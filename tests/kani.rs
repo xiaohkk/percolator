@@ -776,7 +776,7 @@ fn i5_warmup_bounded_by_pnl() {
     let elapsed = slots.saturating_sub(engine.accounts[user_idx as usize].warmup_started_at_slot) as u128;
     let warmup_cap = slope.saturating_mul(elapsed);
     kani::assert(
-        withdrawable <= warmup_cap || withdrawable <= available,
+        withdrawable <= warmup_cap && withdrawable <= available,
         "I5: Withdrawable bounded by min(warmup_cap, available)"
     );
 }
@@ -860,7 +860,7 @@ fn i7_user_isolation_withdrawal() {
 }
 
 // ============================================================================
-// I8: Equity Consistency (margin checks use equity = max(0, capital + pnl))
+// I8: Realized Equity Formula (reporting-only, NOT margin checks — see spec §3.3)
 // ============================================================================
 
 #[kani::proof]
@@ -882,7 +882,7 @@ fn i8_equity_with_positive_pnl() {
 
     let equity = engine.account_equity(&engine.accounts[user_idx as usize]);
 
-    // equity == max(0, capital + pnl) — covers both positive and negative PnL branches
+    // Realized equity = max(0, capital + pnl) — reporting only, not used for margin checks
     let sum_i = (principal as i128).saturating_add(pnl);
     let expected = if sum_i > 0 { sum_i as u128 } else { 0 };
 
@@ -907,7 +907,7 @@ fn i8_equity_with_negative_pnl() {
 
     let equity = engine.account_equity(&engine.accounts[user_idx as usize]);
 
-    // Equity = max(0, capital + pnl)
+    // Realized equity = max(0, capital + pnl) — reporting only, not used for margin checks
     let expected_i = (principal as i128).saturating_add(pnl);
     let expected = if expected_i > 0 {
         expected_i as u128
@@ -917,7 +917,7 @@ fn i8_equity_with_negative_pnl() {
 
     assert!(
         equity == expected,
-        "I8: Equity = max(0, capital + pnl) when PNL is negative"
+        "I8: Realized equity = max(0, capital + pnl) when PNL is negative"
     );
 }
 
