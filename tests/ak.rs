@@ -263,16 +263,19 @@ fn t0_3_set_pnl_aggregate_exact() {
     assert!(actual == expected);
 }
 
-/// Satisfiability: all four sign transitions are reachable.
+/// Satisfiability + correctness: all four sign transitions are reachable
+/// and set_pnl produces correct pnl_pos_tot for each.
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
 fn t0_3_sat_all_sign_transitions() {
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let idx = engine.add_user(0).unwrap();
+
     let old: i16 = kani::any();
     let new: i16 = kani::any();
     kani::assume(old > i16::MIN && new > i16::MIN);
 
-    // Pick one transition and prove it's reachable
     let transition: u8 = kani::any();
     kani::assume(transition < 4);
     match transition {
@@ -283,9 +286,12 @@ fn t0_3_sat_all_sign_transitions() {
         _ => unreachable!(),
     }
 
-    // Just verify the transition is reachable (no assertion needed beyond assume)
-    let _old_pos: u128 = if old > 0 { old as u128 } else { 0 };
-    let _new_pos: u128 = if new > 0 { new as u128 } else { 0 };
+    engine.set_pnl(idx as usize, I256::from_i128(old as i128));
+    engine.set_pnl(idx as usize, I256::from_i128(new as i128));
+
+    let expected = if new > 0 { new as u128 } else { 0u128 };
+    let actual = engine.pnl_pos_tot.try_into_u128().unwrap();
+    assert!(actual == expected, "pnl_pos_tot mismatch after transition");
 }
 
 // ============================================================================
@@ -308,43 +314,48 @@ fn t0_4_fee_debt_no_overflow() {
     }
 }
 
-/// saturating_mul_u256_u64: saturates, never panics.
+/// saturating_mul_u256_u64: exact for small values, saturates for large.
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
 fn t0_4_saturating_mul_no_panic() {
     let a: u8 = kani::any();
     let b: u8 = kani::any();
+
+    // Small values: exact product
     let a256 = U256::from_u128(a as u128);
     let result = saturating_mul_u256_u64(a256, b as u64);
-    // For small values, should equal a * b
     let expected = (a as u128) * (b as u128);
     assert!(result == U256::from_u128(expected));
+
+    // Large value: exercises saturation path
+    kani::assume(b > 1);
+    let result_max = saturating_mul_u256_u64(U256::MAX, b as u64);
+    assert!(result_max == U256::MAX, "must saturate at U256::MAX");
 }
 
-/// C_tot + I checked addition: fails conservatively on overflow.
+/// Conservation (vault >= c_tot + insurance) is preserved by deposit.
 #[kani::proof]
-#[kani::unwind(34)]
+#[kani::unwind(1)]
 #[kani::solver(cadical)]
 fn t0_4_conservation_check_handles_overflow() {
     let c_tot: u64 = kani::any();
     let insurance: u64 = kani::any();
     let vault: u64 = kani::any();
+    let deposit: u64 = kani::any();
 
-    let sum = (c_tot as u128).checked_add(insurance as u128);
-    match sum {
-        Some(s) => {
-            // Conservation: vault >= s
-            if (vault as u128) >= s {
-                // OK
-            }
-            // No assertion needed — just proving checked_add doesn't miss overflow
-        }
-        None => {
-            // For u64 + u64, overflow is impossible in u128.
-            // This branch is unreachable for u64 inputs.
-            unreachable!();
-        }
+    let sum = (c_tot as u128) + (insurance as u128);
+
+    // u64 + u64 never overflows u128
+    assert!(sum >= c_tot as u128);
+    assert!(sum >= insurance as u128);
+
+    // If conservation holds pre-deposit, it holds post-deposit
+    if (vault as u128) >= sum {
+        let vault_new = (vault as u128) + (deposit as u128);
+        let c_tot_new = (c_tot as u128) + (deposit as u128);
+        assert!(vault_new >= c_tot_new + (insurance as u128),
+            "deposit preserves conservation");
     }
 }
 
@@ -747,29 +758,72 @@ fn t2_12_fold_base_case() {
     assert!(q_eff == basis_q);
 }
 
+/// Floor-shift lemma: floor(n + m*d, d) == floor(n, d) + m for integer m.
+/// This is the algebraic foundation for the fold step case.
+/// Uses the same conservative-floor implementation as lazy_pnl.
+#[kani::proof]
+#[kani::unwind(1)]
+#[kani::solver(cadical)]
+fn t2_12_floor_shift_lemma() {
+    let n: i8 = kani::any();
+    let m: i8 = kani::any();
+    let d: u8 = kani::any();
+    kani::assume(d > 0);
+
+    let d32 = d as i32;
+    let n32 = n as i32;
+    let m32 = m as i32;
+    let shifted = n32 + m32 * d32;
+
+    // Conservative floor (matching lazy_pnl implementation)
+    let floor_n = if n32 >= 0 {
+        n32 / d32
+    } else {
+        -((-n32 + d32 - 1) / d32)
+    };
+
+    let floor_shifted = if shifted >= 0 {
+        shifted / d32
+    } else {
+        -((-shifted + d32 - 1) / d32)
+    };
+
+    assert!(floor_shifted == floor_n + m32,
+        "floor(n + m*d, d) must equal floor(n, d) + m");
+}
+
 /// Step case: fold(prefix + mark_event) == compose(fold(prefix), mark_event).
-/// Models prefix state as (A_cur, K_cur) and verifies one more mark step.
+/// Holds for ALL k_prefix because basis_q * A * dp is an exact multiple of
+/// den = A * POS_SCALE (divisibility proved here), so the floor-shift lemma
+/// (t2_12_floor_shift_lemma) applies:
+///
+///   lazy_pnl(q, k+A*dp, A) - lazy_pnl(q, k, A)
+///   = floor(basis_q*(k+A*dp) / den) - floor(basis_q*k / den)
+///   = floor(basis_q*k/den + q_base*dp) - floor(basis_q*k/den)
+///   = q_base*dp  [floor-shift: floor(x+n) = floor(x)+n for integer n]
+///
+/// k_prefix bounded to i8 for CBMC tractability; the property holds for all
+/// k by the floor-shift lemma (which is width-independent).
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
 fn t2_12_fold_step_case() {
     let q_base: u8 = kani::any();
     kani::assume(q_base > 0);
-
-    // Previous cumulative state from some prefix (bounded for solver tractability)
-    let k_prefix: i16 = kani::any();
-    kani::assume(k_prefix >= -15 && k_prefix <= 15);
-    let a = S_ADL_ONE; // A unchanged for mark-only events
-
-    // New event
     let dp: i8 = kani::any();
-    let k_new = (k_prefix as i32) + (a as i32) * (dp as i32);
-
-    // Eager for just this event
-    let eager_step = (q_base as i32) * (dp as i32);
-
-    // Lazy delta from prefix to new
+    let a = S_ADL_ONE;
+    let den = (a as i32) * (S_POS_SCALE as i32);
     let basis_q = (q_base as u16) * S_POS_SCALE;
+
+    // Key divisibility: basis_q * A is an exact multiple of den
+    let exact = (basis_q as i32) * (a as i32);
+    assert!(exact % den == 0, "basis_q * A must be divisible by den");
+    assert!(exact / den == q_base as i32, "quotient must equal q_base");
+
+    // Step case with symbolic k_prefix
+    let k_prefix: i8 = kani::any();
+    let k_new = (k_prefix as i32) + (a as i32) * (dp as i32);
+    let eager_step = (q_base as i32) * (dp as i32);
     let lazy_total = lazy_pnl(basis_q, k_new, a);
     let lazy_prefix = lazy_pnl(basis_q, k_prefix as i32, a);
     let lazy_step = lazy_total - lazy_prefix;
@@ -841,18 +895,22 @@ fn t3_14_epoch_mismatch_forces_terminal_close() {
     let idx = engine.add_user(0).unwrap();
     engine.deposit(idx, 1_000_000, 100, 0).unwrap();
 
-    // Set up a long position with epoch 0
-    let pos = I256::from_u128(POS_SCALE);
+    // Symbolic position size and K value
+    let pos_mul: u8 = kani::any();
+    kani::assume(pos_mul > 0);
+    let pos = I256::from_u128(POS_SCALE * (pos_mul as u128));
     engine.accounts[idx as usize].position_basis_q = pos;
     engine.accounts[idx as usize].adl_a_basis = ADL_ONE;
     // k_snap == k_epoch_start → k_diff == 0 → avoids U512 division
-    engine.accounts[idx as usize].adl_k_snap = I256::from_i128(1000);
+    let k_val: i8 = kani::any();
+    let k = I256::from_i128(k_val as i128);
+    engine.accounts[idx as usize].adl_k_snap = k;
     engine.accounts[idx as usize].adl_epoch_snap = 0;
     engine.stored_pos_count_long = 1;
 
     // Advance epoch: simulate full drain reset
     engine.adl_epoch_long = 1;
-    engine.adl_epoch_start_k_long = I256::from_i128(1000);
+    engine.adl_epoch_start_k_long = k; // matches k_snap → k_diff == 0
     engine.side_mode_long = SideMode::ResetPending;
     engine.stale_account_count_long = 1;
 
@@ -912,19 +970,22 @@ fn t3_16_reset_pending_counter_invariant() {
     engine.deposit(a, 1_000_000, 100, 0).unwrap();
     engine.deposit(b, 1_000_000, 100, 0).unwrap();
 
-    // Set up positions at epoch 0 with k_snap = 0
+    // Symbolic K value — both accounts snap at same K
+    let k_val: i8 = kani::any();
+    let k = I256::from_i128(k_val as i128);
+
     engine.accounts[a as usize].position_basis_q = I256::from_u128(POS_SCALE);
     engine.accounts[a as usize].adl_a_basis = ADL_ONE;
-    engine.accounts[a as usize].adl_k_snap = I256::ZERO;
+    engine.accounts[a as usize].adl_k_snap = k;
     engine.accounts[a as usize].adl_epoch_snap = 0;
     engine.accounts[b as usize].position_basis_q = I256::from_u128(POS_SCALE);
     engine.accounts[b as usize].adl_a_basis = ADL_ONE;
-    engine.accounts[b as usize].adl_k_snap = I256::ZERO;
+    engine.accounts[b as usize].adl_k_snap = k;
     engine.accounts[b as usize].adl_epoch_snap = 0;
     engine.stored_pos_count_long = 2;
 
-    // K_long = 0 so that k_epoch_start = 0 and k_diff = 0 (avoids U512)
-    engine.adl_coeff_long = I256::ZERO;
+    // K_long matches k_snap → k_diff == 0 (avoids U512)
+    engine.adl_coeff_long = k;
 
     // Begin reset: epoch advances, stale = stored_pos_count
     engine.oi_eff_long_q = U256::ZERO;
@@ -932,13 +993,12 @@ fn t3_16_reset_pending_counter_invariant() {
 
     assert!(engine.side_mode_long == SideMode::ResetPending);
     assert!(engine.stale_account_count_long == 2);
-    // k_epoch_start == 0 == k_snap → k_diff == 0 → no U512 division
 
-    // Settle account a
+    // Settle account a — counter decrements
     let _ = engine.settle_side_effects(a as usize);
     assert!(engine.stale_account_count_long == 1);
 
-    // Settle account b
+    // Settle account b — counter decrements
     let _ = engine.settle_side_effects(b as usize);
     assert!(engine.stale_account_count_long == 0);
 }
@@ -953,28 +1013,38 @@ fn t3_16_reset_pending_counter_invariant() {
 // T4.17: enqueue_adl_preserves_balanced_oi (quantity only)
 // ============================================================================
 
-/// Algebraic: if OI_long == OI_short and ADL removes q_close from liq side,
-/// the opposing side's OI also shrinks to OI - q_close (balanced).
-/// Models enqueue_adl logic: liq_side OI -= q_close, opp OI = oi_post.
+/// Algebraic: with 2 accounts on the opposing side, A-shrink during ADL
+/// produces effective positions that sum to at most oi_post.
+/// Models enqueue_adl's A-ratio shrink for the opposing side.
 #[kani::proof]
 #[kani::unwind(1)]
 #[kani::solver(cadical)]
 fn t4_17_enqueue_adl_preserves_oi_balance_qty_only() {
-    let oi: u8 = kani::any();
-    kani::assume(oi >= 2);
+    let q1: u8 = kani::any();
+    let q2: u8 = kani::any();
+    kani::assume(q1 > 0 && q2 > 0);
+    let oi = (q1 as u16) + (q2 as u16);
+    kani::assume(oi <= 15);
+
     let q_close: u8 = kani::any();
-    kani::assume(q_close > 0 && q_close < oi);
+    kani::assume(q_close > 0 && (q_close as u16) < oi);
+    let oi_post = oi - (q_close as u16);
 
-    // Model: liq_side OI' = OI - q_close
-    let oi_liq_after = oi - q_close;
-    // Model: opposing OI' = OI - q_close (when D=0, quantity-only ADL)
-    let oi_opp_after = oi - q_close;
+    let a_old = S_ADL_ONE;
+    let a_new = a_after_adl(a_old, oi_post, oi);
 
-    // Both sides shrink equally
-    assert!(oi_liq_after == oi_opp_after);
-    // Both decrease
-    assert!(oi_liq_after < oi);
-    assert!(oi_opp_after < oi);
+    // Each account's effective position after A-shrink
+    let basis_q1 = (q1 as u16) * S_POS_SCALE;
+    let basis_q2 = (q2 as u16) * S_POS_SCALE;
+    let eff_q1 = lazy_eff_q(basis_q1, a_new, a_old) / S_POS_SCALE;
+    let eff_q2 = lazy_eff_q(basis_q2, a_new, a_old) / S_POS_SCALE;
+
+    // Sum of effective positions must not exceed oi_post (floor can only lose)
+    assert!(eff_q1 + eff_q2 <= oi_post,
+        "sum of effective positions must not exceed oi_post");
+    // Each individual effective position decreased
+    assert!(eff_q1 <= q1 as u16);
+    assert!(eff_q2 <= q2 as u16);
 }
 
 // ============================================================================
@@ -1132,51 +1202,62 @@ fn t5_21_pnl_rounding_conservative() {
 // T5.22: phantom_dust_total_bound
 // ============================================================================
 
-/// Total unowned dust from local floor rounding cannot exceed
-/// PHANTOM_DUST_MAX_Q = MAX_ACCOUNTS.
+/// For 2 accounts sharing an A-shrink, total floor-rounding dust < 2 units.
+/// Generalizes: for N accounts, total dust < N ≤ MAX_ACCOUNTS.
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
 fn t5_22_phantom_dust_total_bound() {
-    // Each account contributes < 1 unit of dust when its floor quantity
-    // doesn't exactly match the rational quantity. With MAX_ACCOUNTS accounts,
-    // total dust < MAX_ACCOUNTS.
-    let n_accounts: u8 = kani::any();
-    kani::assume(n_accounts > 0 && (n_accounts as usize) <= MAX_ACCOUNTS);
+    let q1: u8 = kani::any();
+    let q2: u8 = kani::any();
+    kani::assume(q1 > 0 && q2 > 0);
+    let a_cur: u16 = kani::any();
+    let a_basis: u16 = kani::any();
+    kani::assume(a_basis > 0 && a_cur > 0 && a_cur <= a_basis);
 
-    // Each account's dust is in [0, 1) fixed-point units.
-    // Max total dust = n_accounts * 1 (exclusive) < n_accounts <= MAX_ACCOUNTS.
-    // PHANTOM_DUST_MAX_Q = MAX_ACCOUNTS, so the bound holds.
-    assert!((n_accounts as usize) <= MAX_ACCOUNTS);
+    let basis_q1 = (q1 as u16) * S_POS_SCALE;
+    let basis_q2 = (q2 as u16) * S_POS_SCALE;
+
+    // Per-account floor remainder (from integer division)
+    let rem1 = (basis_q1 as u32) * (a_cur as u32) % (a_basis as u32);
+    let rem2 = (basis_q2 as u32) * (a_cur as u32) % (a_basis as u32);
+
+    // Each remainder < a_basis (one unit of dust per account)
+    assert!(rem1 < a_basis as u32);
+    assert!(rem2 < a_basis as u32);
+
+    // Total dust < 2 units (each account contributes < 1 unit)
+    assert!(rem1 + rem2 < 2 * (a_basis as u32),
+        "total dust from 2 accounts < 2 effective units");
 }
 
 // ============================================================================
 // T5.23: dust_clearance_guard_is_safe
 // ============================================================================
 
-/// Dust clearance only fires when OI <= PHANTOM_DUST_MAX_Q and
-/// stored_pos_count == 0, meaning the amount zeroed is bounded dust.
+/// Worst-case dust per N accounts: N * (POS_SCALE - 1) / POS_SCALE < N.
+/// When stored_pos_count == 0, all remaining OI is floor-rounding dust,
+/// and dust < MAX_ACCOUNTS, so the guard OI ≤ MAX_ACCOUNTS is tight.
 #[kani::proof]
-#[kani::unwind(34)]
+#[kani::unwind(1)]
 #[kani::solver(cadical)]
 fn t5_23_dust_clearance_guard_safe() {
-    let oi_long: u8 = kani::any();
-    let oi_short: u8 = kani::any();
-    let spc_long: u8 = kani::any();
-    let spc_short: u8 = kani::any();
+    let n: u8 = kani::any();
+    kani::assume(n > 0 && (n as usize) <= MAX_ACCOUNTS);
 
-    let pdmq = MAX_ACCOUNTS as u8;
+    // Worst case: each account contributes (S_POS_SCALE - 1) subunits of dust
+    // (the maximum floor remainder in fixed-point)
+    let max_dust_per_acct_fp = S_POS_SCALE as u32 - 1;
+    let max_total_dust_fp = (n as u32) * max_dust_per_acct_fp;
 
-    // Guard condition from schedule_end_of_instruction_resets:
-    // stored_pos_count == 0 AND oi <= PHANTOM_DUST_MAX_Q
-    let guard = (spc_long == 0 || spc_short == 0)
-        && (oi_long <= pdmq && oi_short <= pdmq);
+    // In base units: floor(total_fp / POS_SCALE) < n
+    let max_total_dust_base = max_total_dust_fp / (S_POS_SCALE as u32);
+    assert!(max_total_dust_base < n as u32,
+        "worst-case dust in base units < account count");
 
-    if guard {
-        // The OI being zeroed is bounded by PHANTOM_DUST_MAX_Q
-        assert!(oi_long as usize <= MAX_ACCOUNTS);
-        assert!(oi_short as usize <= MAX_ACCOUNTS);
-    }
+    // Guard threshold matches: MAX_ACCOUNTS >= n
+    assert!((n as usize) <= MAX_ACCOUNTS,
+        "guard threshold covers all account counts");
 }
 
 // ############################################################################
@@ -1262,8 +1343,8 @@ fn t6_24_worked_example_regression() {
 // T6.25: pure_pnl_bankruptcy_regression
 // ============================================================================
 
-/// Algebraic: pure deficit (q_close = 0, D > 0) routes through K path.
-/// Models the deficit socialization: K_opp decreases by A * ceil(D * POS_SCALE / OI).
+/// Pure deficit (q_close = 0, D > 0): per-account lazy PnL is conservative.
+/// Extends T4.19 by verifying the per-account PnL impact through K path.
 #[kani::proof]
 #[kani::unwind(1)]
 #[kani::solver(cadical)]
@@ -1272,9 +1353,11 @@ fn t6_25_pure_pnl_bankruptcy_regression() {
     kani::assume(oi > 0);
     let d: u8 = kani::any();
     kani::assume(d > 0);
+    let q_base: u8 = kani::any();
+    kani::assume(q_base > 0 && q_base <= oi);
 
     let a_opp = S_ADL_ONE;
-    let k_before: i32 = 0;
+    let basis_q = (q_base as u16) * S_POS_SCALE;
 
     // beta_abs = ceil(D * POS_SCALE / OI)
     let beta_abs = ((d as u32) * (S_POS_SCALE as u32) + (oi as u32) - 1) / (oi as u32);
@@ -1282,14 +1365,16 @@ fn t6_25_pure_pnl_bankruptcy_regression() {
 
     // delta_K = -(A * beta_abs)
     let delta_k = -((a_opp as i32) * (beta_abs as i32));
-    assert!(delta_k < 0, "delta_K must be negative (loss socialized)");
+    assert!(delta_k < 0, "K must decrease");
 
-    let k_after = k_before + delta_k;
-    assert!(k_after < k_before, "K must decrease");
+    // Per-account PnL via lazy settlement
+    let pnl = lazy_pnl(basis_q, delta_k, a_opp);
+    assert!(pnl <= 0, "each account must have non-positive PnL");
 
-    // The opposing side's longs take this PnL hit via lazy settlement.
-    // Each account's share: floor(|basis_q| * delta_K / (A * POS_SCALE))
-    // Since delta_K < 0, the PnL delta is negative (loss).
+    // Conservative: lazy loss >= eager floor loss
+    let eager_loss = ((q_base as i32) * (d as i32)) / (oi as i32);
+    assert!(-pnl >= eager_loss,
+        "lazy loss must be >= eager floor loss (conservative)");
 }
 
 // ============================================================================
@@ -1310,16 +1395,20 @@ fn t6_26_full_drain_reset_regression() {
     let idx = engine.add_user(0).unwrap();
     engine.deposit(idx, 1_000_000, 100, 0).unwrap();
 
-    // Set up long position at epoch 0
-    // k_snap = K_long so that k_diff == 0 in settle (avoids U512 division)
-    engine.accounts[idx as usize].position_basis_q = I256::from_u128(POS_SCALE);
+    // Symbolic K value and position multiplier
+    let k_val: i8 = kani::any();
+    let k = I256::from_i128(k_val as i128);
+    let pos_mul: u8 = kani::any();
+    kani::assume(pos_mul > 0);
+
+    // Set up long position at epoch 0 — k_snap = K_long → k_diff == 0
+    engine.accounts[idx as usize].position_basis_q = I256::from_u128(POS_SCALE * (pos_mul as u128));
     engine.accounts[idx as usize].adl_a_basis = ADL_ONE;
-    engine.accounts[idx as usize].adl_k_snap = I256::from_i128(5000);
+    engine.accounts[idx as usize].adl_k_snap = k;
     engine.accounts[idx as usize].adl_epoch_snap = 0;
     engine.stored_pos_count_long = 1;
 
-    // K_long = 5000 (same as k_snap → k_diff = 0)
-    engine.adl_coeff_long = I256::from_i128(5000);
+    engine.adl_coeff_long = k; // matches k_snap → k_diff == 0
 
     // Step 1: begin full drain reset
     engine.oi_eff_long_q = U256::ZERO;
@@ -1328,10 +1417,9 @@ fn t6_26_full_drain_reset_regression() {
     assert!(engine.side_mode_long == SideMode::ResetPending);
     assert!(engine.adl_epoch_long == 1);
     assert!(engine.stale_account_count_long == 1);
-    // K_epoch_start_long should capture K at reset
-    assert!(engine.adl_epoch_start_k_long == I256::from_i128(5000));
+    assert!(engine.adl_epoch_start_k_long == k);
 
-    // Step 2: stale account touches (k_diff == 0 → pnl_delta = 0, no U512)
+    // Step 2: stale account touches (k_diff == 0 → pnl_delta = 0)
     let result = engine.settle_side_effects(idx as usize);
     assert!(result.is_ok());
 
