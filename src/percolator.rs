@@ -1,6 +1,6 @@
-//! Formally Verified Risk Engine for Perpetual DEX — v9.4
+//! Formally Verified Risk Engine for Perpetual DEX — v9.5
 //!
-//! Implements the v9.4 spec: Lazy A/K ADL + Non-Compounding Quantity Basis
+//! Implements the v9.5 spec: Lazy A/K ADL + Non-Compounding Quantity Basis
 //! + Exact Wide Arithmetic + Deferred Reset Finalization.
 //!
 //! This module implements a formally verified risk engine that guarantees:
@@ -678,12 +678,22 @@ impl RiskEngine {
     /// attach_effective_position (spec §4.5)
     pub fn attach_effective_position(&mut self, idx: usize, new_eff_pos_q: I256) {
         if new_eff_pos_q.is_zero() {
+            // Determine old side for epoch/K reference before zeroing basis
+            let old_basis = self.accounts[idx].position_basis_q;
             self.set_position_basis_q(idx, I256::ZERO);
-            // Reset snapshots to canonical zero-position defaults in current epoch
-            // Determine which side to reference — use long epoch as default for flat
+            // Reset snapshots to canonical zero-position defaults in current epoch (spec §4.5)
             self.accounts[idx].adl_a_basis = ADL_ONE;
-            self.accounts[idx].adl_k_snap = I256::ZERO;
-            self.accounts[idx].adl_epoch_snap = 0;
+            if old_basis.is_positive() {
+                self.accounts[idx].adl_k_snap = self.adl_coeff_long;
+                self.accounts[idx].adl_epoch_snap = self.adl_epoch_long;
+            } else if old_basis.is_negative() {
+                self.accounts[idx].adl_k_snap = self.adl_coeff_short;
+                self.accounts[idx].adl_epoch_snap = self.adl_epoch_short;
+            } else {
+                // Was already flat — use long side defaults
+                self.accounts[idx].adl_k_snap = self.adl_coeff_long;
+                self.accounts[idx].adl_epoch_snap = self.adl_epoch_long;
+            }
         } else {
             let side = side_of_i256(&new_eff_pos_q).expect("attach: nonzero must have side");
             self.set_position_basis_q(idx, new_eff_pos_q);
@@ -1975,6 +1985,9 @@ impl RiskEngine {
             }
         }
 
+        // Step 13: if funding-rate inputs changed, recompute r_last (spec §10.4)
+        // (No-op: execute_trade does not modify funding-rate inputs)
+
         // Step 14: post-trade margin
         // Account a
         if !new_eff_a.is_zero() {
@@ -2029,6 +2042,9 @@ impl RiskEngine {
         // Steps 16-17: end-of-instruction resets
         let _ = self.schedule_end_of_instruction_resets(&mut ctx);
         self.finalize_end_of_instruction_resets(&ctx);
+
+        // Step 18: assert OI balance (spec §10.4)
+        assert!(self.oi_eff_long_q == self.oi_eff_short_q, "OI_eff_long != OI_eff_short after trade");
 
         Ok(())
     }
@@ -2198,9 +2214,12 @@ impl RiskEngine {
             self.set_pnl(idx as usize, I256::ZERO);
         }
 
-        // End-of-instruction resets
+        // End-of-instruction resets (spec §10.5 steps 6-7)
         let _ = self.schedule_end_of_instruction_resets(&mut ctx);
         self.finalize_end_of_instruction_resets(&ctx);
+
+        // Step 8: assert OI balance (spec §10.5)
+        assert!(self.oi_eff_long_q == self.oi_eff_short_q, "OI_eff_long != OI_eff_short after liquidation");
 
         self.lifetime_liquidations = self.lifetime_liquidations.saturating_add(1);
 
