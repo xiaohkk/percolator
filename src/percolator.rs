@@ -295,6 +295,10 @@ pub struct RiskEngine {
     pub stale_account_count_long: u64,
     pub stale_account_count_short: u64,
 
+    /// Dynamic phantom dust bounds (spec §4.6, §5.7)
+    pub phantom_dust_bound_long_q: U256,
+    pub phantom_dust_bound_short_q: U256,
+
     /// Last oracle price used in accrue_market_to
     pub last_oracle_price: u64,
     /// Last slot used in accrue_market_to
@@ -469,6 +473,8 @@ impl RiskEngine {
             stored_pos_count_short: 0,
             stale_account_count_long: 0,
             stale_account_count_short: 0,
+            phantom_dust_bound_long_q: U256::ZERO,
+            phantom_dust_bound_short_q: U256::ZERO,
             last_oracle_price: 0,
             last_market_slot: 0,
             funding_price_sample_last: 0,
@@ -792,6 +798,22 @@ impl RiskEngine {
         }
     }
 
+    /// Spec §4.6: increment phantom dust bound by 1 q-unit (checked).
+    pub fn inc_phantom_dust_bound(&mut self, s: Side) {
+        match s {
+            Side::Long => {
+                self.phantom_dust_bound_long_q = self.phantom_dust_bound_long_q
+                    .checked_add(U256::from_u128(1))
+                    .expect("phantom_dust_bound_long_q overflow");
+            }
+            Side::Short => {
+                self.phantom_dust_bound_short_q = self.phantom_dust_bound_short_q
+                    .checked_add(U256::from_u128(1))
+                    .expect("phantom_dust_bound_short_q overflow");
+            }
+        }
+    }
+
     // ========================================================================
     // effective_pos_q (spec §5.2)
     // ========================================================================
@@ -885,7 +907,8 @@ impl RiskEngine {
             self.set_pnl(idx, new_pnl);
 
             if q_eff_new.is_zero() {
-                // Position effectively zeroed
+                // Position effectively zeroed (spec §5.3 step 3)
+                self.inc_phantom_dust_bound(side);
                 self.set_position_basis_q(idx, I256::ZERO);
                 // Reset snapshots in current epoch
                 self.accounts[idx].adl_a_basis = ADL_ONE;
@@ -1213,6 +1236,12 @@ impl RiskEngine {
         let spc = self.get_stored_pos_count(side);
         self.set_stale_count(side, spc);
 
+        // phantom_dust_bound_side_q = 0 (spec §2.5 step 6)
+        match side {
+            Side::Long => self.phantom_dust_bound_long_q = U256::ZERO,
+            Side::Short => self.phantom_dust_bound_short_q = U256::ZERO,
+        }
+
         // mode = ResetPending
         self.set_side_mode(side, SideMode::ResetPending);
     }
@@ -1239,10 +1268,23 @@ impl RiskEngine {
     // ========================================================================
 
     pub fn schedule_end_of_instruction_resets(&mut self, ctx: &mut InstructionContext) -> Result<()> {
-        // Step 1: dust clearance
+        // Step 1: dust clearance (spec §5.7 / §12.5)
         if self.stored_pos_count_long == 0 || self.stored_pos_count_short == 0 {
-            let pdmq = phantom_dust_max_q();
-            if self.oi_eff_long_q <= pdmq && self.oi_eff_short_q <= pdmq {
+            let mut clear_bound_q = U256::ZERO;
+            if self.stored_pos_count_long == 0 {
+                clear_bound_q = clear_bound_q.checked_add(self.phantom_dust_bound_long_q)
+                    .ok_or(RiskError::CorruptState)?;
+            }
+            if self.stored_pos_count_short == 0 {
+                clear_bound_q = clear_bound_q.checked_add(self.phantom_dust_bound_short_q)
+                    .ok_or(RiskError::CorruptState)?;
+            }
+            if clear_bound_q.is_zero()
+                && self.oi_eff_long_q.is_zero()
+                && self.oi_eff_short_q.is_zero()
+            {
+                // Trivial case: no dust accumulated, no OI — nothing to clear
+            } else if self.oi_eff_long_q <= clear_bound_q && self.oi_eff_short_q <= clear_bound_q {
                 self.oi_eff_long_q = U256::ZERO;
                 self.oi_eff_short_q = U256::ZERO;
                 ctx.pending_reset_long = true;
@@ -1743,11 +1785,8 @@ impl RiskEngine {
         let new_cap = add_u128(self.accounts[idx as usize].capital.get(), amount);
         self.set_capital(idx as usize, new_cap);
 
-        // Fee debt sweep
+        // Fee debt sweep (spec §10.2)
         self.fee_debt_sweep(idx as usize);
-
-        // MAY call touch_account_full
-        let _ = self.touch_account_full(idx as usize, oracle_price, now_slot);
 
         Ok(())
     }
@@ -1923,8 +1962,11 @@ impl RiskEngine {
             );
         }
 
-        // Step 11: restart-on-new-profit for accounts whose AvailGross increased
-        // After touch + trade PnL, capture new AvailGross
+        // Step 11: settle post-trade losses from principal for both accounts (spec §10.4)
+        self.settle_losses(a as usize);
+        self.settle_losses(b as usize);
+
+        // Step 12: restart-on-new-profit for accounts whose AvailGross increased
         for &account_idx in &[a as usize, b as usize] {
             let new_avail = self.avail_gross(account_idx);
             if !new_avail.is_zero() {
@@ -1933,7 +1975,7 @@ impl RiskEngine {
             }
         }
 
-        // Step 13: post-trade margin
+        // Step 14: post-trade margin
         // Account a
         if !new_eff_a.is_zero() {
             let abs_old_a = if old_eff_a.is_zero() { U256::ZERO } else { old_eff_a.abs_u256() };
@@ -1954,8 +1996,7 @@ impl RiskEngine {
                 }
             }
         } else {
-            // Flat: require PNL >= 0 after loss settlement
-            self.settle_losses(a as usize);
+            // Flat: require PNL >= 0 (losses already settled in step 11)
             self.resolve_flat_negative(a as usize);
         }
 
@@ -1977,15 +2018,15 @@ impl RiskEngine {
                 }
             }
         } else {
-            self.settle_losses(b as usize);
+            // Flat: require PNL >= 0 (losses already settled in step 11)
             self.resolve_flat_negative(b as usize);
         }
 
-        // Step 14: fee debt sweep
+        // Step 15: fee debt sweep
         self.fee_debt_sweep(a as usize);
         self.fee_debt_sweep(b as usize);
 
-        // Steps 15-16: end-of-instruction resets
+        // Steps 16-17: end-of-instruction resets
         let _ = self.schedule_end_of_instruction_resets(&mut ctx);
         self.finalize_end_of_instruction_resets(&ctx);
 
@@ -2183,6 +2224,9 @@ impl RiskEngine {
 
         self.current_slot = now_slot;
 
+        // Step 1: initialize instruction context (spec §10.6)
+        let mut ctx = InstructionContext::new();
+
         // Accrue market state using stored rate (anti-retroactivity)
         self.accrue_market_to(now_slot, oracle_price)?;
 
@@ -2282,6 +2326,10 @@ impl RiskEngine {
         }
 
         let num_gc_closed = self.garbage_collect_dust();
+
+        // Steps 3-4: end-of-instruction resets (spec §10.6)
+        let _ = self.schedule_end_of_instruction_resets(&mut ctx);
+        self.finalize_end_of_instruction_resets(&ctx);
 
         Ok(CrankOutcome {
             advanced,
