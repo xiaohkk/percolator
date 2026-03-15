@@ -14,6 +14,7 @@
 - Clean-empty markets still no longer re-trigger full-drain reset scheduling. End-of-instruction dust clearance fires only when there is actual residual dust or residual authoritative OI to clear. A fully drained, fully reconciled market can stably remain in `Normal`.
 - `enqueue_adl` still normatively handles the case where `beta_abs = ceil(D * POS_SCALE / OI)` is not representable as `i256`. In that case the quote deficit routes through `absorb_protocol_loss(D)` while quantity socialization still proceeds.
 - Explicit position mutations that discard a same-epoch fractional remainder still account for that orphaned sub-`1 q` quantity in the per-side `phantom_dust_bound_*_q`.
+- `enqueue_adl` now adds `ceil(OI / A_old)` to the opposing side's `phantom_dust_bound_*_q` after truncating `A_candidate = floor(A_old * OI_post / OI)`. Without this, the global A truncation injects up to `2^40` q-units of phantom OI that no individual user can ever close, permanently deadlocking the market reset path.
 - End-of-instruction reset finalization still auto-finalizes any side already in `ResetPending` whose `OI`, `stale_account_count`, and `stored_pos_count` have all reached zero.
 
 ---
@@ -530,6 +531,7 @@ The engine MUST perform the following in order:
 8. If `A_candidate > 0`:
    - set `A_opp := A_candidate`,
    - set `OI_eff_opp := OI_post`,
+   - add `ceil(OI / A_old)` to `phantom_dust_bound_opp_q` (global A truncation dust — the floor in step 7 injects up to this many q-units of phantom OI that no individual user can ever close),
    - if `A_opp < MIN_A_SIDE`, set `mode_opp = DrainOnly`,
    - return.
 9. If `A_candidate == 0` while `OI_post > 0`, the side has exhausted representable quantity precision. The engine MUST enter a **precision-exhaustion terminal drain**:
@@ -875,7 +877,7 @@ An implementation MUST include tests that cover:
 2. **Oracle manipulation:** inflated positive PnL cannot be withdrawn before maturity.
 3. **Same-epoch local settlement:** settlement of one account does not depend on any canonical-order prefix.
 4. **Non-compounding quantity basis:** repeated same-epoch touches without explicit position mutation do not compound quantity-flooring loss.
-5. **Dynamic dust bound:** after any number of same-epoch zeroing events before a reset, authoritative OI on a side with no stored positions is bounded by that side’s cumulative `phantom_dust_bound_side_q`.
+5. **Dynamic dust bound:** after any number of same-epoch zeroing events and ADL multiplier truncations before a reset, authoritative OI on a side with no stored positions is bounded by that side’s cumulative `phantom_dust_bound_side_q` (which includes both per-user remainder increments and global A truncation contributions from `enqueue_adl`).
 6. **Dust-clear scheduling:** dust clearance and reset initiation happen only at end of top-level instructions, never mid-instruction.
 7. **Epoch-safe reset:** accounts cannot be attached to a new epoch before `begin_full_drain_reset` runs at end of instruction.
 8. **Precision-exhaustion terminal drain:** if `A_candidate == 0` with `OI_post > 0`, the engine force-drains both sides instead of reverting or clamping.
@@ -899,6 +901,7 @@ An implementation MUST include tests that cover:
 26. **Clean-empty market lifecycle:** a fully drained and fully reconciled market can return to `Normal` and admit fresh OI without getting stuck in a reset loop.
 27. **Non-representable beta fallback:** if `beta_abs` is not representable as `i256`, quote deficit routes through `absorb_protocol_loss` while quantity socialization still proceeds.
 28. **Explicit-mutation dust accounting:** if a trade or liquidation discards a same-epoch basis whose exact effective quantity had a nonzero fractional remainder, `phantom_dust_bound_side_q` increases by exactly `1` q-unit.
+    **Global A truncation dust accounting:** each `enqueue_adl` that truncates `A_candidate = floor(A_old * OI_post / OI)` adds `ceil(OI / A_old)` to the opposing side's `phantom_dust_bound_side_q`, bounding the phantom OI injected by the integer floor.
 29. **Automatic reset finalization:** the top-level instruction that reconciles the last stale account can leave the side in `Normal` at end-of-instruction without requiring a separate keeper-only finalize call.
 30. **Trade-path reopenability:** if a side is already `ResetPending` but also already eligible for `finalize_side_reset`, an `execute_trade` instruction can auto-finalize that side before OI-increase gating and admit fresh OI in the same instruction.
 
@@ -988,6 +991,7 @@ enqueue_adl(ctx, liq_side, q_close_q, D):
     if A_candidate > 0:
         A_opp = A_candidate
         OI_eff_opp = OI_post
+        phantom_dust_bound_opp_q += ceil(OI / A_old)   # global A truncation dust
         if A_opp < MIN_A_SIDE:
             mode_opp = DrainOnly
         return
