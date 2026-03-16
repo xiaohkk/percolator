@@ -1052,6 +1052,32 @@ impl RiskEngine {
         let long_live = !oi_long.is_zero();
         let short_live = !oi_short.is_zero();
 
+        // Same-slot price change: apply mark-only ΔP with no funding.
+        // Without this, a price move within the same slot is silently dropped.
+        if total_dt == 0 {
+            let delta_p = (oracle_price as i128).checked_sub(self.last_oracle_price as i128)
+                .ok_or(RiskError::Overflow)?;
+            if delta_p != 0 {
+                if long_live {
+                    let a_long_256 = U256::from_u128(self.adl_mult_long);
+                    let delta_p_i256 = I256::from_i128(delta_p);
+                    let delta_k = checked_u256_mul_i256(a_long_256, delta_p_i256)?;
+                    self.adl_coeff_long = self.adl_coeff_long.checked_add(delta_k)
+                        .ok_or(RiskError::Overflow)?;
+                }
+                if short_live {
+                    let a_short_256 = U256::from_u128(self.adl_mult_short);
+                    let delta_p_i256 = I256::from_i128(delta_p);
+                    let delta_k = checked_u256_mul_i256(a_short_256, delta_p_i256)?;
+                    self.adl_coeff_short = self.adl_coeff_short.checked_sub(delta_k)
+                        .ok_or(RiskError::Overflow)?;
+                }
+            }
+            self.last_oracle_price = oracle_price;
+            self.funding_price_sample_last = oracle_price;
+            return Ok(());
+        }
+
         let funding_rate = self.funding_rate_bps_per_slot_last;
         if funding_rate.abs() > MAX_ABS_FUNDING_BPS_PER_SLOT {
             return Err(RiskError::Overflow);
@@ -1793,7 +1819,7 @@ impl RiskEngine {
         }
 
         // Step 8: maintenance fees
-        self.settle_maintenance_fee_internal(idx, now_slot);
+        self.settle_maintenance_fee_internal(idx, now_slot)?;
 
         // Step 9: settle losses from principal
         self.settle_losses(idx);
@@ -1811,32 +1837,21 @@ impl RiskEngine {
     }
 
     /// Internal maintenance fee settle — checked arithmetic, no margin check.
-    fn settle_maintenance_fee_internal(&mut self, idx: usize, now_slot: u64) {
+    fn settle_maintenance_fee_internal(&mut self, idx: usize, now_slot: u64) -> Result<()> {
         let dt = now_slot.saturating_sub(self.accounts[idx].last_fee_slot);
         if dt == 0 {
-            return;
+            return Ok(());
         }
         let fee_per_slot = self.params.maintenance_fee_per_slot.get();
-        // If fee_per_slot * dt would overflow u128, cap due at i128::MAX.
-        // This is a bounded-failure approach: we never silently lose the overflow,
-        // but we also don't panic on a potentially-reachable config.
-        let due = match fee_per_slot.checked_mul(dt as u128) {
-            Some(d) => d,
-            None => i128::MAX as u128,  // cap: more than enough to exhaust any credits
-        };
+        let due = fee_per_slot.checked_mul(dt as u128)
+            .ok_or(RiskError::Overflow)?;
         self.accounts[idx].last_fee_slot = now_slot;
 
-        // Deduct from fee_credits — clamp to -(i128::MAX) (not i128::MIN).
-        // i128::MIN is reserved as a sentinel/invalid value that could cause
-        // negation panics in downstream code.
-        let due_i128 = core::cmp::min(due, i128::MAX as u128) as i128;
-        let new_fc = self.accounts[idx].fee_credits.saturating_sub(due_i128);
-        // Clamp: never let fee_credits reach i128::MIN
-        self.accounts[idx].fee_credits = if new_fc.get() == i128::MIN {
-            I128::new(i128::MIN + 1)
-        } else {
-            new_fc
-        };
+        // Deduct from fee_credits — checked subtraction.
+        let due_i128: i128 = due.try_into().map_err(|_| RiskError::Overflow)?;
+        let new_fc = self.accounts[idx].fee_credits.get()
+            .checked_sub(due_i128).ok_or(RiskError::Overflow)?;
+        self.accounts[idx].fee_credits = I128::new(new_fc);
 
         // Pay from capital if negative
         if self.accounts[idx].fee_credits.is_negative() {
@@ -1848,12 +1863,13 @@ impl RiskEngine {
                 self.set_capital(idx, cap - pay);
                 self.insurance_fund.balance = self.insurance_fund.balance + pay;
                 self.insurance_fund.fee_revenue = self.insurance_fund.fee_revenue + pay;
-                // pay <= owed = |fee_credits|, so fee_credits + pay <= 0: no overflow
-                let pay_i128 = core::cmp::min(pay, i128::MAX as u128) as i128;
-                self.accounts[idx].fee_credits = self.accounts[idx].fee_credits
-                    .saturating_add(pay_i128);
+                let pay_i128: i128 = pay.try_into().map_err(|_| RiskError::Overflow)?;
+                let new_credits = self.accounts[idx].fee_credits.get()
+                    .checked_add(pay_i128).ok_or(RiskError::Overflow)?;
+                self.accounts[idx].fee_credits = I128::new(new_credits);
             }
         }
+        Ok(())
     }
 
     // ========================================================================
@@ -1902,7 +1918,8 @@ impl RiskEngine {
         };
 
         if excess > 0 {
-            self.c_tot = U128::new(self.c_tot.get().saturating_add(excess));
+            self.c_tot = U128::new(self.c_tot.get().checked_add(excess)
+                .ok_or(RiskError::Overflow)?);
         }
 
         Ok(idx)
@@ -1955,7 +1972,8 @@ impl RiskEngine {
         };
 
         if excess > 0 {
-            self.c_tot = U128::new(self.c_tot.get().saturating_add(excess));
+            self.c_tot = U128::new(self.c_tot.get().checked_add(excess)
+                .ok_or(RiskError::Overflow)?);
         }
 
         Ok(idx)
@@ -2046,7 +2064,7 @@ impl RiskEngine {
         self.vault = U128::new(sub_u128(self.vault.get(), amount));
 
         // End-of-instruction resets
-        let _ = self.schedule_end_of_instruction_resets(&mut ctx);
+        self.schedule_end_of_instruction_resets(&mut ctx)?;
         self.finalize_end_of_instruction_resets(&ctx);
 
         Ok(())
@@ -2087,6 +2105,9 @@ impl RiskEngine {
 
         if !self.is_used(a as usize) || !self.is_used(b as usize) {
             return Err(RiskError::AccountNotFound);
+        }
+        if a == b {
+            return Err(RiskError::Overflow);
         }
 
         let mut ctx = InstructionContext::new();
@@ -2163,7 +2184,7 @@ impl RiskEngine {
 
         // Charge fee from account a (payer)
         if fee > 0 {
-            self.charge_fee_safe(a as usize, fee);
+            self.charge_fee_safe(a as usize, fee)?;
         }
 
         // Track LP fees
@@ -2260,7 +2281,7 @@ impl RiskEngine {
         self.fee_debt_sweep(b as usize);
 
         // Steps 16-17: end-of-instruction resets
-        let _ = self.schedule_end_of_instruction_resets(&mut ctx);
+        self.schedule_end_of_instruction_resets(&mut ctx)?;
         self.finalize_end_of_instruction_resets(&ctx);
 
         // Step 18: assert OI balance (spec §10.4)
@@ -2269,8 +2290,8 @@ impl RiskEngine {
         Ok(())
     }
 
-    /// Charge fee per spec §8.1 — checked, panics on overflow (corruption).
-    fn charge_fee_safe(&mut self, idx: usize, fee: u128) {
+    /// Charge fee per spec §8.1 — checked arithmetic, returns error on overflow.
+    fn charge_fee_safe(&mut self, idx: usize, fee: u128) -> Result<()> {
         let cap = self.accounts[idx].capital.get();
         let fee_paid = core::cmp::min(fee, cap);
         if fee_paid > 0 {
@@ -2282,15 +2303,14 @@ impl RiskEngine {
         if fee_shortfall > 0 {
             let shortfall_i256 = I256::from_u128(fee_shortfall);
             let old_pnl = self.accounts[idx].pnl;
-            // Clamp on underflow instead of panicking — a panic here would
-            // brick liquidations for heavily underwater accounts (§1.5 Rule 16).
-            let new_pnl = match old_pnl.checked_sub(shortfall_i256) {
-                Some(v) if v == I256::MIN => I256::MIN.checked_add(I256::ONE).unwrap(),
-                Some(v) => v,
-                None => I256::MIN.checked_add(I256::ONE).unwrap(),
-            };
+            let new_pnl = old_pnl.checked_sub(shortfall_i256)
+                .ok_or(RiskError::Overflow)?;
+            if new_pnl == I256::MIN {
+                return Err(RiskError::Overflow);
+            }
             self.set_pnl(idx, new_pnl);
         }
+        Ok(())
     }
 
     /// Check side-mode gating: reject trade if net OI increases on a blocked side (spec §9.6)
@@ -2373,7 +2393,7 @@ impl RiskEngine {
         let result = self.liquidate_at_oracle_internal(idx, now_slot, oracle_price, &mut ctx)?;
         if result {
             // End-of-instruction resets (spec §10.5 steps 6-7)
-            let _ = self.schedule_end_of_instruction_resets(&mut ctx);
+            self.schedule_end_of_instruction_resets(&mut ctx)?;
             self.finalize_end_of_instruction_resets(&ctx);
 
             // Assert OI balance (spec §10.5)
@@ -2439,7 +2459,7 @@ impl RiskEngine {
             0
         };
         let liq_fee = core::cmp::min(liq_fee_raw, self.params.liquidation_fee_cap.get());
-        self.charge_fee_safe(idx as usize, liq_fee);
+        self.charge_fee_safe(idx as usize, liq_fee)?;
 
         // Step 8: determine deficit D
         let eff_post = self.effective_pos_q(idx as usize);
@@ -2505,7 +2525,7 @@ impl RiskEngine {
             if forgive > 0 && dt > 0 {
                 self.accounts[caller_idx as usize].last_fee_slot = last_fee.saturating_add(forgive);
             }
-            self.settle_maintenance_fee_internal(caller_idx as usize, now_slot);
+            self.settle_maintenance_fee_internal(caller_idx as usize, now_slot)?;
             (forgive, true)
         } else {
             (0, true)
@@ -2583,7 +2603,7 @@ impl RiskEngine {
         let num_gc_closed = self.garbage_collect_dust();
 
         // Steps 3-4: end-of-instruction resets (spec §10.6)
-        let _ = self.schedule_end_of_instruction_resets(&mut ctx);
+        self.schedule_end_of_instruction_resets(&mut ctx)?;
         self.finalize_end_of_instruction_resets(&ctx);
 
         Ok(CrankOutcome {
@@ -2643,7 +2663,7 @@ impl RiskEngine {
         self.set_capital(idx as usize, 0);
 
         // End-of-instruction resets before freeing
-        let _ = self.schedule_end_of_instruction_resets(&mut ctx);
+        self.schedule_end_of_instruction_resets(&mut ctx)?;
         self.finalize_end_of_instruction_resets(&ctx);
 
         self.free_slot(idx);
@@ -2679,8 +2699,10 @@ impl RiskEngine {
                 continue;
             }
 
-            // Best-effort fee settle
-            self.settle_maintenance_fee_internal(idx, self.current_slot);
+            // Best-effort fee settle (GC is non-critical; skip on error)
+            if self.settle_maintenance_fee_internal(idx, self.current_slot).is_err() {
+                continue;
+            }
 
             // Dust predicate: zero position basis, zero capital, zero reserved, non-positive pnl
             let account = &self.accounts[idx];

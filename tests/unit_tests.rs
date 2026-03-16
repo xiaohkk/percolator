@@ -1209,15 +1209,12 @@ fn test_maintenance_fee_does_not_reach_i128_min() {
     engine.accounts[idx as usize].fee_credits = I128::new(i128::MIN + 2);
     engine.accounts[idx as usize].last_fee_slot = 0;
 
-    // Touch should not panic — fee_credits must be clamped above i128::MIN
+    // Touch must return Err — fee_per_slot * dt overflows u128 with checked math.
+    // This is the correct "fail conservatively" behavior per §1.5 Rule 9.
     engine.last_oracle_price = 1000;
     engine.last_market_slot = 100;
     let result = engine.touch_account_full(idx as usize, 1000, 100);
-    assert!(result.is_ok(), "touch must not panic on extreme fee debt");
-
-    // fee_credits must never be exactly i128::MIN
-    assert!(engine.accounts[idx as usize].fee_credits.get() != i128::MIN,
-        "fee_credits must not reach i128::MIN");
+    assert!(result.is_err(), "touch must fail on extreme fee overflow");
 }
 
 // ============================================================================
@@ -1283,4 +1280,85 @@ fn test_keeper_crank_propagates_corruption() {
     // keeper_crank must propagate the CorruptState error, not swallow it
     let result = engine.keeper_crank(a, 2, oracle, 0);
     assert!(result.is_err(), "keeper_crank must propagate corruption errors");
+}
+
+// ============================================================================
+// Self-trade rejection
+// ============================================================================
+
+#[test]
+fn test_self_trade_rejected() {
+    let mut engine = RiskEngine::new(default_params());
+    let oracle = 1000u64;
+    let slot = 1u64;
+    engine.current_slot = slot;
+
+    let a = engine.add_user(1000).expect("add a");
+    engine.deposit(a, 100_000, oracle, slot).expect("dep a");
+    engine.keeper_crank(a, slot, oracle, 0).expect("crank");
+
+    let size_q = make_size_q(1);
+    let result = engine.execute_trade(a, a, oracle, slot, size_q, oracle);
+    assert!(result.is_err(), "self-trade (a == b) must be rejected");
+}
+
+// ============================================================================
+// Same-slot price change applies mark-to-market
+// ============================================================================
+
+#[test]
+fn test_same_slot_price_change_applies_mark() {
+    let mut engine = RiskEngine::new(default_params());
+    let oracle = 1000u64;
+    let slot = 1u64;
+    engine.current_slot = slot;
+    engine.last_oracle_price = oracle;
+    engine.last_market_slot = slot; // same slot
+    engine.adl_mult_long = ADL_ONE;
+    engine.adl_mult_short = ADL_ONE;
+    engine.oi_eff_long_q = U256::from_u128(POS_SCALE);
+    engine.oi_eff_short_q = U256::from_u128(POS_SCALE);
+
+    let k_long_before = engine.adl_coeff_long;
+    let k_short_before = engine.adl_coeff_short;
+
+    // Same slot, different price: mark-only update must apply
+    let new_oracle = 1100u64;
+    engine.accrue_market_to(slot, new_oracle).expect("accrue");
+
+    // K_long must increase (price went up, longs gain)
+    assert!(engine.adl_coeff_long > k_long_before,
+        "K_long must increase on same-slot price rise");
+    // K_short must decrease (shorts lose)
+    assert!(engine.adl_coeff_short < k_short_before,
+        "K_short must decrease on same-slot price rise");
+    // Oracle price must be updated
+    assert!(engine.last_oracle_price == new_oracle,
+        "last_oracle_price must be updated");
+}
+
+// ============================================================================
+// schedule_end_of_instruction_resets error propagation
+// ============================================================================
+
+#[test]
+fn test_schedule_reset_error_propagated_in_withdraw() {
+    let mut engine = RiskEngine::new(default_params());
+    let oracle = 1000u64;
+    let slot = 1u64;
+    engine.current_slot = slot;
+
+    let a = engine.add_user(1000).expect("add a");
+    engine.deposit(a, 100_000, oracle, slot).expect("dep a");
+    engine.keeper_crank(a, slot, oracle, 0).expect("crank");
+
+    // Corrupt state: stored_pos_count says 0 but OI is non-zero and unequal.
+    // This makes schedule_end_of_instruction_resets return CorruptState.
+    engine.stored_pos_count_long = 0;
+    engine.stored_pos_count_short = 0;
+    engine.oi_eff_long_q = U256::from_u128(POS_SCALE);
+    engine.oi_eff_short_q = U256::from_u128(POS_SCALE * 2); // unequal OI
+
+    let result = engine.withdraw(a, 1, oracle, slot);
+    assert!(result.is_err(), "withdraw must propagate reset error on corrupt state");
 }
