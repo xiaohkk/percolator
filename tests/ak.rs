@@ -640,6 +640,9 @@ fn t1_8_adl_deficit_only_lazy_equals_eager() {
     let lazy_loss = -lazy_loss_raw;
     assert!(lazy_loss >= eager_loss,
         "ADL deficit lazy must be at least as large as eager");
+    // Upper bound: lazy overshoot bounded by 1 base unit (ceiling rounding)
+    assert!(lazy_loss <= eager_loss + (q_base as i32),
+        "ADL deficit lazy overshoot must be bounded by q_base");
 }
 
 // ============================================================================
@@ -684,6 +687,9 @@ fn t1_9_adl_quantity_plus_deficit_lazy_conservative() {
 
     assert!(lazy_loss >= eager_loss,
         "ADL PnL: lazy loss must be >= eager loss (conservative)");
+    // Upper bound: lazy overshoot bounded by 1 base unit (ceiling rounding)
+    assert!(lazy_loss <= eager_loss + (q_base as i32),
+        "ADL PnL: lazy overshoot must be bounded by q_base");
 }
 
 // ============================================================================
@@ -2956,8 +2962,10 @@ fn t11_51_execute_trade_slippage_zero_sum() {
 // T11.52: touch_account_full_restart_conversion_fee_seniority
 // ============================================================================
 
-/// Real engine: after touch_account_full with warmup maturity and fee debt,
-/// restart-on-new-profit fires and fee_debt_sweep runs.
+/// Real engine: after touch_account_full with warmup maturity, pre-existing
+/// positive PnL (so old_warmable > 0), and fee debt, restart-on-new-profit
+/// fires with nonzero old_warmable, converting warmable → capital, then
+/// fee_debt_sweep runs with the seniority path.
 #[kani::proof]
 #[kani::solver(cadical)]
 fn t11_52_touch_account_full_restart_fee_seniority() {
@@ -2978,7 +2986,14 @@ fn t11_52_touch_account_full_restart_fee_seniority() {
     engine.adl_epoch_long = 0;
     engine.oi_eff_long_q = U256::from_u128(POS_SCALE);
 
-    // K_long positive → will produce positive PnL on settle
+    // Give account pre-existing positive PnL so old_warmable > 0
+    // This ensures restart_on_new_profit actually converts warmable → capital
+    let pre_pnl = I256::from_u128(5000);
+    engine.accounts[idx as usize].pnl = pre_pnl;
+    engine.pnl_pos_tot = U256::from_u128(5000);
+
+    // K_long positive → will produce ADDITIONAL positive PnL on settle
+    // (new_avail > old_avail triggers restart path)
     engine.adl_coeff_long = I256::from_i128((ADL_ONE as i128) * 100);
 
     // Fee debt: negative fee_credits (-500)
@@ -3306,12 +3321,14 @@ fn t13_54_funding_no_mint_asymmetric_a() {
     //   (dk_long * A_short) + (dk_short * A_long) <= 0
     // This is because total PnL = OI * (dk/A), so the cross-product
     // normalizes both sides to comparable units.
-    let a_short_i = I256::from_u128(a_short as u128);
-    let a_long_i = I256::from_u128(a_long as u128);
-    let term_long = dk_long.checked_mul(a_short_i).unwrap();
-    let term_short = dk_short.checked_mul(a_long_i).unwrap();
+    // Values are small (u8-range A, small K deltas from u8 funding rates),
+    // so i128 multiplication is safe and avoids needing I256::checked_mul.
+    let dk_long_i128 = dk_long.try_into_i128().unwrap();
+    let dk_short_i128 = dk_short.try_into_i128().unwrap();
+    let term_long = dk_long_i128.checked_mul(a_short as i128).unwrap();
+    let term_short = dk_short_i128.checked_mul(a_long as i128).unwrap();
     let cross_total = term_long.checked_add(term_short).unwrap();
-    assert!(!cross_total.is_positive(),
+    assert!(cross_total <= 0,
         "funding must not mint: cross-multiplied K changes must be <= 0");
 }
 
