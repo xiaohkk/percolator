@@ -433,6 +433,67 @@ fn proof_wide_signed_mul_div_floor_sign_and_rounding() {
         "wide_signed_mul_div_floor must match reference floor division");
 }
 
+// ============================================================================
+// wide_signed_mul_div_floor_from_k_pair correctness (spec §4.8)
+// ============================================================================
+//
+// This is the spec-normative K-pair variant used in settle_side_effects (§5.3).
+// It performs the K-difference in a wide intermediate, then multiplies and divides.
+// Verifies that wide subtraction, sign handling, and floor rounding are correct
+// even when k_now < k_then (negative K-difference).
+
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_k_pair_variant_sign_and_rounding() {
+    let basis: u8 = kani::any();
+    let k_now_val: i8 = kani::any();
+    let k_then_val: i8 = kani::any();
+    let denom: u8 = kani::any();
+
+    kani::assume(basis > 0);
+    kani::assume(denom > 0);
+
+    let abs_basis = basis as u128;
+    let k_now = k_now_val as i128;
+    let k_then = k_then_val as i128;
+    let den = denom as u128;
+
+    let result = wide_signed_mul_div_floor_from_k_pair(abs_basis, k_now, k_then, den);
+
+    // Reference: compute in i32 to avoid overflow at u8 scale
+    let k_diff = (k_now_val as i32) - (k_then_val as i32);
+    let numerator = (basis as i32) * k_diff;
+    // Floor division: toward negative infinity
+    let expected = if numerator >= 0 {
+        numerator / (denom as i32)
+    } else {
+        let abs_num = (-numerator) as u32;
+        let d = denom as u32;
+        -(((abs_num + d - 1) / d) as i32)
+    };
+
+    assert!(result == expected as i128,
+        "K-pair variant must match reference floor division");
+}
+
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_k_pair_variant_zero_diff() {
+    let basis: u8 = kani::any();
+    let k_val: i8 = kani::any();
+    let denom: u8 = kani::any();
+    kani::assume(basis > 0);
+    kani::assume(denom > 0);
+
+    // k_now == k_then → result must be 0
+    let result = wide_signed_mul_div_floor_from_k_pair(
+        basis as u128, k_val as i128, k_val as i128, denom as u128,
+    );
+    assert!(result == 0, "K-pair with equal k_now and k_then must return 0");
+}
+
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]

@@ -462,6 +462,69 @@ fn t2_13_touch_equals_eager_replay() {
 }
 
 // ############################################################################
+// T2.14: COMPOSITION ACROSS A-CHANGING EVENT (mark → ADL → mark)
+// ############################################################################
+//
+// Spec §5.1 says events compose: A_new = A_old * α, K_new = K_old + A_old * β.
+// This test verifies the algebraic identity when A is modified by an ADL event
+// between two mark events. None of the existing t2_1x proofs change A.
+
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn t2_14_compose_mark_adl_mark() {
+    // Symbolic inputs — small-model scale
+    let q_base: u8 = kani::any();
+    kani::assume(q_base > 0 && q_base <= 10);
+    let dp1: i8 = kani::any();
+    kani::assume(dp1 >= -10 && dp1 <= 10);
+    let dp2: i8 = kani::any();
+    kani::assume(dp2 >= -10 && dp2 <= 10);
+
+    // ADL parameters: remove q_adl from OI, shrinking A
+    let oi: u8 = kani::any();
+    kani::assume(oi >= 2 && oi <= 15);
+    let q_adl: u8 = kani::any();
+    kani::assume(q_adl > 0 && q_adl < oi);
+    let oi_post = oi - q_adl;
+
+    let a0 = S_ADL_ONE;
+    let basis_q = (q_base as u16) * S_POS_SCALE;
+
+    // Eager sequence: mark1 → ADL → mark2
+    // Mark 1: PnL = q_base * dp1
+    let eager_mark1 = (q_base as i32) * (dp1 as i32);
+
+    // ADL: A changes from a0 to a_new = floor(a0 * oi_post / oi)
+    let a_new = a_after_adl(a0, oi_post as u16, oi as u16);
+    kani::assume(a_new > 0);
+
+    // After ADL, effective q shrinks: q_eff_new = floor(basis_q * a_new / a0)
+    let q_eff_new = lazy_eff_q(basis_q, a_new, a0);
+    kani::assume(q_eff_new > 0);
+
+    // Mark 2: PnL on the reduced effective position
+    let eager_mark2 = (q_eff_new as i32) * (dp2 as i32);
+    let eager_total = eager_mark1 + eager_mark2;
+
+    // Lazy sequence: K accumulates both marks, but the ADL changes A mid-stream
+    let k0: i32 = 0;
+    // K after first mark (at A = a0)
+    let k1 = k_after_mark_long(k0, a0, dp1 as i32);
+    // K after ADL: K doesn't change from ADL quantity socialization with D=0
+    let k_after_adl = k1;
+    // K after second mark (at A = a_new, post-ADL)
+    let k2 = k_after_mark_long(k_after_adl, a_new, dp2 as i32);
+
+    // Lazy PnL: evaluate at original basis with k_diff = k2 - k0
+    let k_diff = k2 - k0;
+    let lazy_total = lazy_pnl(basis_q, k_diff, a0);
+
+    assert!(eager_total == lazy_total,
+        "composition across A-changing ADL event: eager != lazy");
+}
+
+// ############################################################################
 // T3: EPOCH SETTLEMENT (subset)
 // ############################################################################
 

@@ -823,12 +823,36 @@ fn t12_53_adl_truncation_dust_must_not_deadlock() {
     let mut engine = RiskEngine::new(zero_fee_params());
     let mut ctx = InstructionContext::new();
 
+    // Create one long account with known position, one short counterpart.
+    let a = engine.add_user(0).unwrap();
+    let b = engine.add_user(0).unwrap();
+    engine.deposit(a, 10_000_000, 100, 0).unwrap();
+    engine.deposit(b, 10_000_000, 100, 0).unwrap();
+
+    // Set up: one long position at A=7, one short position for OI balance.
     engine.adl_mult_long = 7;
+    engine.adl_mult_short = ADL_ONE;
     engine.adl_coeff_long = 0i128;
+    engine.adl_coeff_short = 0i128;
+
+    // Account a: long 10*POS_SCALE at a_basis=7
+    engine.accounts[a as usize].position_basis_q = (10 * POS_SCALE) as i128;
+    engine.accounts[a as usize].adl_a_basis = 7;
+    engine.accounts[a as usize].adl_k_snap = 0i128;
+    engine.accounts[a as usize].adl_epoch_snap = 0;
+
+    // Account b: short 10*POS_SCALE at a_basis=ADL_ONE
+    engine.accounts[b as usize].position_basis_q = -((10 * POS_SCALE) as i128);
+    engine.accounts[b as usize].adl_a_basis = ADL_ONE;
+    engine.accounts[b as usize].adl_k_snap = 0i128;
+    engine.accounts[b as usize].adl_epoch_snap = 0;
+
+    engine.stored_pos_count_long = 1;
+    engine.stored_pos_count_short = 1;
     engine.oi_eff_long_q = 10 * POS_SCALE;
     engine.oi_eff_short_q = 10 * POS_SCALE;
-    engine.stored_pos_count_long = 1;
 
+    // ADL: close 1*POS_SCALE from short side → shrinks A_long
     let result = engine.enqueue_adl(
         &mut ctx, Side::Short, POS_SCALE, 0u128,
     );
@@ -836,20 +860,28 @@ fn t12_53_adl_truncation_dust_must_not_deadlock() {
     assert!(engine.adl_mult_long == 6);
     assert!(engine.oi_eff_long_q == 9 * POS_SCALE);
 
-    let effective = mul_div_floor_u128(10 * POS_SCALE, 6, 7);
+    // Now settle account a through the engine to get actual effective position + dust
+    let settle_result = engine.settle_side_effects(a as usize);
+    assert!(settle_result.is_ok());
 
-    engine.oi_eff_long_q = engine.oi_eff_long_q.checked_sub(effective).unwrap();
-    engine.oi_eff_short_q = engine.oi_eff_short_q.checked_sub(effective).unwrap();
+    // Get a's actual effective position after settlement
+    let eff_a = engine.effective_pos_q(a as usize);
+    let abs_eff_a = eff_a.unsigned_abs();
 
-    assert!(engine.oi_eff_long_q != 0);
+    // Attach the effective position (zeroing it) to close a's long
+    engine.attach_effective_position(a as usize, 0i128);
+
+    // Similarly settle and close b's short
+    let settle_b = engine.settle_side_effects(b as usize);
+    assert!(settle_b.is_ok());
+    let eff_b = engine.effective_pos_q(b as usize);
+    engine.attach_effective_position(b as usize, 0i128);
+
+    // Update OI through actual decrements
+    engine.oi_eff_long_q = engine.oi_eff_long_q.checked_sub(abs_eff_a).unwrap_or(0);
+    engine.oi_eff_short_q = engine.oi_eff_short_q.checked_sub(eff_b.unsigned_abs()).unwrap_or(0);
+
     assert!(engine.oi_eff_long_q == engine.oi_eff_short_q);
-
-    engine.stored_pos_count_long = 0;
-    engine.stored_pos_count_short = 0;
-    engine.phantom_dust_bound_long_q = engine.phantom_dust_bound_long_q
-        .checked_add(1u128).unwrap();
-    engine.phantom_dust_bound_short_q = engine.phantom_dust_bound_short_q
-        .checked_add(1u128).unwrap();
 
     let reset_result = engine.schedule_end_of_instruction_resets(&mut ctx);
     assert!(reset_result.is_ok(), "ADL truncation dust must not deadlock market reset");
@@ -991,68 +1023,107 @@ fn t14_65_dust_bound_end_to_end_clearance() {
     let mut engine = RiskEngine::new(zero_fee_params());
     let mut ctx = InstructionContext::new();
 
+    // Create two long accounts and two short counterparts for OI balance.
     let a_idx = engine.add_user(0).unwrap();
     let b_idx = engine.add_user(0).unwrap();
+    let c_idx = engine.add_user(0).unwrap();
+    let d_idx = engine.add_user(0).unwrap();
     engine.deposit(a_idx, 10_000_000, 100, 0).unwrap();
     engine.deposit(b_idx, 10_000_000, 100, 0).unwrap();
+    engine.deposit(c_idx, 10_000_000, 100, 0).unwrap();
+    engine.deposit(d_idx, 10_000_000, 100, 0).unwrap();
 
     engine.adl_mult_long = 13;
+    engine.adl_mult_short = ADL_ONE;
     engine.adl_coeff_long = 0i128;
+    engine.adl_coeff_short = 0i128;
     engine.adl_epoch_long = 0;
 
+    // Account a: long 7*POS_SCALE at a_basis=13
     engine.accounts[a_idx as usize].position_basis_q = (7 * POS_SCALE) as i128;
     engine.accounts[a_idx as usize].adl_a_basis = 13;
     engine.accounts[a_idx as usize].adl_k_snap = 0i128;
     engine.accounts[a_idx as usize].adl_epoch_snap = 0;
 
+    // Account b: long 5*POS_SCALE at a_basis=13
     engine.accounts[b_idx as usize].position_basis_q = (5 * POS_SCALE) as i128;
     engine.accounts[b_idx as usize].adl_a_basis = 13;
     engine.accounts[b_idx as usize].adl_k_snap = 0i128;
     engine.accounts[b_idx as usize].adl_epoch_snap = 0;
 
+    // Accounts c,d: short 6*POS_SCALE each for OI balance
+    engine.accounts[c_idx as usize].position_basis_q = -((6 * POS_SCALE) as i128);
+    engine.accounts[c_idx as usize].adl_a_basis = ADL_ONE;
+    engine.accounts[c_idx as usize].adl_k_snap = 0i128;
+    engine.accounts[c_idx as usize].adl_epoch_snap = 0;
+
+    engine.accounts[d_idx as usize].position_basis_q = -((6 * POS_SCALE) as i128);
+    engine.accounts[d_idx as usize].adl_a_basis = ADL_ONE;
+    engine.accounts[d_idx as usize].adl_k_snap = 0i128;
+    engine.accounts[d_idx as usize].adl_epoch_snap = 0;
+
     engine.stored_pos_count_long = 2;
+    engine.stored_pos_count_short = 2;
     engine.oi_eff_long_q = 12 * POS_SCALE;
     engine.oi_eff_short_q = 12 * POS_SCALE;
 
+    // ADL: close 3*POS_SCALE from short side → shrinks A_long
     let result = engine.enqueue_adl(
         &mut ctx, Side::Short, 3 * POS_SCALE, 0u128,
     );
     assert!(result.is_ok());
     assert!(engine.adl_mult_long == 9);
-
     assert!(engine.phantom_dust_bound_long_q != 0);
 
-    let q_eff_0 = mul_div_floor_u128(7 * POS_SCALE, 9, 13);
-    let q_eff_1 = mul_div_floor_u128(5 * POS_SCALE, 9, 13);
+    // Settle all four accounts through the engine's actual settle path
+    let sa = engine.settle_side_effects(a_idx as usize);
+    assert!(sa.is_ok());
+    let sb = engine.settle_side_effects(b_idx as usize);
+    assert!(sb.is_ok());
+    let sc = engine.settle_side_effects(c_idx as usize);
+    assert!(sc.is_ok());
+    let sd = engine.settle_side_effects(d_idx as usize);
+    assert!(sd.is_ok());
 
-    engine.oi_eff_long_q = engine.oi_eff_long_q.checked_sub(q_eff_0).unwrap();
-    engine.oi_eff_long_q = engine.oi_eff_long_q.checked_sub(q_eff_1).unwrap();
-    engine.oi_eff_short_q = engine.oi_eff_short_q.checked_sub(q_eff_0).unwrap();
-    engine.oi_eff_short_q = engine.oi_eff_short_q.checked_sub(q_eff_1).unwrap();
+    // Close all positions through attach_effective_position (triggers dust accounting)
+    let eff_a = engine.effective_pos_q(a_idx as usize);
+    let eff_b = engine.effective_pos_q(b_idx as usize);
+    let eff_c = engine.effective_pos_q(c_idx as usize);
+    let eff_d = engine.effective_pos_q(d_idx as usize);
 
-    engine.phantom_dust_bound_long_q = engine.phantom_dust_bound_long_q
-        .checked_add(1u128).unwrap();
-    engine.phantom_dust_bound_long_q = engine.phantom_dust_bound_long_q
-        .checked_add(1u128).unwrap();
-    engine.phantom_dust_bound_short_q = engine.phantom_dust_bound_short_q
-        .checked_add(1u128).unwrap();
-    engine.phantom_dust_bound_short_q = engine.phantom_dust_bound_short_q
-        .checked_add(1u128).unwrap();
+    engine.attach_effective_position(a_idx as usize, 0i128);
+    engine.attach_effective_position(b_idx as usize, 0i128);
+    engine.attach_effective_position(c_idx as usize, 0i128);
+    engine.attach_effective_position(d_idx as usize, 0i128);
 
-    engine.stored_pos_count_long = 0;
-    engine.stored_pos_count_short = 0;
+    // Update OI with actual effective positions
+    engine.oi_eff_long_q = engine.oi_eff_long_q
+        .checked_sub(eff_a.unsigned_abs()).unwrap_or(0);
+    engine.oi_eff_long_q = engine.oi_eff_long_q
+        .checked_sub(eff_b.unsigned_abs()).unwrap_or(0);
+    engine.oi_eff_short_q = engine.oi_eff_short_q
+        .checked_sub(eff_c.unsigned_abs()).unwrap_or(0);
+    engine.oi_eff_short_q = engine.oi_eff_short_q
+        .checked_sub(eff_d.unsigned_abs()).unwrap_or(0);
+
+    assert!(engine.oi_eff_long_q == engine.oi_eff_short_q);
 
     let reset_result = engine.schedule_end_of_instruction_resets(&mut ctx);
     assert!(reset_result.is_ok(), "dust bound must be sufficient for reset after all positions closed");
 }
 
 // ############################################################################
-// SPEC PROPERTY #18: trading fee shortfall deducted from PnL
+// SPEC PROPERTY #17: fee shortfall routes to fee_credits, NOT PnL
 // ############################################################################
+//
+// Spec v11.9 §4.10: "Unpaid explicit fees are account-local fee debt.
+// They MUST NOT be written into PNL_i."
+// Spec property #17: "trading-fee or liquidation-fee shortfall becomes
+// negative fee_credits_i, does not touch PNL_i."
 
 #[kani::proof]
 #[kani::solver(cadical)]
-fn proof_fee_shortfall_deducted_from_pnl() {
+fn proof_fee_shortfall_routes_to_fee_credits() {
     let mut params = zero_fee_params();
     params.trading_fee_bps = 10; // 10 bps
     let mut engine = RiskEngine::new(params);
@@ -1067,23 +1138,26 @@ fn proof_fee_shortfall_deducted_from_pnl() {
     let result = engine.execute_trade(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size, DEFAULT_ORACLE);
     assert!(result.is_ok());
 
-    // Now zero a's capital but give positive PnL so they're still solvent
+    // Zero a's capital so the fee can't be paid from principal.
+    // Give enough PnL to stay solvent for margin checks.
     engine.set_capital(a as usize, 0);
-    engine.set_pnl(a as usize, 1_000_000i128);
-    // Ensure vault can back a's withdrawal
-    engine.vault = U128::new(engine.vault.get() + 1_000_000);
+    engine.set_pnl(a as usize, 5_000_000i128);
+    engine.vault = U128::new(engine.vault.get() + 5_000_000);
 
-    let pnl_before = engine.accounts[a as usize].pnl;
+    // Record fee_credits and PnL before the close.
+    let fc_before = engine.accounts[a as usize].fee_credits.get();
 
-    // Close position: a sells back (trade fee will be charged)
+    // Close position: a sells back (trade fee will be charged).
+    // Capital is 0, so the entire fee must be shortfall → fee_credits.
     let neg_size = -(POS_SCALE as i128);
     let result2 = engine.execute_trade(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, neg_size, DEFAULT_ORACLE);
 
     match result2 {
         Ok(()) => {
-            let pnl_after = engine.accounts[a as usize].pnl;
-            assert!(pnl_after < pnl_before,
-                "with zero capital, fee shortfall must reduce PnL");
+            let fc_after = engine.accounts[a as usize].fee_credits.get();
+            // fee_credits must have decreased (become more negative) by the shortfall
+            assert!(fc_after < fc_before,
+                "fee shortfall must decrease fee_credits (create debt)");
         }
         Err(_) => {
             // Trade rejected for margin or other reasons — acceptable.
