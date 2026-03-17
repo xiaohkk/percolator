@@ -179,6 +179,12 @@ fn t0_4_saturating_mul_no_panic() {
 #[kani::unwind(1)]
 #[kani::solver(cadical)]
 fn t0_4_fee_debt_i128_min() {
+    // Per spec §2.1: "fee_credits == i128::MIN is forbidden".
+    // fee_debt_u128_checked is a helper that converts negative fee_credits
+    // to unsigned debt. While the spec forbids i128::MIN as a state value,
+    // the helper still must handle it gracefully (return 2^127) to avoid
+    // panics in defensive code paths. This test validates robustness, not
+    // that i128::MIN is a reachable state.
     let debt = fee_debt_u128_checked(i128::MIN);
     assert!(debt == (1u128 << 127), "fee_debt of i128::MIN must be 2^127");
 }
@@ -205,17 +211,32 @@ fn proof_notional_flat_is_zero() {
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
 fn proof_notional_scales_with_price() {
-    let q: u8 = kani::any();
+    // Use the engine's actual notional() function to verify monotonicity
+    // through the floor(abs(eff_pos_q) * price / POS_SCALE) formula.
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let idx = engine.add_user(0).unwrap();
+    engine.deposit(idx, 10_000_000, 100, 0).unwrap();
+
+    // Give the account a non-zero position
+    let q_mul: u8 = kani::any();
+    kani::assume(q_mul > 0 && q_mul <= 10);
+    engine.accounts[idx as usize].position_basis_q = I256::from_u128(POS_SCALE * (q_mul as u128));
+    engine.accounts[idx as usize].adl_a_basis = ADL_ONE;
+    engine.accounts[idx as usize].adl_k_snap = I256::ZERO;
+    engine.accounts[idx as usize].adl_epoch_snap = 0;
+    engine.adl_epoch_long = 0;
+    engine.adl_mult_long = ADL_ONE;
+    engine.stored_pos_count_long = 1;
+    engine.oi_eff_long_q = U256::from_u128(POS_SCALE * (q_mul as u128));
+
     let p1: u8 = kani::any();
     let p2: u8 = kani::any();
-
-    kani::assume(q > 0);
     kani::assume(p1 > 0);
     kani::assume(p2 >= p1);
 
-    let n1 = (q as u32) * (p1 as u32);
-    let n2 = (q as u32) * (p2 as u32);
-    assert!(n2 >= n1);
+    let n1 = engine.notional(idx as usize, p1 as u64);
+    let n2 = engine.notional(idx as usize, p2 as u64);
+    assert!(n2 >= n1, "notional must be monotone in price");
 }
 
 #[kani::proof]
@@ -357,4 +378,65 @@ fn proof_haircut_mul_div_conservative() {
         U256::from_u128(pnl_val as u128), h_num, h_den);
     assert!(effective <= U256::from_u128(pnl_val as u128),
         "floor haircut must not overshoot pnl");
+}
+
+// ============================================================================
+// wide_signed_mul_div_floor correctness (spec §1.5 item 11)
+// ============================================================================
+//
+// This is the critical 512-bit intermediate path used for PnL delta
+// computation. Verifies:
+//   floor(abs_basis * k_diff / denom) with correct sign and rounding.
+
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_wide_signed_mul_div_floor_sign_and_rounding() {
+    let basis: u8 = kani::any();
+    let k_val: i8 = kani::any();
+    let denom: u8 = kani::any();
+
+    kani::assume(basis > 0);
+    kani::assume(denom > 0);
+    kani::assume(k_val != i8::MIN); // I256::MIN excluded by impl
+
+    let abs_basis = U256::from_u128(basis as u128);
+    let k_diff = I256::from_i128(k_val as i128);
+    let denominator = U256::from_u128(denom as u128);
+
+    let result = wide_signed_mul_div_floor(abs_basis, k_diff, denominator);
+
+    // Reference: compute in i32 to avoid overflow at u8 scale
+    let numerator = (basis as i32) * (k_val as i32);
+    // Floor division: toward negative infinity
+    let expected = if numerator >= 0 {
+        numerator / (denom as i32)
+    } else {
+        // floor for negative: -((-numerator + denom - 1) / denom)
+        let abs_num = (-numerator) as u32;
+        let d = denom as u32;
+        -(((abs_num + d - 1) / d) as i32)
+    };
+
+    let result_i128 = if result.is_negative() {
+        -(result.abs_u256().lo() as i128)
+    } else {
+        result.abs_u256().lo() as i128
+    };
+
+    assert!(result_i128 == expected as i128,
+        "wide_signed_mul_div_floor must match reference floor division");
+}
+
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_wide_signed_mul_div_floor_zero_inputs() {
+    // Zero basis → zero result
+    let result = wide_signed_mul_div_floor(U256::ZERO, I256::from_i128(42), U256::from_u128(1));
+    assert!(result == I256::ZERO);
+
+    // Zero k_diff → zero result
+    let result2 = wide_signed_mul_div_floor(U256::from_u128(42), I256::ZERO, U256::from_u128(1));
+    assert!(result2 == I256::ZERO);
 }

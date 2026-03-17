@@ -113,22 +113,36 @@ fn bounded_haircut_ratio_bounded() {
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
 fn bounded_equity_nonneg_flat() {
+    // Test equity non-negativity with non-trivial haircut (Residual > 0).
+    // Two accounts: idx has the tested state, idx2 provides vault excess
+    // so that Residual = Vault - (C_tot + I) > 0, giving h > 0.
     let mut engine = RiskEngine::new(zero_fee_params());
     let idx = engine.add_user(0).unwrap();
+    let idx2 = engine.add_user(0).unwrap();
 
-    let cap: u32 = kani::any();
-    kani::assume(cap <= 10_000_000);
+    let cap: u16 = kani::any();
+    kani::assume(cap <= 10_000);
     engine.set_capital(idx as usize, cap as u128);
-    engine.vault = U128::new(cap as u128);
 
-    let pnl_val: i32 = kani::any();
-    kani::assume(pnl_val > i32::MIN);
+    // idx2 has capital too, and vault has excess to create Residual > 0
+    let cap2: u16 = kani::any();
+    kani::assume(cap2 <= 10_000);
+    engine.set_capital(idx2 as usize, cap2 as u128);
+
+    let excess: u16 = kani::any();
+    kani::assume(excess <= 10_000);
+    let total_cap = (cap as u128) + (cap2 as u128);
+    engine.vault = U128::new(total_cap + (excess as u128));
+
+    let pnl_val: i16 = kani::any();
+    kani::assume(pnl_val > i16::MIN);
     engine.set_pnl(idx as usize, I256::from_i128(pnl_val as i128));
 
     assert!(engine.accounts[idx as usize].position_basis_q.is_zero());
 
     let eq = engine.account_equity_net(&engine.accounts[idx as usize], DEFAULT_ORACLE);
-    assert!(!eq.is_negative());
+    assert!(!eq.is_negative(),
+        "flat account equity must be non-negative even with non-trivial haircut");
 }
 
 #[kani::proof]
@@ -659,7 +673,8 @@ fn proof_junior_profit_backing() {
 // NEW: proof_protected_principal
 // ############################################################################
 
-/// Flat account capital unaffected by other's insolvency
+/// Flat account capital unaffected by other's insolvency.
+/// Uses touch_account_full which internally calls settle_losses + resolve_flat_negative.
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
@@ -674,12 +689,20 @@ fn proof_protected_principal() {
 
     let a_cap_before = engine.accounts[a as usize].capital.get();
 
-    // b goes insolvent: negative PnL, capital wiped
-    engine.set_pnl(b as usize, I256::from_i128(-500_000));
-    engine.set_capital(b as usize, 0);
-    engine.set_pnl(b as usize, I256::ZERO);
+    // b goes insolvent: negative PnL exceeding capital (so settle_losses
+    // will wipe capital and resolve_flat_negative will absorb remainder)
+    let loss: u16 = kani::any();
+    kani::assume(loss > 0);
+    let loss_val = 500_000u128 + (loss as u128);
+    engine.set_pnl(b as usize, I256::from_i128(-(loss_val as i128)));
 
-    // a's capital must be unchanged
+    // touch_account_full runs the real settlement pipeline:
+    // settle_side_effects → settle_losses → resolve_flat_negative
+    engine.last_oracle_price = DEFAULT_ORACLE;
+    engine.last_market_slot = DEFAULT_SLOT;
+    let _ = engine.touch_account_full(b as usize, DEFAULT_ORACLE, DEFAULT_SLOT);
+
+    // a's capital must be unchanged through b's entire loss resolution
     let a_cap_after = engine.accounts[a as usize].capital.get();
     assert!(a_cap_after == a_cap_before,
         "flat account capital must be unaffected by other's insolvency");
