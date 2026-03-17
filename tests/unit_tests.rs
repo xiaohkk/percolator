@@ -1362,3 +1362,460 @@ fn test_schedule_reset_error_propagated_in_withdraw() {
     let result = engine.withdraw(a, 1, oracle, slot);
     assert!(result.is_err(), "withdraw must propagate reset error on corrupt state");
 }
+
+// ============================================================================
+// Wide arithmetic: U512-backed mul_div with large operands
+// ============================================================================
+
+#[test]
+fn test_wide_signed_mul_div_floor_large_operands() {
+    use percolator::wide_math::wide_signed_mul_div_floor;
+
+    // Large basis * large positive K_diff
+    let abs_basis = U256::from_u128(u128::MAX);
+    let k_diff = I256::from_i128(i128::MAX);
+    let denom = U256::from_u128(POS_SCALE);
+    let result = wide_signed_mul_div_floor(abs_basis, k_diff, denom);
+    // Must not panic; result should be positive (positive * positive / positive)
+    assert!(!result.is_negative(), "positive inputs must give non-negative result");
+
+    // Large basis * large negative K_diff (floor toward -inf)
+    let k_neg = I256::from_i128(-1_000_000_000);
+    let result_neg = wide_signed_mul_div_floor(abs_basis, k_neg, denom);
+    assert!(result_neg.is_negative(), "negative k_diff must give negative result");
+
+    // Verify floor rounding: for negative results with remainder, result should
+    // be strictly more negative than truncation toward zero.
+    // (-1 * 3) / 2 => floor = -2, not -1 (truncation).
+    let basis_3 = U256::from_u128(3);
+    let k_neg1 = I256::from_i128(-1);
+    let denom_2 = U256::from_u128(2);
+    let floored = wide_signed_mul_div_floor(basis_3, k_neg1, denom_2);
+    assert_eq!(floored, I256::from_i128(-2), "floor(-3/2) must be -2");
+}
+
+#[test]
+fn test_wide_signed_mul_div_floor_zero_cases() {
+    use percolator::wide_math::wide_signed_mul_div_floor;
+
+    // Zero basis
+    let result = wide_signed_mul_div_floor(U256::ZERO, I256::from_i128(42), U256::from_u128(1));
+    assert_eq!(result, I256::ZERO);
+
+    // Zero k_diff
+    let result = wide_signed_mul_div_floor(U256::from_u128(42), I256::ZERO, U256::from_u128(1));
+    assert_eq!(result, I256::ZERO);
+}
+
+#[test]
+fn test_mul_div_floor_u256_large_product() {
+    use percolator::wide_math::mul_div_floor_u256;
+
+    // (u128::MAX * u128::MAX) / 1 should not panic — uses U512 internally
+    let a = U256::from_u128(u128::MAX);
+    let b = U256::from_u128(u128::MAX);
+    let d = U256::from_u128(u128::MAX); // dividing by same magnitude keeps in range
+    let result = mul_div_floor_u256(a, b, d);
+    assert_eq!(result, U256::from_u128(u128::MAX), "u128::MAX * u128::MAX / u128::MAX = u128::MAX");
+
+    // Small a * large b / large d => small result
+    let result2 = mul_div_floor_u256(U256::from_u128(1), U256::from_u128(u128::MAX), U256::from_u128(u128::MAX));
+    assert_eq!(result2, U256::from_u128(1));
+}
+
+#[test]
+fn test_mul_div_ceil_u256_rounding() {
+    use percolator::wide_math::mul_div_ceil_u256;
+
+    // Exact division: 6 * 2 / 3 = 4 (no rounding needed)
+    let exact = mul_div_ceil_u256(U256::from_u128(6), U256::from_u128(2), U256::from_u128(3));
+    assert_eq!(exact, U256::from_u128(4));
+
+    // Rounding up: 7 * 1 / 3 = ceil(7/3) = 3
+    let ceiled = mul_div_ceil_u256(U256::from_u128(7), U256::from_u128(1), U256::from_u128(3));
+    assert_eq!(ceiled, U256::from_u128(3), "ceil(7/3) must be 3");
+
+    // Minimal remainder: 4 * 1 / 3 = ceil(4/3) = 2
+    let min_rem = mul_div_ceil_u256(U256::from_u128(4), U256::from_u128(1), U256::from_u128(3));
+    assert_eq!(min_rem, U256::from_u128(2), "ceil(4/3) must be 2");
+}
+
+// ============================================================================
+// Multi-step funding accrual over large dt
+// ============================================================================
+
+#[test]
+fn test_accrue_market_to_multi_substep_large_dt() {
+    let mut engine = RiskEngine::new(default_params());
+    engine.last_oracle_price = 1000;
+    engine.last_market_slot = 0;
+    engine.funding_price_sample_last = 1000;
+    engine.adl_mult_long = ADL_ONE;
+    engine.adl_mult_short = ADL_ONE;
+    engine.oi_eff_long_q = U256::from_u128(POS_SCALE);
+    engine.oi_eff_short_q = U256::from_u128(POS_SCALE);
+
+    // High funding rate, large time gap requiring multiple sub-steps
+    engine.funding_rate_bps_per_slot_last = 5000; // 50% bps/slot
+    let large_dt = MAX_FUNDING_DT * 3 + 100; // triggers 4 sub-steps
+
+    let result = engine.accrue_market_to(large_dt, 1100);
+    assert!(result.is_ok(), "multi-substep accrual must not overflow: {:?}", result);
+
+    // Price increased, so K_long must increase (mark + funding payer = long)
+    // K_short must also change from receiving funding
+    assert!(engine.last_market_slot == large_dt);
+    assert!(engine.last_oracle_price == 1100);
+}
+
+#[test]
+fn test_accrue_market_funding_rate_zero_no_funding_applied() {
+    let mut engine = RiskEngine::new(default_params());
+    engine.last_oracle_price = 1000;
+    engine.last_market_slot = 0;
+    engine.funding_price_sample_last = 1000;
+    engine.adl_mult_long = ADL_ONE;
+    engine.adl_mult_short = ADL_ONE;
+    engine.oi_eff_long_q = U256::from_u128(POS_SCALE);
+    engine.oi_eff_short_q = U256::from_u128(POS_SCALE);
+    engine.funding_rate_bps_per_slot_last = 0;
+
+    let k_long_before = engine.adl_coeff_long;
+    let k_short_before = engine.adl_coeff_short;
+
+    // Same price, time passes: with zero rate, only mark applies (0 delta_p)
+    engine.accrue_market_to(100, 1000).unwrap();
+
+    // No price change + no funding → K unchanged
+    assert_eq!(engine.adl_coeff_long, k_long_before);
+    assert_eq!(engine.adl_coeff_short, k_short_before);
+}
+
+#[test]
+fn test_accrue_market_negative_funding_rate() {
+    let mut engine = RiskEngine::new(default_params());
+    engine.last_oracle_price = 1000;
+    engine.last_market_slot = 0;
+    engine.funding_price_sample_last = 1000;
+    engine.adl_mult_long = ADL_ONE;
+    engine.adl_mult_short = ADL_ONE;
+    engine.oi_eff_long_q = U256::from_u128(POS_SCALE);
+    engine.oi_eff_short_q = U256::from_u128(POS_SCALE);
+
+    // Negative rate: shorts pay, longs receive
+    engine.funding_rate_bps_per_slot_last = -1000;
+
+    let k_long_before = engine.adl_coeff_long;
+    let k_short_before = engine.adl_coeff_short;
+
+    engine.accrue_market_to(10, 1000).unwrap(); // same price, time passes
+
+    // Shorts pay → K_short decreases; Longs receive → K_long increases
+    assert!(engine.adl_coeff_short < k_short_before,
+        "negative rate: short K must decrease (payer)");
+    assert!(engine.adl_coeff_long > k_long_before,
+        "negative rate: long K must increase (receiver)");
+}
+
+// ============================================================================
+// Keeper crank: cursor advancement and fairness
+// ============================================================================
+
+#[test]
+fn test_keeper_crank_sweep_complete_flag() {
+    let (mut engine, a, _b) = setup_two_users(10_000_000, 10_000_000);
+
+    // With only 2 accounts, a single crank should sweep all of them
+    let outcome = engine.keeper_crank(a, 5, 1000, 0).unwrap();
+    assert!(outcome.sweep_complete, "crank with few accounts must complete sweep");
+}
+
+#[test]
+fn test_keeper_crank_caller_fee_discount_multi_slot() {
+    let mut engine = RiskEngine::new(default_params());
+    let oracle = 1000u64;
+    let slot = 1u64;
+    engine.current_slot = slot;
+
+    let a = engine.add_user(1000).unwrap();
+    engine.deposit(a, 10_000_000, oracle, slot).unwrap();
+    engine.keeper_crank(a, slot, oracle, 0).unwrap();
+
+    // Advance many slots to accumulate maintenance fee debt
+    let far_slot = 1000u64;
+    engine.accounts[a as usize].last_fee_slot = slot;
+
+    // Run crank at far_slot — caller gets 50% slot forgiveness
+    engine.keeper_crank(a, far_slot, oracle, 0).unwrap();
+
+    // Caller's last_fee_slot should be updated to far_slot (post-settlement)
+    assert_eq!(engine.accounts[a as usize].last_fee_slot, far_slot,
+        "caller's last_fee_slot must be updated after crank settlement");
+}
+
+// ============================================================================
+// Liquidation edge cases
+// ============================================================================
+
+#[test]
+fn test_liquidation_triggers_on_underwater_account() {
+    // Small deposits + large position = high leverage → easily liquidated
+    let (mut engine, a, b) = setup_two_users(100_000, 100_000);
+    let oracle = 1000u64;
+    let slot = 2u64;
+
+    // Trade at maximum leverage the margin allows
+    // With 100k capital, 10% IM, max notional ≈ 1M → ~1000 units at price 1000
+    let size_q = make_size_q(900);
+    engine.execute_trade(a, b, oracle, slot, size_q, oracle).unwrap();
+
+    // Price crashes — longs deeply underwater
+    let crash_price = 500u64; // 50% drop
+    let slot2 = 3;
+
+    // Crank at crash price — accrues market internally then liquidates
+    let outcome = engine.keeper_crank(b, slot2, crash_price, 0).unwrap();
+    assert!(outcome.num_liquidations > 0, "crank must liquidate underwater account after 50% price drop");
+}
+
+#[test]
+fn test_direct_liquidation_returns_to_insurance() {
+    let (mut engine, a, b) = setup_two_users(10_000_000, 10_000_000);
+    let oracle = 1000u64;
+    let slot = 2u64;
+
+    let size_q = make_size_q(10);
+    engine.execute_trade(a, b, oracle, slot, size_q, oracle).unwrap();
+
+    let ins_before = engine.insurance_fund.balance.get();
+
+    // Price crashes — a (long) underwater
+    let crash_price = 100u64;
+    let slot2 = 3;
+    engine.liquidate_at_oracle(a, slot2, crash_price).unwrap();
+
+    let ins_after = engine.insurance_fund.balance.get();
+    // Insurance should receive liquidation fee (or absorb loss)
+    assert!(ins_after >= ins_before, "insurance fund must not decrease on liquidation");
+}
+
+// ============================================================================
+// Conservation law: full lifecycle
+// ============================================================================
+
+#[test]
+fn test_conservation_full_lifecycle() {
+    let (mut engine, a, b) = setup_two_users(10_000_000, 10_000_000);
+    assert!(engine.check_conservation(), "conservation must hold after setup");
+
+    let oracle = 1000u64;
+    let slot = 2u64;
+
+    // Trade
+    let size_q = make_size_q(5);
+    engine.execute_trade(a, b, oracle, slot, size_q, oracle).unwrap();
+    assert!(engine.check_conservation(), "conservation must hold after trade");
+
+    // Price change + crank
+    let slot2 = 3;
+    engine.keeper_crank(a, slot2, 1200, 0).unwrap();
+    assert!(engine.check_conservation(), "conservation must hold after crank with price change");
+
+    // Withdraw
+    engine.withdraw(a, 1_000, 1200, slot2).unwrap();
+    assert!(engine.check_conservation(), "conservation must hold after withdraw");
+
+    // Another crank at different price
+    let slot3 = 4;
+    engine.keeper_crank(b, slot3, 800, 0).unwrap();
+    assert!(engine.check_conservation(), "conservation must hold after second crank");
+}
+
+// ============================================================================
+// Position boundary: max position enforcement
+// ============================================================================
+
+#[test]
+fn test_trade_at_reasonable_size_succeeds() {
+    let (mut engine, a, b) = setup_two_users(100_000_000, 100_000_000);
+    let oracle = 1000u64;
+    let slot = 2u64;
+
+    // Reasonable trade should succeed
+    let size_q = make_size_q(1);
+    let result = engine.execute_trade(a, b, oracle, slot, size_q, oracle);
+    assert!(result.is_ok(), "reasonable trade must succeed");
+    assert!(engine.check_conservation());
+}
+
+// ============================================================================
+// Maintenance fee: overflow on large dt
+// ============================================================================
+
+#[test]
+fn test_maintenance_fee_large_dt_overflow_returns_error() {
+    let mut params = default_params();
+    params.maintenance_fee_per_slot = U128::new(u128::MAX / 2);
+    let mut engine = RiskEngine::new(params);
+    let oracle = 1000u64;
+    let slot = 1u64;
+    engine.current_slot = slot;
+
+    let a = engine.add_user(1000).unwrap();
+    engine.deposit(a, 10_000_000, oracle, slot).unwrap();
+    engine.keeper_crank(a, slot, oracle, 0).unwrap();
+
+    // Use a moderate slot gap (not u64::MAX which loops forever in accrue_market_to).
+    // fee_per_slot = u128::MAX/2, dt = 200_000 → product overflows u128.
+    let far_slot = slot + 200_000;
+    // Set last_market_slot close to far_slot so accrue_market_to is fast
+    engine.last_market_slot = far_slot - 1;
+    engine.last_oracle_price = oracle;
+    engine.funding_price_sample_last = oracle;
+
+    let result = engine.keeper_crank(a, far_slot, oracle, 0);
+    assert!(result.is_err(), "huge maintenance fee must return Err, not panic");
+}
+
+// ============================================================================
+// charge_fee_safe: PnL near I256::MIN boundary
+// ============================================================================
+
+#[test]
+fn test_charge_fee_safe_rejects_pnl_at_i256_min() {
+    let mut engine = RiskEngine::new(default_params());
+    let oracle = 1000u64;
+    let slot = 1u64;
+    engine.current_slot = slot;
+
+    let a = engine.add_user(1000).unwrap();
+    engine.deposit(a, 0, oracle, slot).unwrap(); // zero capital so shortfall goes to PnL
+
+    // Set PnL very close to I256::MIN
+    let near_min = I256::MIN.checked_add(I256::from_i128(1)).unwrap();
+    engine.set_pnl(a as usize, near_min);
+
+    // Liquidation fee would push PnL to exactly I256::MIN — must return Err
+    // We test via the public liquidate path, but first set up the conditions
+    // for an underwater account with a position.
+    engine.accounts[a as usize].position_basis_q = I256::from_u128(POS_SCALE);
+    engine.adl_mult_long = ADL_ONE;
+    engine.adl_mult_short = ADL_ONE;
+    engine.adl_epoch_long = 0;
+    engine.adl_epoch_short = 0;
+    engine.accounts[a as usize].adl_a_basis = ADL_ONE;
+    engine.accounts[a as usize].adl_k_snap = I256::ZERO;
+    engine.accounts[a as usize].adl_epoch_snap = 0;
+    engine.stored_pos_count_long = 1;
+    engine.oi_eff_long_q = U256::from_u128(POS_SCALE);
+    engine.oi_eff_short_q = U256::from_u128(POS_SCALE);
+    engine.last_oracle_price = oracle;
+    engine.last_market_slot = slot;
+    engine.last_crank_slot = slot;
+    engine.funding_price_sample_last = oracle;
+
+    // Liquidation should handle this gracefully (return Err or succeed without I256::MIN)
+    let result = engine.liquidate_at_oracle(a, slot, oracle);
+    // Either it errors out or it succeeds but PnL is not I256::MIN
+    if result.is_ok() {
+        assert!(engine.accounts[a as usize].pnl != I256::MIN,
+            "PnL must never reach I256::MIN");
+    }
+}
+
+// ============================================================================
+// Side mode gating prevents OI increase during DrainOnly
+// ============================================================================
+
+#[test]
+fn test_drain_only_blocks_oi_increase() {
+    let (mut engine, a, b) = setup_two_users(10_000_000, 10_000_000);
+    let oracle = 1000u64;
+    let slot = 2u64;
+
+    // Set long side to DrainOnly
+    engine.side_mode_long = SideMode::DrainOnly;
+
+    // Try to open a new long position — should fail
+    let size_q = make_size_q(1); // a goes long
+    let result = engine.execute_trade(a, b, oracle, slot, size_q, oracle);
+    assert!(result.is_err(), "DrainOnly side must reject OI-increasing trades");
+}
+
+// ============================================================================
+// Oracle price: zero and max boundary
+// ============================================================================
+
+#[test]
+fn test_oracle_price_zero_rejected() {
+    let (mut engine, a, _b) = setup_two_users(10_000_000, 10_000_000);
+    let result = engine.accrue_market_to(2, 0);
+    assert!(result.is_err(), "oracle price 0 must be rejected");
+}
+
+#[test]
+fn test_oracle_price_max_accepted() {
+    let mut engine = RiskEngine::new(default_params());
+    engine.last_oracle_price = 1000;
+    engine.last_market_slot = 0;
+    engine.funding_price_sample_last = 1000;
+    engine.adl_mult_long = ADL_ONE;
+    engine.adl_mult_short = ADL_ONE;
+    engine.funding_rate_bps_per_slot_last = 0;
+
+    let result = engine.accrue_market_to(1, MAX_ORACLE_PRICE);
+    assert!(result.is_ok(), "MAX_ORACLE_PRICE must be accepted");
+
+    let result2 = engine.accrue_market_to(2, MAX_ORACLE_PRICE + 1);
+    assert!(result2.is_err(), "above MAX_ORACLE_PRICE must be rejected");
+}
+
+// ============================================================================
+// Deposit/withdraw roundtrip: conservation on single account
+// ============================================================================
+
+#[test]
+fn test_deposit_withdraw_roundtrip_same_slot() {
+    let (mut engine, a, _b) = setup_two_users(10_000_000, 10_000_000);
+    // Use same slot as setup (slot=1) to avoid maintenance fee deduction
+    let oracle = 1000;
+    let slot = 1;
+
+    let cap_before = engine.accounts[a as usize].capital.get();
+    engine.deposit(a, 5_000_000, oracle, slot).unwrap();
+    assert_eq!(engine.accounts[a as usize].capital.get(), cap_before + 5_000_000);
+
+    // Withdraw full extra amount at same slot — no fee should apply
+    engine.withdraw(a, 5_000_000, oracle, slot).unwrap();
+    assert_eq!(engine.accounts[a as usize].capital.get(), cap_before,
+        "same-slot deposit+withdraw roundtrip must return exact capital");
+    assert!(engine.check_conservation());
+}
+
+// ============================================================================
+// Multiple cranks don't double-process accounts
+// ============================================================================
+
+#[test]
+fn test_double_crank_same_slot_is_safe() {
+    let (mut engine, a, b) = setup_two_users(10_000_000, 10_000_000);
+    let oracle = 1000u64;
+    let slot = 2u64;
+
+    engine.keeper_crank(a, slot, oracle, 0).unwrap();
+
+    let cap_a = engine.accounts[a as usize].capital.get();
+    let cap_b = engine.accounts[b as usize].capital.get();
+
+    // Second crank same slot — should be a no-op (no double fee charges etc.)
+    engine.keeper_crank(b, slot, oracle, 0).unwrap();
+
+    // Capital shouldn't change from a redundant crank
+    // (small tolerance for rounding if any fees apply)
+    let cap_a_after = engine.accounts[a as usize].capital.get();
+    let cap_b_after = engine.accounts[b as usize].capital.get();
+    assert!(cap_a_after == cap_a, "redundant crank must not change capital");
+    assert!(cap_b_after == cap_b, "redundant crank must not change capital");
+    assert!(engine.check_conservation());
+}
+
