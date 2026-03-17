@@ -95,6 +95,8 @@ Together:
 - Markets always recover.
 - Flat accounts keep their deposits.
 
+A/K fairness is exact for open-position economics. H fairness is exact only for the currently stored realized claim set, not for the economically "true" claim set you would get after globally cranking everyone.
+
 ---
 
 ## Open Source
