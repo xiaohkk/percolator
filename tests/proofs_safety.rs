@@ -817,13 +817,14 @@ fn proof_funding_rate_validated_before_storage() {
 #[kani::solver(cadical)]
 fn proof_gc_dust_preserves_fee_credits() {
     let mut engine = RiskEngine::new(zero_fee_params());
+
+    let a = engine.add_user(0).unwrap();
+    engine.deposit(a, 10_000, 100, 1).unwrap();
+
     engine.last_oracle_price = 100;
     engine.last_market_slot = 1;
     engine.last_crank_slot = 1;
     engine.current_slot = 1;
-
-    let a = engine.add_user(0).unwrap();
-    engine.deposit(a, 10_000, 100, 0).unwrap();
 
     // Account has 0 capital, 0 position, but positive fee_credits (prepaid)
     engine.set_capital(a as usize, 0);
@@ -844,7 +845,7 @@ fn proof_gc_dust_preserves_fee_credits() {
     // Now test negative fee_credits (debt): account SHOULD be collected
     // and the uncollectible debt written off
     let b = engine.add_user(0).unwrap();
-    engine.deposit(b, 10_000, 100, 0).unwrap();
+    engine.deposit(b, 10_000, 100, 1).unwrap();
     engine.set_capital(b as usize, 0);
     engine.accounts[b as usize].fee_credits = I128::new(-3_000); // debt
     engine.accounts[b as usize].position_basis_q = 0i128;
@@ -930,7 +931,7 @@ fn proof_trading_loss_seniority() {
 // ############################################################################
 
 #[kani::proof]
-#[kani::unwind(1)]
+#[kani::unwind(34)]
 #[kani::solver(cadical)]
 fn proof_settle_fee_rejects_i128_min() {
     let mut params = zero_fee_params();

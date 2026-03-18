@@ -503,9 +503,16 @@ fn t2_14_compose_mark_adl_mark() {
     let q_eff_new = lazy_eff_q(basis_q, a_new, a0);
     kani::assume(q_eff_new > 0);
 
-    // Mark 2: PnL on the reduced effective position (convert q-units to base units)
-    let q_eff_base = (q_eff_new / S_POS_SCALE) as i32;
-    let eager_mark2 = q_eff_base * (dp2 as i32);
+    // Mark 2: idealized eager PnL = floor(q_base * a_new * dp2 / a0)
+    // No intermediate position rounding — matches how K accumulates in the lazy model
+    let mark2_num = (q_base as i32) * (a_new as i32) * (dp2 as i32);
+    let mark2_den = a0 as i32;
+    let eager_mark2 = if mark2_num >= 0 {
+        mark2_num / mark2_den
+    } else {
+        let abs_num = -mark2_num;
+        -((abs_num + mark2_den - 1) / mark2_den)
+    };
     let eager_total = eager_mark1 + eager_mark2;
 
     // Lazy sequence: K accumulates both marks, but the ADL changes A mid-stream
@@ -691,6 +698,8 @@ fn t7_28a_noncompounding_floor_inequality_correct_direction() {
 fn t7_28b_noncompounding_exact_additivity_divisible_increments() {
     let basis: u8 = kani::any();
     kani::assume(basis > 0);
+    // In the real engine, position_basis_q is always POS_SCALE-aligned
+    kani::assume(basis % 4 == 0);
     let a_basis: u8 = kani::any();
     kani::assume(a_basis > 0);
 
