@@ -1,4 +1,4 @@
-# Risk Engine Spec (Source of Truth) — v11.21
+# Risk Engine Spec (Source of Truth) — v11.26
 
 **Combined Single-Document Native 128-bit Revision  
 (Off-Chain Shortlist Keeper / Flat-Only Auto-Conversion / Full-Local-PnL Maintenance Edition)**
@@ -10,19 +10,14 @@
 
 This is a single combined spec. It supersedes prior delta-style revisions by restating the full current design in one document and replacing the earlier integrated on-chain barrier-scan keeper mode with a minimal on-chain exact-revalidation crank that assumes candidate discovery is performed off chain by permissionless keepers.
 
-## Change summary from v11.20
+## Change summary from v11.25
 
-This revision performs another full consistency pass on the latest document, verifies the previously reported exact-drain ADL reset bug is fixed, and patches the remaining real non-minor issue found in the current design.
+This revision makes two substantive fixes and two clarifications.
 
-1. **The post-withdraw live-balance dust floor is now universal.** A withdrawal MUST leave post-withdraw capital either exactly `0` or at least `MIN_INITIAL_DEPOSIT`, regardless of whether the account currently has an open position. This closes the micro-position flash-withdraw capacity-pinning loop in which an attacker could temporarily hold dust OI to bypass the old flat-only dust rule and then return to a flat unreclaimable `C_i = 1` account.
-
-2. **Open-position matured-profit access is now explicit rather than impossible.** A new top-level `convert_released_pnl(i, x_req, oracle_price, now_slot)` instruction lets an account with an open position voluntarily convert some or all matured released profit into protected principal on current state, then immediately sweep fee debt. This removes the major functional lockout where open-position users could not access matured profits without fully closing the position, while preserving the safety of flat-only automatic conversion on ordinary passive touches.
-
-3. **Risk-reducing trade policy is clarified as fee-inclusive by design, and deployments get an explicit configuration recommendation.** The strict raw-buffer comparison in §10.5 still intentionally uses the actual post-fee state. This is not a correctness bug. To keep the exemption practically usable, deployments that value voluntary de-risking SHOULD configure `trading_fee_bps` materially below `maintenance_bps`.
-
-4. **All v11.20 fixes are preserved.** Profit conversion still uses `consume_released_pnl`, automatic conversion remains flat-only on ordinary touches, maintenance equity still uses full local touched `PNL_i`, the exact-drain `enqueue_adl` reset fix remains in force, flat withdrawals still cannot leave unreclaimable dust, and funding-rate recomputation still clamps rather than reverting.
-
----
+1. **Strict risk-reducing trades now forbid worsening fee-neutral negative raw maintenance equity.** A risk-reducing exemption may still compare fee-neutral raw maintenance buffers, but it MUST also ensure that the trade does not worsen the account's fee-neutral raw maintenance-equity shortfall below zero. A shrinking maintenance requirement therefore cannot be used to mask additional bad debt created by execution slippage.
+2. **Organic flat closes now use exact post-fee `Eq_maint_raw_i`, not `Eq_init_raw_i`.** A trade that clears position risk to zero MUST be allowed to exit when the account's exact post-fee total local net wealth is nonnegative, even if some of that wealth is still reserved in `R_i`. This prevents profitable fast winners from being trapped solely because profit is still warming up.
+3. **`consume_released_pnl` and `convert_released_pnl` remain normative.** This revision reaffirms that profit conversion for matured released PnL is defined only through those helpers / entrypoints, not by generic `set_pnl` loss ordering.
+4. **Deferred fee collection on open positions remains a policy choice, not a safety bug.** The protocol may continue to track unpaid explicit fees as local `fee_credits_i` debt until capital or explicit conversion is available. This can reduce practical Insurance Fund utilization, but it does not create a conservation, solvency-accounting, or liveness violation in the consensus rules.
 
 ## 0. Security goals (normative)
 
@@ -50,7 +45,7 @@ The engine MUST provide the following properties.
 
 11. **No sequential quantity dependency:** Same-epoch account settlement MUST be fully local. It MAY depend on the account's own stored basis and current global side state, but MUST NOT require a canonical-order prefix or global carry cursor.
 
-12. **Protocol-fee neutrality:** Explicit protocol fees MUST either be collected into `I` immediately or tracked as account-local fee debt. They MUST NOT be socialized through `h`, and unpaid explicit fees MUST NOT inflate bankruptcy deficit `D`.
+12. **Protocol-fee neutrality:** Explicit protocol fees MUST either be collected into `I` immediately or tracked as account-local fee debt. They MUST NOT be socialized through `h`, and unpaid explicit fees MUST NOT inflate bankruptcy deficit `D`. A voluntary organic exit to flat MUST NOT be able to leave a reclaimable account with negative exact `Eq_maint_raw_i` solely because protocol fee debt was left behind.
 
 13. **Synthetic liquidation price integrity:** A synthetic liquidation close MUST execute at the current oracle mark with zero execution-price slippage. Any liquidation penalty MUST be represented only by explicit fee state.
 
@@ -60,7 +55,7 @@ The engine MUST provide the following properties.
 
 16. **Deterministic overflow handling:** Any arithmetic condition that is not proven unreachable by the spec's numeric bounds MUST have a deterministic fail-safe or bounded fallback path. Silent wrap, unchecked panic, or undefined truncation are forbidden.
 
-17. **Finite-capacity liveness:** Because account capacity is finite, the engine MUST provide permissionless dead-account reclamation or equivalent slot reuse so abandoned empty accounts cannot permanently exhaust capacity.
+17. **Finite-capacity liveness:** Because account capacity is finite, the engine MUST provide permissionless dead-account reclamation or equivalent slot reuse so abandoned empty accounts and flat dust accounts below the live-balance floor cannot permanently exhaust capacity.
 
 18. **Permissionless off-chain keeper compatibility:** Candidate discovery MAY be performed entirely off chain. The engine MUST expose exact current-state shortlist processing and targeted per-account settle / liquidate / reclaim paths so any permissionless keeper can make liquidation and reset progress without any required on-chain phase-1 scan or trusted off-chain classification.
 
@@ -107,7 +102,8 @@ The following bounds are normative and MUST be enforced.
 - `MAX_ACCOUNT_NOTIONAL = 100_000_000_000_000_000_000`
 - `MAX_PROTOCOL_FEE_ABS = 100_000_000_000_000_000_000`
 - configured `MIN_INITIAL_DEPOSIT` MUST satisfy `0 < MIN_INITIAL_DEPOSIT <= MAX_VAULT_TVL`
-- deployment configuration of `MIN_INITIAL_DEPOSIT` MUST be economically non-trivial for the quote token and MUST NOT be set below the deployment's tolerated live-balance dust threshold
+- configured `MIN_NONZERO_MM_REQ` and `MIN_NONZERO_IM_REQ` MUST satisfy `0 < MIN_NONZERO_MM_REQ < MIN_NONZERO_IM_REQ <= MIN_INITIAL_DEPOSIT`
+- deployment configuration of `MIN_INITIAL_DEPOSIT`, `MIN_NONZERO_MM_REQ`, and `MIN_NONZERO_IM_REQ` MUST be economically non-trivial for the quote token and MUST NOT be set below the deployment's tolerated slot-pinning dust threshold
 - `MAX_ABS_FUNDING_BPS_PER_SLOT = 10_000`
 - `|r_last| <= MAX_ABS_FUNDING_BPS_PER_SLOT`
 - `MAX_TRADING_FEE_BPS = 10_000`
@@ -173,6 +169,7 @@ By clamping constants to base-10 metrics, on-chain persistent state fits nativel
 - Funding receiver numerator: `6.55 × 10^22 * ADL_ONE ≈ 6.55 × 10^28`
 - `A_old * OI_post`: `10^6 * 10^14 = 10^20`
 - `PNL_pos_tot` hard cap: `10^38 < u128::MAX ≈ 3.4 × 10^38`
+- Absolute nonzero-position margin floors: `MIN_NONZERO_MM_REQ` and `MIN_NONZERO_IM_REQ` are bounded by `MIN_INITIAL_DEPOSIT <= 10^16`, so they fit natively in `u128`
 - `K_side` overflow under max-step accumulation requires on the order of `10^12` years
 - The three always-wide paths remain:
   1. exact `pnl_delta`
@@ -253,6 +250,8 @@ The engine MUST also store, or deterministically derive from immutable configura
 - `liquidation_fee_cap`
 - `min_liquidation_abs`
 - `MIN_INITIAL_DEPOSIT`
+- `MIN_NONZERO_MM_REQ`
+- `MIN_NONZERO_IM_REQ`
 - any configured parameters used by `recompute_r_last_from_final_state()`
 - any configured parameters used by the optional recurring maintenance-fee model
 
@@ -301,14 +300,14 @@ On success, it MUST increment the materialized-account count and set:
 - `w_slope_i = 0`
 - `last_fee_slot_i = slot_anchor`
 
-### 2.6 Permissionless empty-account reclamation
+### 2.6 Permissionless empty- or flat-dust-account reclamation
 
 The engine MUST provide a permissionless reclamation path `reclaim_empty_account(i)`.
 
 It MAY succeed only if all of the following hold:
 
 - account `i` is materialized
-- `C_i == 0`
+- `0 <= C_i < MIN_INITIAL_DEPOSIT`
 - `PNL_i == 0`
 - `R_i == 0`
 - `basis_pos_q_i == 0`
@@ -316,12 +315,18 @@ It MAY succeed only if all of the following hold:
 
 On success, it MUST:
 
+- if `C_i > 0`:
+  - let `dust = C_i`
+  - `set_capital(i, 0)`
+  - `I = checked_add_u128(I, dust)`
 - forgive any negative `fee_credits_i` by setting `fee_credits_i = 0`
 - reset all local fields to canonical zero / anchored defaults
 - mark the slot missing / reusable
 - decrement the materialized-account count
 
-A reclaimed empty account MUST contribute nothing to `C_tot`, `PNL_pos_tot`, `PNL_matured_pos_tot`, side counts, stale counts, or OI.
+This forgiveness is safe only because voluntary organic paths that would leave a flat account with negative exact `Eq_maint_raw_i` are forbidden by §10.5. Reclamation is therefore reserved for genuinely empty or economically dust-flat accounts whose remaining fee debt is uncollectible. A user who wishes to preserve a flat balance below `MIN_INITIAL_DEPOSIT` MUST withdraw it to zero or top it back up above the live-balance floor before a permissionless reclaim occurs.
+
+A reclaimed empty or flat-dust account MUST contribute nothing to `C_tot`, `PNL_pos_tot`, `PNL_matured_pos_tot`, side counts, stale counts, or OI. Any swept dust capital becomes part of `I` and leaves `V` unchanged, so `C_tot + I` is conserved.
 
 ### 2.7 Initial market state
 
@@ -433,7 +438,8 @@ Then define:
 
 Interpretation:
 
-- `Eq_init_net_i` is the equity available for initial-margin and withdrawal-style checks. Fresh reserved PnL in `R_i` does **not** count here, and matured junior profit counts only through the global haircut of §3.3.
+- `Eq_init_raw_i` is the exact widened signed quantity used for initial-margin and withdrawal-style approval checks. Fresh reserved PnL in `R_i` does **not** count here, and matured junior profit counts only through the global haircut of §3.3.
+- `Eq_init_net_i` is a clamped nonnegative convenience quantity derived from `Eq_init_raw_i`. It MAY be exposed for reporting, but it MUST NOT be used where negative raw equity must be distinguished from zero, including risk-increasing trade approval and open-position withdrawal approval.
 - `Eq_net_i` / `Eq_maint_raw_i` are the quantities used for maintenance-margin and liquidation checks. On a touched generating account, full local mark-to-market `PNL_i` counts here, whether currently released or still reserved.
 - The global haircut remains a claim-conversion / initial-margin / withdrawal construct. It MUST NOT directly reduce another account's maintenance equity, and pure warmup release on unchanged `C_i`, `PNL_i`, and `fee_credits_i` MUST NOT by itself reduce `Eq_maint_raw_i`.
 - strict risk-reducing buffer comparisons MUST use `Eq_maint_raw_i` (not `Eq_net_i`) so negative raw equity cannot be hidden by the outer `max(0, ·)` floor.
@@ -1100,7 +1106,7 @@ Rules:
 
 The fee MUST be charged using `charge_fee_to_insurance(i, fee)`.
 
-Deployment guidance: because the strict risk-reducing trade exemption of §10.5 compares actual post-fee maintenance buffers, deployments that want voluntary partial de-risking to remain broadly usable SHOULD configure `trading_fee_bps` materially below `maintenance_bps`.
+Deployment guidance: even though the strict risk-reducing trade exemption of §10.5 now holds the explicit fee of the candidate trade constant for the before/after buffer comparison, high trading fees still worsen the actual post-trade state. Deployments that want voluntary partial de-risking to remain broadly usable SHOULD configure `trading_fee_bps` materially below `maintenance_bps`.
 
 ### 8.2 Account-local maintenance fees
 
@@ -1136,7 +1142,7 @@ The short-circuit is on `q_close_q`, not `closed_notional`. Therefore the minimu
 
 `FeeDebt_i = fee_debt_u128_checked(fee_credits_i)`:
 
-- MUST reduce both `Eq_net_i` and `Eq_init_net_i`
+- MUST reduce `Eq_maint_raw_i`, `Eq_net_i`, `Eq_init_raw_i`, and therefore also the derived `Eq_init_net_i`
 - MUST be swept whenever principal becomes available and is no longer senior-encumbered by already-realized trading losses on the same local state
 - MUST NOT directly change `Residual`, `PNL_pos_tot`, or `PNL_matured_pos_tot`
 
@@ -1149,13 +1155,19 @@ The short-circuit is on `q_close_q`, not `closed_notional`. Therefore the minimu
 After `touch_account_full(i, oracle_price, now_slot)`, define:
 
 - `Notional_i = mul_div_floor_u128(abs(effective_pos_q(i)), oracle_price, POS_SCALE)`
-- `MM_req_i = mul_div_floor_u128(Notional_i, maintenance_bps, 10_000)`
-- `IM_req_i = mul_div_floor_u128(Notional_i, initial_bps, 10_000)`
+- if `effective_pos_q(i) == 0`:
+  - `MM_req_i = 0`
+  - `IM_req_i = 0`
+- else:
+  - `MM_req_i = max(mul_div_floor_u128(Notional_i, maintenance_bps, 10_000), MIN_NONZERO_MM_REQ)`
+  - `IM_req_i = max(mul_div_floor_u128(Notional_i, initial_bps, 10_000), MIN_NONZERO_IM_REQ)`
 
 Healthy conditions:
 
 - maintenance healthy if `Eq_net_i > MM_req_i as i128`
-- initial-margin healthy if `Eq_init_net_i >= IM_req_i as i128`
+- initial-margin healthy if exact `Eq_init_raw_i >= (IM_req_i as wide_signed)` in the widened signed domain of §3.4
+
+These absolute nonzero-position floors are a finite-capacity liveness safeguard. A microscopic open position MUST NOT evade both initial-margin and maintenance enforcement solely because proportional notional floors to zero.
 
 ### 9.2 Risk-increasing and strict risk-reducing trades
 
@@ -1233,6 +1245,20 @@ Any operation that would increase net side OI on a side whose mode is `DrainOnly
 
 ## 10. External operations
 
+### 10.0 Standard instruction lifecycle
+
+Unless explicitly noted otherwise (for example `deposit` and `reclaim_empty_account`), an external state-mutating operation that accepts `oracle_price` and `now_slot` executes inside the same standard lifecycle:
+
+1. validate trusted monotonic slot inputs and the validated oracle input required by that endpoint
+2. initialize a fresh instruction context `ctx`
+3. perform the endpoint's exact current-state inner execution
+4. call `schedule_end_of_instruction_resets(ctx)` exactly once
+5. call `finalize_end_of_instruction_resets(ctx)` exactly once
+6. if funding-rate inputs changed because of the instruction's final post-reset state, recompute `r_last` exactly once from that final state
+7. if the instruction can mutate live side exposure, assert `OI_eff_long == OI_eff_short` at the end
+
+This subsection is a condensation aid only. The endpoint subsections below remain the normative source of truth for exact call ordering, including any endpoint-specific exceptions or additional guards.
+
 ### 10.1 `touch_account_full(i, oracle_price, now_slot)`
 
 Canonical settle routine for an existing materialized account. It MUST perform, in order:
@@ -1303,7 +1329,7 @@ Procedure:
 6. if `effective_pos_q(i) != 0`, require post-withdraw initial-margin health on the hypothetical post-withdraw state where:
    - `C_i' = C_i - amount`
    - `V' = V - amount`
-   - `Eq_init_net_i` is recomputed from that hypothetical state
+   - exact `Eq_init_raw_i` is recomputed from that hypothetical state and compared against `IM_req_i` in the widened signed domain of §3.4
    - all other touched-state quantities are unchanged
    - equivalently, because both `V` and `C_tot` decrease by the same `amount`, `Residual` and `h` are unchanged by the simulation
 7. apply:
@@ -1364,8 +1390,8 @@ Procedure:
 12. `touch_account_full(b, oracle_price, now_slot)`
 13. let `old_eff_pos_q_a = effective_pos_q(a)` and `old_eff_pos_q_b = effective_pos_q(b)`
 14. let `MM_req_pre_a`, `MM_req_pre_b` be maintenance requirement on the post-touch pre-trade state
-15. let `margin_buffer_pre_a = Eq_maint_raw_a - (MM_req_pre_a as wide_signed)` evaluated in the exact widened signed domain of §3.4
-16. let `margin_buffer_pre_b = Eq_maint_raw_b - (MM_req_pre_b as wide_signed)` evaluated in the exact widened signed domain of §3.4
+15. let `Eq_maint_raw_pre_a = Eq_maint_raw_a` and `Eq_maint_raw_pre_b = Eq_maint_raw_b` in the exact widened signed domain of §3.4
+16. let `margin_buffer_pre_a = Eq_maint_raw_pre_a - (MM_req_pre_a as wide_signed)` and `margin_buffer_pre_b = Eq_maint_raw_pre_b - (MM_req_pre_b as wide_signed)` in the exact widened signed domain of §3.4
 17. invoke `maybe_finalize_ready_reset_sides_before_oi_increase()`
 18. reject if the trade would increase net side OI on any side whose mode is `DrainOnly` or `ResetPending`
 19. define:
@@ -1389,13 +1415,17 @@ Procedure:
 27. compute `fee = mul_div_ceil_u128(trade_notional, trading_fee_bps, 10_000)`
 28. charge explicit trading fees using `charge_fee_to_insurance(a, fee)` and `charge_fee_to_insurance(b, fee)`
 29. enforce post-trade margin for each account using the current post-step-28 state:
-   - if the resulting effective position is zero, the flat-account guard from steps 25–26 already applies
-   - else if the trade is risk-increasing for that account, require initial-margin healthy using `Eq_init_net_i`
+   - if the resulting effective position is zero:
+     - the flat-account guard from steps 25–26 still applies, and
+     - require exact `Eq_maint_raw_i >= 0` in the widened signed domain of §3.4 on the current post-step-28 state
+   - else if the trade is risk-increasing for that account, require exact raw initial-margin healthy using `Eq_init_raw_i` and `IM_req_i` as defined in §9.1
    - else if the account is maintenance healthy using `Eq_net_i`, allow
-   - else if the trade is strictly risk-reducing for that account, allow only if the post-trade raw maintenance buffer `(Eq_maint_raw_i - MM_req_i)` computed in the exact widened signed domain of §3.4 is strictly greater than the corresponding exact widened pre-trade raw maintenance buffer recorded in steps 15–16
+   - else if the trade is strictly risk-reducing for that account, allow only if **both** of the following hold in the exact widened signed domain of §3.4:
+     - the post-trade **fee-neutral** raw maintenance buffer `((Eq_maint_raw_i + (fee as wide_signed)) - (MM_req_i as wide_signed))` is strictly greater than the corresponding exact widened pre-trade raw maintenance buffer recorded in steps 15–16, and
+     - the post-trade **fee-neutral** raw maintenance-equity shortfall below zero does not worsen, equivalently `min(Eq_maint_raw_i + (fee as wide_signed), 0) >= min(Eq_maint_raw_pre_i, 0)`
    - else reject
 
-This strict risk-reducing comparison is intentionally performed on the actual post-step-28 state. Trading fees are immediate liabilities; therefore a trade whose fee cost outweighs its maintenance relief is not maintenance-improving and MAY be rejected even when absolute exposure shrinks.
+This strict risk-reducing comparison is evaluated on the actual post-step-28 state but holds only the explicit fee of the candidate trade constant for the before/after comparison. Equivalently, it compares pre-trade raw maintenance buffer against post-trade raw maintenance buffer plus that same trade fee, so pure fee friction alone cannot make a genuinely de-risking trade fail the exemption. In addition, the fee-neutral raw maintenance-equity shortfall below zero must not worsen, so a large maintenance-requirement drop from a partial close cannot be used to mask newly created bad debt from execution slippage. All execution-slippage PnL, all position / notional changes, and all other current-state liabilities still remain in the comparison. Likewise, a voluntary organic flat close whose actual post-fee state would have negative exact `Eq_maint_raw_i` MUST still be rejected rather than exiting with unpaid fee debt that could later be forgiven by reclamation.
 30. `schedule_end_of_instruction_resets(ctx)`
 31. `finalize_end_of_instruction_resets(ctx)`
 32. if funding-rate inputs changed, recompute `r_last` exactly once from the final post-reset state
@@ -1418,7 +1448,7 @@ Procedure:
 
 ### 10.7 `reclaim_empty_account(i)`
 
-Permissionless dead-account recycling wrapper.
+Permissionless empty- or flat-dust-account recycling wrapper.
 
 Procedure:
 
@@ -1467,37 +1497,17 @@ Rules:
 
 ## 11. Permissionless off-chain shortlist keeper mode
 
-This section is the sole normative specification for the optimized keeper path. It supersedes the earlier integrated on-chain barrier-wave mode.
+This section is the sole normative specification for the optimized keeper path. Candidate discovery, ranking, deduplication, and sequential simulation MAY be performed entirely off chain. The protocol's on-chain safety derives only from exact current-state revalidation immediately before any liquidation write.
 
-### 11.1 Design intent
+### 11.1 Core rules
 
-The engine does **not** require any on-chain phase-1 search, barrier classifier, or no-false-negative scan proof.
+1. The engine does **not** require any on-chain phase-1 search, barrier classifier, or no-false-negative scan proof.
+2. `ordered_candidates[]` in §10.8 is keeper-supplied and untrusted. It MAY be stale, incomplete, duplicated, adversarially ordered, or produced by approximate heuristics.
+3. Optional liquidation-policy hints are also advisory only. They MUST be ignored unless they pass the same exact current-state validity checks as the normal `liquidate` entrypoint.
+4. The protocol MUST NOT require that a keeper discover *all* currently liquidatable accounts before it may process a useful subset.
+5. Because `settle_account`, `liquidate`, `reclaim_empty_account`, and `keeper_crank` are permissionless, reset progress and dead-account recycling MUST remain possible without any mandatory on-chain scan order.
 
-Instead:
-
-1. Candidate discovery MAY be performed entirely off chain.
-2. Candidate ranking and sequential path simulation MAY be performed entirely off chain.
-3. On-chain safety derives only from exact current-state revalidation before any liquidation write.
-4. Because `settle_account`, `liquidate`, `reclaim_empty_account`, and `keeper_crank` are all permissionless, reset progress and dead-account recycling do not depend on any mandatory on-chain scan order.
-5. The protocol MUST NOT require that a keeper discover *all* currently liquidatable accounts before it may submit and process a useful subset.
-
-This design minimizes on-chain compute by moving every non-consensus search task off chain while keeping all consensus-critical economics and risk checks on chain.
-
-### 11.2 Shortlist trust model
-
-`ordered_candidates[]` in §10.8 is keeper-supplied and untrusted.
-
-Therefore:
-
-- shortlist contents MAY be stale, incomplete, duplicated, adversarially ordered, or generated from approximate heuristics
-- optional liquidation-policy hints MAY be stale or adversarial
-- the engine MUST NOT trust any off-chain preview, health classification, or estimated deficit value for consensus
-- the engine MUST revalidate the candidate from current on-chain state immediately before any liquidation write
-- an optional liquidation-policy hint that fails current-state validity checks MUST be ignored rather than trusted
-
-A stale or adversarial shortlist MAY waste that instruction's own `max_revalidations` budget or the submitting keeper's own call opportunity, but it MUST NOT permit an incorrect liquidation.
-
-### 11.3 Exact current-state revalidation attempts
+### 11.2 Exact current-state revalidation attempts
 
 Let `max_revalidations` be the keeper's per-instruction budget measured in **exact current-state revalidation attempts**.
 
@@ -1510,108 +1520,37 @@ It counts against `max_revalidations` once that materialized-account revalidatio
 - is touched and proves safe
 - is touched, remains liquidatable, but no valid current-state liquidation action is applied for that attempt
 
-It does **not** count for a pure missing-account skip.
+A pure missing-account skip does **not** count.
 
-A fatal conservative failure or invariant violation encountered after the exact-touch path begins is **not** a counted skip. It is a top-level instruction failure and reverts atomically under the execution model of §0.
-
-The engine MAY expose richer off-chain indexing or preview infrastructure, but such infrastructure is non-consensus and out of scope for this normative section.
-
-### 11.4 Keeper local exact-touch equivalence
-
-Inside `keeper_crank`, the per-candidate local exact-touch helper MUST be economically equivalent to `touch_account_full(i, oracle_price, now_slot)` on a state that has already been globally accrued once to `(now_slot, oracle_price)` at the start of the instruction.
-
-Concretely, for each materialized candidate account it MUST execute the same local logic and in the same order as §10.1 steps 7–13:
-
-1. `advance_profit_warmup(i)`
-2. `settle_side_effects(i)`
-3. `settle_losses_from_principal(i)`
-4. flat-loss routing of §7.3 when `effective_pos_q(i) == 0 and PNL_i < 0`
-5. account-local maintenance-fee realization of §8.2
-6. if `basis_pos_q_i == 0`, matured released-profit conversion of §7.4
-7. fee-debt sweep of §7.5
-
-It MUST NOT call `accrue_market_to` again for that account.
+Inside `keeper_crank`, the per-candidate local exact-touch helper MUST be economically equivalent to `touch_account_full(i, oracle_price, now_slot)` on a state that has already been globally accrued once to `(now_slot, oracle_price)` at the start of the instruction. Concretely, for each materialized candidate it MUST execute the same local logic and in the same order as §10.1 steps 7–13, and it MUST NOT call `accrue_market_to` again for that account.
 
 If the account is liquidatable after this local exact-touch path, the keeper MAY invoke liquidation on the already-touched state using the same already-touched local liquidation execution as §§9.4–9.5 and §10.6 steps 4–6. It MUST NOT duplicate the touch, invoke end-of-instruction reset handling mid-loop, or nest a second top-level instruction.
 
-### 11.5 No mandatory on-chain keeper ordering
+A fatal conservative failure or invariant violation encountered after an exact-touch attempt begins is **not** a counted skip. It is a top-level instruction failure and reverts atomically under §0.
 
-The protocol MUST NOT impose a mandatory on-chain ordering such as:
+### 11.3 On-chain ordering constraints
 
-- liquidation candidates before cleanup candidates
-- cleanup candidates before liquidation candidates
-- global priority queues derived from an on-chain preview classifier
+The protocol MUST NOT impose a mandatory on-chain liquidation-first, cleanup-first, or priority-queue ordering across keeper-supplied candidates.
 
-The only mandatory on-chain ordering constraints inside `keeper_crank` are:
+Inside `keeper_crank`, the only mandatory on-chain ordering constraints are:
 
 1. the single initial `accrue_market_to(now_slot, oracle_price)` and trusted `current_slot = now_slot` anchor happen before per-candidate exact revalidation
-2. candidates are processed in keeper-supplied order
+2. materialized candidates are processed in keeper-supplied order
 3. once either pending-reset flag becomes true, the instruction stops further candidate processing and proceeds directly to end-of-instruction reset handling
 
-This is intentional. It prevents protocol-level deadlocks caused by mandatory liquidation-first queues while preserving permissionless reset-progress submissions.
+A stale or adversarial shortlist MAY waste that instruction's own `max_revalidations` budget or the submitting keeper's own call opportunity, but it MUST NOT permit an incorrect liquidation.
 
-### 11.6 Recommended off-chain ordering for honest keepers
+### 11.4 Honest-keeper guidance (non-normative)
 
-The following ordering is a normative **SHOULD** for honest keepers that want to maximize expected same-call risk reduction per exact on-chain revalidation while still preserving reset liveness. It is operational guidance, not a consensus rule.
+An honest keeper SHOULD, when compute permits, simulate the same single `accrue_market_to(now_slot, oracle_price)` step off chain, then sequentially simulate the shortlisted touches and liquidations on the evolving simulated state before submission. This is recommended because liquidation ordering is path-dependent through `A_side`, `K_side`, `OI_eff_*`, side modes, and end-of-instruction reset stop conditions.
 
-#### 11.6.1 Off-chain simulation loop
+For off-chain ordering, an honest keeper SHOULD usually prioritize:
 
-When compute permits, an honest keeper SHOULD:
+- reset-progress or dust-progress candidates that can unblock finalization on already-constrained sides
+- opposite-side bankruptcy candidates **before** a touch that is expected to zero the last stored position on side `S` while phantom OI would remain on `S`, because once `stored_pos_count_S == 0` while phantom OI remains, further `D_rem` can no longer be written into `K_S` and is routed through uninsured protocol loss after insurance
+- otherwise, higher expected uncovered deficit after insurance, larger maintenance shortfall, larger notional, and `DrainOnly`-side candidates ahead of otherwise similar `Normal`-side candidates
 
-1. start from the latest authoritative on-chain state it can observe
-2. simulate the same single `accrue_market_to(now_slot, oracle_price)` step that §10.8 will execute on chain
-3. choose one candidate
-4. simulate that candidate's exact local touch and, if applicable, exact liquidation on the simulated state
-5. update the simulated state
-6. rerank the remaining candidates on that updated simulated state
-7. repeat until the desired shortlist length or risk target is reached
-
-This sequential re-simulation is recommended because liquidation ordering is path-dependent through `A_side`, `K_side`, `OI_eff_*`, side modes, and end-of-instruction reset stop conditions.
-
-#### 11.6.2 Priority bands
-
-An honest keeper SHOULD rank candidates in the following bands.
-
-**Band A — reserved reset-progress and pre-reset dust-progress**
-
-- If a side is already `ResetPending` and still has targeted stale-account reconciliation work, dust-zero progress work, or other per-account touches that can reduce `stale_account_count_*`, `stored_pos_count_*`, or otherwise advance finalization, the keeper SHOULD place one such candidate for that side near the front of the shortlist.
-- A keeper SHOULD also treat as Band-A progress any side that is not yet `ResetPending` but is already within its phantom-dust-clear bound and has targeted dust-zero accounts whose touch can reduce `stored_pos_count_*` and unblock end-of-instruction dust-clear scheduling.
-- If both sides need such progress and the intended budget permits, the keeper SHOULD place one candidate for each side before ordinary liquidations.
-- If the intended budget is smaller than the number of such sides across repeated calls, the keeper SHOULD rotate fairly across sides so no such side is perpetually skipped.
-- If a candidate touch is expected to zero the last stored position on side `S` while `OI_eff_S` would remain positive until end-of-instruction dust-clear handling, and opposite-side bankruptcies are also predicted in the same simulated wave, an honest keeper SHOULD usually place those opposite-side bankruptcy candidates earlier in the shortlist. This preserves current-instruction ADL realization capacity, because once `stored_pos_count_S == 0` while phantom OI remains, `enqueue_adl` can no longer write K-space loss to `S` and remaining `D_rem` is routed through uninsured protocol loss after insurance.
-- When this preserve-ADL ordering conflict exists, honest keepers SHOULD normally treat those opposite-side bankruptcy candidates as higher priority than the zeroing touch itself unless side `S` is already `ResetPending` and the current call would otherwise make no reset progress for `S`.
-
-**Band B — live-side liquidations not expected to schedule a new pending reset in this instruction**
-
-Within this band, the keeper SHOULD rank:
-
-1. candidates predicted to remain bankruptcy / full-close liquidations before candidates predicted to resolve through partial liquidation
-2. higher predicted uncovered deficit **after** Insurance Fund usage (`D_est_after_I`) before lower ones
-3. larger maintenance shortfall `max(0, MM_req - Eq_net)` before smaller ones
-4. larger notional before smaller ones
-5. candidates on a `DrainOnly` side before otherwise similar candidates on a `Normal` side
-
-This band targets the largest expected unresolved risk without prematurely ending the instruction.
-
-**Band C — live-side candidates expected to schedule a new pending reset, precision-exhaustion terminal drain, or zero remaining OI**
-
-Because §10.8 must stop once such a state transition actually schedules a pending reset, an honest keeper SHOULD usually place these candidates **after** the higher-value Band-B candidates on the same still-live simulated state.
-
-Exception: if the keeper's explicit objective for that call is to restore re-openability as soon as possible, it MAY intentionally place a Band-C candidate earlier.
-
-**Band D — cleanup-only / reclaimable-empty candidates**
-
-These SHOULD be placed after Bands B and C, except for the reserved Band-A reset-progress slots.
-
-### 11.7 Safety and liveness consequences
-
-Under this design:
-
-1. There is no protocol-level on-chain no-false-negative scan guarantee, because the protocol no longer requires an on-chain scan.
-2. There is also no protocol-level mandatory queue that can force one keeper's false positives to starve a different keeper's reset-progress work.
-3. A stale shortlist cannot cause an incorrect liquidation because each candidate is revalidated on current state immediately before any liquidation write.
-4. Reset progress remains permissionless because any keeper can target the needed stale or dust accounts directly through `settle_account` or `keeper_crank`.
-5. Once a candidate schedules a pending reset, later candidates in the same shortlist are intentionally deferred to a future instruction built from fresh state.
+These `SHOULD` recommendations are operational guidance only, not consensus rules.
 
 ## 12. Required test properties (minimum)
 
@@ -1641,12 +1580,12 @@ An implementation MUST include tests that cover at least:
 22. **Deposit loss seniority:** in `deposit`, realized losses are settled from newly deposited principal before any outstanding fee debt is swept.
 23. **Deposit materialization threshold:** a missing account cannot be materialized by a deposit smaller than `MIN_INITIAL_DEPOSIT`, while an existing materialized account may still receive smaller top-ups.
 24. **Dust liquidation minimum fee:** if `q_close_q > 0` but `closed_notional` floors to zero, `liq_fee` still honors `min_liquidation_abs`.
-25. **Risk-reducing trade exemption:** a strict non-flipping position reduction that improves the unfloored raw maintenance buffer is allowed even if the account remains below maintenance after the trade. A reduction that worsens raw maintenance buffer is rejected even when floored `Eq_net_i` remains zero.
-26. **Positive local PnL supports maintenance but not initial margin / withdrawal at face value:** on a touched generating account, maintenance uses full local `PNL_i`, so a freshly profitable account is not liquidated solely because profit is still warming up and pure warmup release on unchanged `PNL_i` does not reduce `Eq_maint_raw_i`; the same junior profit still cannot satisfy a risk-increasing initial-margin or withdrawal check except through `Eq_init_net_i`.
+25. **Risk-reducing trade exemption:** a strict non-flipping position reduction that improves the exact widened **fee-neutral** raw maintenance buffer is allowed even if the account remains below maintenance after the trade, but only if the same trade does not worsen the exact widened **fee-neutral** raw maintenance-equity shortfall below zero. A reduction whose fee-neutral raw maintenance buffer worsens, or whose fee-neutral negative raw maintenance equity becomes more negative, is rejected.
+26. **Positive local PnL supports maintenance but not initial margin / withdrawal at face value:** on a touched generating account, maintenance uses full local `PNL_i`, so a freshly profitable account is not liquidated solely because profit is still warming up and pure warmup release on unchanged `PNL_i` does not reduce `Eq_maint_raw_i`; the same junior profit still cannot satisfy a risk-increasing initial-margin or withdrawal check except through the matured-haircutted component of exact `Eq_init_raw_i`.
 27. **Reserve-loss ordering:** when positive `PNL_i` shrinks for true market-loss reasons, losses consume `R_i` before matured released positive PnL, so neutral price chop does not ratchet previously matured margin into reserve.
 28. **Organic close bankruptcy guard:** a flat trade cannot bypass ADL by leaving negative `PNL_i` behind.
 29. **Bankruptcy full-close requirement:** bankruptcy liquidation always closes the full remaining effective position.
-30. **Dead-account reclamation:** a flat zero-value account with negative `fee_credits_i` can be reclaimed and its slot reused safely.
+30. **Dead-account reclamation:** a flat account with `0 <= C_i < MIN_INITIAL_DEPOSIT`, zero `PNL_i`, zero `R_i`, zero basis, and nonpositive `fee_credits_i` can be reclaimed safely; any remaining dust capital is swept into `I` and the slot is reused.
 31. **Missing-account safety:** `settle_account`, `withdraw`, `execute_trade`, `liquidate`, and `keeper_crank` do not materialize missing accounts.
 32. **Standalone settle lifecycle:** `settle_account` can reconcile the last stale or dusty account and still trigger required reset scheduling/finalization and final-state funding recomputation.
 33. **Off-chain shortlist stale/adversarial safety:** replaying or adversarially ordering an old shortlist cannot cause an incorrect liquidation, because `keeper_crank` revalidates each processed candidate on current state before any liquidation write.
@@ -1672,338 +1611,15 @@ An implementation MUST include tests that cover at least:
 52. **Explicit open-position profit conversion:** `convert_released_pnl` consumes only `ReleasedPos_i`, leaves `R_i` unchanged, sweeps fee debt from the new capital, and rejects atomically if the post-conversion open-position state is not maintenance healthy.
 53. **Phantom-dust ADL ordering awareness:** if a keeper simulation zeroes the last stored position on a side while phantom OI remains, opposite-side bankruptcies processed after that point lose current-instruction K-socialization capacity; processing them before that zeroing touch preserves it.
 54. **Unilateral exact-drain reset scheduling:** if `enqueue_adl` drives `OI_eff_opp` to `0` while `OI_eff_liq_side` remains positive, it still schedules `pending_reset_opp = true`, and subsequent close / liquidation attempts on the drained side do not underflow against a zero authoritative OI.
+55. **Organic flat-close fee-debt guard:** if a trade would leave an account with resulting effective position `0` but exact post-fee `Eq_maint_raw_i < 0`, the instruction rejects atomically; a user cannot wash-trade away assets, exit flat with unpaid fee debt, and then reclaim the slot to forgive it. A profitable fast winner with positive reserved `R_i` and nonnegative exact post-fee `Eq_maint_raw_i` may still close risk to zero even though `Eq_init_raw_i` excludes that reserved profit.
+56. **Exact raw initial-margin approval:** a risk-increasing trade or open-position withdrawal with exact `Eq_init_raw_i < IM_req_i` is rejected even if `Eq_init_net_i` would floor to `0` and the proportional notional term would otherwise floor low.
+57. **Absolute nonzero-position margin floors:** any nonzero position faces at least `MIN_NONZERO_MM_REQ` and `MIN_NONZERO_IM_REQ`; a microscopic nonzero position cannot remain healthy or be newly opened solely because proportional notional floors to zero.
+58. **Flat dust-capital reclamation:** a trade- or conversion-created flat account with `0 < C_i < MIN_INITIAL_DEPOSIT` cannot pin capacity permanently, because `reclaim_empty_account` may sweep that dust capital into `I` and recycle the slot.
 
-## 13. Reference pseudocode (non-normative)
-
-### 13.1 `set_pnl`
-
-```text
-set_pnl(i, new):
-    assert new != i128::MIN
-    old_pos = max(PNL_i, 0)
-    old_R   = R_i
-    old_rel = old_pos - old_R
-    new_pos = max(new, 0)
-    assert new_pos <= MAX_ACCOUNT_POSITIVE_PNL
-
-    if new_pos > old_pos:
-        reserve_add = new_pos - old_pos
-        new_R = old_R + reserve_add
-        assert new_R <= new_pos
-    else:
-        pos_loss = old_pos - new_pos
-        new_R = saturating_sub(old_R, pos_loss)
-        assert new_R <= new_pos
-
-    new_rel = new_pos - new_R
-
-    update PNL_pos_tot by (new_pos - old_pos)
-    update PNL_matured_pos_tot by (new_rel - old_rel)
-
-    PNL_i = new
-    R_i   = new_R
-```
-
-### 13.1.1 `consume_released_pnl`
-
-```text
-consume_released_pnl(i, x):
-    assert x > 0
-    old_pos = max(PNL_i, 0)
-    old_R   = R_i
-    old_rel = old_pos - old_R
-    assert x <= old_rel
-
-    new_pos = old_pos - x
-    new_rel = old_rel - x
-    assert new_pos >= old_R
-
-    update PNL_pos_tot by (new_pos - old_pos)
-    update PNL_matured_pos_tot by (new_rel - old_rel)
-    assert PNL_matured_pos_tot <= PNL_pos_tot
-
-    PNL_i = checked_sub_i128(PNL_i, checked_cast_i128(x))
-    R_i   = old_R
-```
-
-### 13.2 `advance_profit_warmup`
-
-```text
-advance_profit_warmup(i):
-    if R_i == 0:
-        w_slope_i = 0
-        w_start_i = current_slot
-        return
-
-    if T == 0:
-        set_reserved_pnl(i, 0)
-        w_slope_i = 0
-        w_start_i = current_slot
-        return
-
-    elapsed = current_slot - w_start_i
-    release = min(R_i, saturating_mul_u128_u64(w_slope_i, elapsed))
-    if release > 0:
-        set_reserved_pnl(i, R_i - release)
-
-    if R_i == 0:
-        w_slope_i = 0
-    w_start_i = current_slot
-```
-
-### 13.3 `enqueue_adl`
-
-```text
-enqueue_adl(ctx, liq_side, q_close_q, D):
-    opp = opposite(liq_side)
-
-    if q_close_q > 0:
-        OI_eff_liq_side -= q_close_q
-
-    if D > 0:
-        D_rem = use_insurance_buffer(D)
-    else:
-        D_rem = 0
-
-    OI = OI_eff_opp
-    if OI == 0:
-        if D_rem > 0:
-            record_uninsured_protocol_loss(D_rem)
-        if OI_eff_liq_side == 0:
-            ctx.pending_reset_liq_side = true
-            ctx.pending_reset_opp = true
-        return
-
-    if stored_pos_count_opp == 0:
-        OI_post = OI - q_close_q
-        if D_rem > 0:
-            record_uninsured_protocol_loss(D_rem)
-        OI_eff_opp = OI_post
-        if OI_post == 0:
-            ctx.pending_reset_opp = true
-            if OI_eff_liq_side == 0:
-                ctx.pending_reset_liq_side = true
-        return
-
-    A_old  = A_opp
-    OI_post = OI - q_close_q
-
-    if D_rem > 0:
-        adl_scale = A_old * POS_SCALE
-        res = wide_mul_div_ceil_u128_or_over_i128max(D_rem, adl_scale, OI)
-        if res is Ok(delta_K_abs):
-            delta_K_exact = -(delta_K_abs as i128)
-            if checked_add_i128(K_opp, delta_K_exact) succeeds:
-                K_opp += delta_K_exact
-            else:
-                record_uninsured_protocol_loss(D_rem)
-        else:
-            record_uninsured_protocol_loss(D_rem)
-
-    if OI_post == 0:
-        OI_eff_opp = 0
-        ctx.pending_reset_opp = true
-        if OI_eff_liq_side == 0:
-            ctx.pending_reset_liq_side = true
-        return
-
-    A_prod = A_old * OI_post
-    A_candidate = floor(A_prod / OI)
-    A_rem = A_prod mod OI
-
-    if A_candidate > 0:
-        A_opp = A_candidate
-        OI_eff_opp = OI_post
-        if A_rem != 0:
-            N_opp = stored_pos_count_opp
-            dust_bound = N_opp + ceil((OI + N_opp) / A_old)
-            phantom_dust_bound_opp_q += dust_bound
-        if A_opp < MIN_A_SIDE:
-            mode_opp = DrainOnly
-        return
-
-    OI_eff_opp = 0
-    OI_eff_liq_side = 0
-    ctx.pending_reset_opp = true
-    ctx.pending_reset_liq_side = true
-```
-
-### 13.4 `deposit`
-
-```text
-deposit(i, amount, now_slot):
-    assert now_slot >= current_slot
-    if account_missing(i):
-        assert amount >= MIN_INITIAL_DEPOSIT
-        materialize_account(i, now_slot)
-
-    current_slot = now_slot
-    assert V + amount <= MAX_VAULT_TVL
-    V += amount
-    set_capital(i, C_i + amount)
-    settle_losses_from_principal(i)
-    if basis_pos_q_i == 0 and PNL_i < 0:
-        absorb_protocol_loss((-PNL_i) as u128)
-        set_pnl(i, 0)
-    if basis_pos_q_i == 0:
-        sweep_fee_debt(i)
-```
-
-### 13.4.1 `convert_released_pnl`
-
-```text
-convert_released_pnl(i, x_req, oracle_price, now_slot):
-    assert account_materialized(i)
-    ctx = fresh_instruction_context()
-
-    touch_account_full(i, oracle_price, now_slot)
-
-    if basis_pos_q_i == 0:
-        schedule_end_of_instruction_resets(ctx)
-        finalize_end_of_instruction_resets(ctx)
-        recompute_r_last_from_final_state_if_needed()
-        return
-
-    assert 0 < x_req <= ReleasedPos_i
-
-    if PNL_matured_pos_tot == 0:
-        y = x_req
-    else:
-        y = floor(x_req * h_num / h_den)
-
-    consume_released_pnl(i, x_req)
-    set_capital(i, C_i + y)
-    sweep_fee_debt(i)
-
-    if effective_pos_q(i) != 0:
-        assert maintenance_healthy(i)
-
-    schedule_end_of_instruction_resets(ctx)
-    finalize_end_of_instruction_resets(ctx)
-    recompute_r_last_from_final_state_if_needed()
-```
-
-### 13.5 `reclaim_empty_account`
-
-```text
-reclaim_empty_account(i):
-    assert account_materialized(i)
-    assert C_i == 0
-    assert PNL_i == 0
-    assert R_i == 0
-    assert basis_pos_q_i == 0
-    assert fee_credits_i <= 0
-
-    fee_credits_i = 0
-    reset_local_fields_to_canonical_zero_defaults()
-    mark_slot_missing_and_reusable(i)
-    materialized_account_count -= 1
-```
-
-### 13.6 Off-chain shortlist keeper
-
-```text
-touch_account_after_instruction_accrual(i):
-    advance_profit_warmup(i)
-    settle_side_effects(i)
-    settle_losses_from_principal(i)
-    if effective_pos_q(i) == 0 and PNL_i < 0:
-        absorb_protocol_loss((-PNL_i) as u128)
-        set_pnl(i, 0)
-    realize_account_local_maintenance_fee_debt_if_enabled(i)
-    if basis_pos_q_i == 0:
-        convert_matured_released_profits(i)
-    sweep_fee_debt(i)
-
-keeper_crank(now_slot, oracle_price, ordered_candidates, max_revalidations):
-    ctx = fresh_instruction_context()
-    assert now_slot >= current_slot
-    assert now_slot >= slot_last
-    assert 0 < oracle_price <= MAX_ORACLE_PRICE
-
-    accrue_market_to(now_slot, oracle_price)
-    current_slot = now_slot
-
-    attempts = 0
-    for cand in ordered_candidates:
-        if attempts == max_revalidations:
-            break
-        if ctx.pending_reset_long or ctx.pending_reset_short:
-            break
-        if account_missing(cand.account_id):
-            continue
-
-        attempts += 1
-        i = cand.account_id
-
-        touch_account_after_instruction_accrual(i)
-
-        if account_is_liquidatable_now(i):
-            liquidate_from_current_touch(i, ctx, cand.policy_hint)  // same already-touched local liquidation execution as §§9.4–9.5 and §10.6 steps 4–6; no second touch; do not finalize resets mid-loop; ignore invalid hints
-
-        if ctx.pending_reset_long or ctx.pending_reset_short:
-            break
-
-    schedule_end_of_instruction_resets(ctx)
-    finalize_end_of_instruction_resets(ctx)
-    if funding_inputs_changed():
-        recompute_r_last_from_final_state()
-    assert OI_eff_long == OI_eff_short
-```
-
-### 13.7 Recommended off-chain shortlist builder
-
-```text
-build_shortlist_offchain(sim_state, target_budget, fair_reset_rotation_state):
-    shortlist = []
-
-    progress_sides = sides_already_resetpending_with_progress(sim_state)
-    for side in choose_fair_subset(progress_sides, target_budget, fair_reset_rotation_state):
-        shortlist.append(best_progress_candidate_for_side(sim_state, side))
-        if len(shortlist) == target_budget:
-            return shortlist
-
-    while len(shortlist) < target_budget and not sim_state.predicted_pending_reset:
-        band_b = live_liquidations_not_expected_to_schedule_reset(sim_state)
-        band_c = live_liquidations_expected_to_schedule_reset(sim_state)
-        band_d = cleanup_only_or_reclaimable(sim_state)
-
-        preserve_adl = opposite_side_bankruptcies_before_last_dust_zero(sim_state, band_b)
-        if preserve_adl exists:
-            cand = preserve_adl
-        elif band_b is not empty:
-            cand = argmax_lexicographic(
-                band_b,
-                bankruptcy_before_partial,
-                D_est_after_I_desc,
-                maintenance_shortfall_desc,
-                notional_desc,
-                drainonly_before_normal
-            )
-        elif band_c is not empty:
-            cand = argmax_lexicographic(
-                band_c,
-                D_est_after_I_desc,
-                maintenance_shortfall_desc,
-                notional_desc,
-                drainonly_before_normal
-            )
-        elif band_d is not empty:
-            cand = choose_cleanup_candidate(sim_state, band_d)
-        else:
-            break
-
-        shortlist.append(cand)
-        sim_state = simulate_exact_touch_and_optional_liquidation(sim_state, cand)
-
-    return shortlist
-```
-
-## 14. Compatibility and upgrade notes
+## 13. Compatibility and upgrade notes
 
 1. LP accounts and user accounts may share the same protected-principal and junior-profit mechanics.
 2. The mandatory `O(1)` global aggregates for solvency are `C_tot`, `PNL_pos_tot`, and `PNL_matured_pos_tot`; the A/K side indices add `O(1)` state for lazy settlement.
 3. This spec deliberately rejects hidden residual matching. Bankruptcy socialization occurs only through explicit Insurance Fund usage, explicit A/K state, or junior undercollateralization.
 4. Any upgrade path from a version that did not maintain `R_i`, `PNL_matured_pos_tot`, `basis_pos_q_i`, `a_basis_i`, `stored_pos_count_*`, `stale_account_count_*`, or `phantom_dust_bound_*_q` consistently MUST complete migration before OI-increasing operations are re-enabled.
 5. Any upgrade from an earlier integrated barrier-preview or addendum-based keeper design MAY drop the on-chain preview helper and barrier-scan logic once the exact current-state `keeper_crank` path and the shortlist-oriented tests from §12 are implemented.
-
