@@ -98,8 +98,8 @@ fn t0_4_conservation_check_handles_overflow() {
         }
         None => {
             // c_tot + insurance overflows u128 → conservation check
-            // should detect this as a deficit / corrupt state.
-            // This is the path the old test couldn't exercise.
+            // must detect this as a deficit / corrupt state.
+            kani::cover!(true, "overflow branch reachable");
         }
     }
 }
@@ -551,9 +551,15 @@ fn proof_account_equity_net_nonnegative() {
     kani::assume(pnl_val as i32 > i16::MIN as i32);
     engine.set_pnl(a as usize, pnl_val as i128);
 
-    // Exercise both positive PnL (haircut path via effective_pos_pnl) and negative PnL
+    // Set pnl_matured_pos_tot to exercise h < 1 in haircut_ratio (v11.21)
+    let matured: u16 = kani::any();
+    kani::assume(matured <= 20_000);
+    engine.pnl_matured_pos_tot = core::cmp::min(matured as u128, engine.pnl_pos_tot);
+
+    // Exercise both positive PnL (haircut path) and negative PnL
     let eq = engine.account_equity_net(&engine.accounts[a as usize], DEFAULT_ORACLE);
-    assert!(eq >= 0);
+    assert!(eq >= 0,
+        "flat account equity must be non-negative for any haircut level");
 }
 
 #[kani::proof]
