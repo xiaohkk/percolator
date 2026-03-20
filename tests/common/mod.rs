@@ -8,6 +8,7 @@ pub use percolator::wide_math::{
     saturating_mul_u256_u64,
     fee_debt_u128_checked,
     mul_div_floor_u256,
+    mul_div_floor_u256_with_rem,
     mul_div_ceil_u256,
     wide_signed_mul_div_floor,
     ceil_div_positive_checked,

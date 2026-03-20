@@ -221,11 +221,12 @@ fn test_basic_trade() {
     let size_q = make_size_q(100);
     engine.execute_trade(a, b, oracle, slot, size_q, oracle).expect("trade");
 
-    // Both should have positions
+    // Both should have positions of the correct magnitude
     let eff_a = engine.effective_pos_q(a as usize);
     let eff_b = engine.effective_pos_q(b as usize);
-    assert!(eff_a > 0);
-    assert!(eff_b < 0);
+    assert_eq!(eff_a, make_size_q(100), "account a must be long 100 units");
+    assert_eq!(eff_b, make_size_q(-100), "account b must be short 100 units");
+    assert!(engine.oi_eff_long_q > 0, "open interest must be nonzero after trade");
     assert!(engine.check_conservation());
 }
 
@@ -271,8 +272,20 @@ fn test_trade_with_different_exec_price() {
     let size_q = make_size_q(100);
     engine.execute_trade(a, b, oracle, slot, size_q, exec).expect("trade");
 
-    // Account a (long) should have positive PnL from oracle-exec gap
-    // Account b (short) should have negative PnL
+    // Account a (long) bought at exec=990 vs oracle=1000, so should have positive PnL
+    // trade_pnl = floor(100 * POS_SCALE * (1000 - 990) / POS_SCALE) = 1000
+    assert!(engine.accounts[a as usize].pnl > 0,
+        "long PnL must be positive when exec < oracle: pnl={}",
+        engine.accounts[a as usize].pnl);
+
+    // Account b (short) had negative trade PnL of -1000, but settle_losses
+    // absorbs it from capital. Verify b's capital decreased instead.
+    // b started with 100_000 deposit, minus trading fee. After settle_losses,
+    // the 1000 loss is paid from capital.
+    let cap_b = engine.accounts[b as usize].capital.get();
+    assert!(cap_b < 100_000,
+        "short capital must decrease when exec < oracle (loss settled): cap={}",
+        cap_b);
     assert!(engine.check_conservation());
 }
 
@@ -341,6 +354,9 @@ fn test_haircut_ratio_with_surplus() {
     let (h_num, h_den) = engine.haircut_ratio();
     // h_num <= h_den always
     assert!(h_num <= h_den);
+    // Verify the haircut is actually computed (not just the default (1,1))
+    assert!(h_num > 0, "h_num must be positive when PnL exists");
+    assert!(h_den > 0, "h_den must be positive when PnL exists");
 }
 
 // ============================================================================
@@ -455,8 +471,8 @@ fn test_warmup_full_conversion_after_period() {
 
     let capital_after = engine.accounts[a as usize].capital.get();
     // Capital should increase after warmup conversion (position is flat now)
-    assert!(capital_after >= capital_before,
-        "capital should increase after warmup conversion");
+    assert!(capital_after > capital_before,
+        "after full warmup period, profit must be converted to capital");
     assert!(engine.check_conservation());
 }
 
@@ -506,7 +522,8 @@ fn test_deposit_fee_credits() {
     let idx = engine.add_user(1000).expect("add_user");
 
     engine.deposit_fee_credits(idx, 5000, slot).expect("deposit_fee_credits");
-    assert!(engine.accounts[idx as usize].fee_credits.get() > 0);
+    assert_eq!(engine.accounts[idx as usize].fee_credits.get(), 5000,
+        "fee_credits must equal the deposited amount");
     assert!(engine.check_conservation());
 }
 
@@ -640,10 +657,16 @@ fn test_keeper_crank_caller_fee_discount() {
     let caller = engine.add_user(1000).expect("add_user");
     engine.deposit(caller, 10_000, oracle, slot).expect("deposit");
 
+    let capital_before = engine.accounts[caller as usize].capital.get();
+
     // Advance some slots to accumulate maintenance fees
     let slot2 = 200u64;
-    let outcome = engine.keeper_crank(slot2, oracle, &[], 64).expect("crank");
+    let outcome = engine.keeper_crank(slot2, oracle, &[caller], 64).expect("crank");
     assert!(outcome.advanced);
+
+    let capital_after = engine.accounts[caller as usize].capital.get();
+    assert!(capital_after < capital_before,
+        "maintenance fee must reduce capital: before={}, after={}", capital_before, capital_after);
 }
 
 // ============================================================================
@@ -996,8 +1019,8 @@ fn test_keeper_crank_liquidates_underwater_accounts() {
     let slot2 = 2u64;
     let crash = 870u64;
     let outcome = engine.keeper_crank(slot2, crash, &[a, b], 64).expect("crank");
-    // The crank should have attempted liquidation
-    let _ = outcome.num_liquidations; // just checking it does not panic
+    // The crank should have liquidated the underwater account
+    assert!(outcome.num_liquidations > 0, "crank must liquidate underwater account");
     assert!(engine.check_conservation());
 }
 
@@ -2316,30 +2339,37 @@ fn test_property_53_phantom_dust_adl_ordering() {
 
     let a = engine.add_user(0).unwrap();
     let b = engine.add_user(0).unwrap();
-    engine.deposit(a, 100_000, oracle, slot).unwrap();
-    engine.deposit(b, 100_000, oracle, slot).unwrap();
+    // Give 'a' small capital so it goes bankrupt on crash; give 'b' large capital
+    engine.deposit(a, 50_000, oracle, slot).unwrap();
+    engine.deposit(b, 1_000_000, oracle, slot).unwrap();
     engine.keeper_crank(slot, oracle, &[], 0).unwrap();
 
-    // Establish positions: a long, b short
-    let size_q = make_size_q(2);
+    // Open near-maximum-leverage position for 'a':
+    // 50k capital, 10% IM => max notional ~500k => ~480 units at price 1000
+    let size_q = make_size_q(480);
     engine.execute_trade(a, b, oracle, slot, size_q, oracle).unwrap();
 
-    // Verify balanced OI
+    // Verify balanced OI before crash
     assert_eq!(engine.oi_eff_long_q, engine.oi_eff_short_q, "OI must be balanced");
     assert!(engine.oi_eff_long_q > 0, "OI must be nonzero");
-
-    // After a side-reset that zeroes stored positions but leaves phantom OI,
-    // the K-socialization capacity for that side is zero.
-    // This is a structural awareness test: stored_pos_count == 0 means
-    // no one can absorb further K deltas on that side.
-    // We verify the property indirectly: if stored_pos_count goes to 0,
-    // the A multiplier cannot distribute losses.
-
-    // The property is about ordering awareness during keeper processing.
-    // If stored_pos_count_long == 0 but oi_eff_long_q > 0 (phantom dust),
-    // enqueue_adl for a short-side bankruptcy cannot socialize K to longs.
     assert!(engine.stored_pos_count_long > 0, "should have stored long positions");
-    assert!(engine.stored_pos_count_short > 0, "should have stored short positions");
+
+    // Crash the price to make 'a' (long) deeply underwater, triggering
+    // liquidation + ADL (bankruptcy). This closes a's position and creates
+    // phantom dust on the long side.
+    let crash_price = 870u64;
+    let slot2 = slot + 1;
+    let result = engine.liquidate_at_oracle(a, slot2, crash_price);
+    assert!(result.is_ok(), "liquidation must succeed: {:?}", result);
+    assert!(result.unwrap(), "account a must be liquidated");
+
+    // After liquidation, a's position is closed; stored_pos_count_long should be 0
+    assert_eq!(engine.stored_pos_count_long, 0,
+        "long stored_pos_count must be 0 after sole long is liquidated");
+
+    // Conservation must hold even in this phantom-dust ADL scenario
+    assert!(engine.check_conservation(),
+        "conservation must hold after phantom-dust ADL scenario");
 }
 
 // ============================================================================

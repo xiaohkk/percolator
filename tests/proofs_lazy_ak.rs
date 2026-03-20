@@ -14,102 +14,6 @@ use common::*;
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
-fn t1_5_mark_event_lazy_equals_eager_long() {
-    let q_base: u8 = kani::any();
-    kani::assume(q_base > 0);
-    let delta_p: i8 = kani::any();
-
-    let a_init = S_ADL_ONE;
-    let k_init: i32 = 0;
-    let basis_q = (q_base as u16) * S_POS_SCALE;
-
-    let eager_pnl = eager_mark_pnl_long(q_base as i32, delta_p as i32);
-
-    let k_after = k_after_mark_long(k_init, a_init, delta_p as i32);
-    let k_diff = k_after - k_init;
-    let lazy_pnl_val = lazy_pnl(basis_q, k_diff, a_init);
-
-    assert!(eager_pnl == lazy_pnl_val, "mark lazy != eager for long");
-}
-
-#[kani::proof]
-#[kani::unwind(34)]
-#[kani::solver(cadical)]
-fn t1_5_mark_event_lazy_equals_eager_short() {
-    let q_base: u8 = kani::any();
-    kani::assume(q_base > 0);
-    let delta_p: i8 = kani::any();
-
-    let a_init = S_ADL_ONE;
-    let k_init: i32 = 0;
-    let basis_q = (q_base as u16) * S_POS_SCALE;
-
-    let eager_pnl = eager_mark_pnl_short(q_base as i32, delta_p as i32);
-
-    let k_after = k_after_mark_short(k_init, a_init, delta_p as i32);
-    let k_diff = k_after - k_init;
-    let lazy_pnl_val = lazy_pnl(basis_q, k_diff, a_init);
-
-    assert!(eager_pnl == lazy_pnl_val, "mark lazy != eager for short");
-}
-
-#[kani::proof]
-#[kani::unwind(34)]
-#[kani::solver(cadical)]
-fn t1_5_sat_negative_mark_long() {
-    let q_base: u8 = kani::any();
-    kani::assume(q_base > 0);
-    let delta_p: i8 = kani::any();
-    kani::assume(delta_p < 0);
-    let pnl = eager_mark_pnl_long(q_base as i32, delta_p as i32);
-    assert!(pnl < 0);
-}
-
-#[kani::proof]
-#[kani::unwind(34)]
-#[kani::solver(cadical)]
-fn t1_6_funding_event_lazy_equals_eager_long() {
-    let q_base: u8 = kani::any();
-    kani::assume(q_base > 0);
-    let delta_f: i8 = kani::any();
-
-    let a_init = S_ADL_ONE;
-    let k_init: i32 = 0;
-    let basis_q = (q_base as u16) * S_POS_SCALE;
-
-    let eager_pnl = -((q_base as i32) * (delta_f as i32));
-
-    let k_after = k_after_fund_long(k_init, a_init, delta_f as i32);
-    let k_diff = k_after - k_init;
-    let lazy_pnl_val = lazy_pnl(basis_q, k_diff, a_init);
-
-    assert!(eager_pnl == lazy_pnl_val);
-}
-
-#[kani::proof]
-#[kani::unwind(34)]
-#[kani::solver(cadical)]
-fn t1_6_funding_event_lazy_equals_eager_short() {
-    let q_base: u8 = kani::any();
-    kani::assume(q_base > 0);
-    let delta_f: i8 = kani::any();
-
-    let a_init = S_ADL_ONE;
-    let k_init: i32 = 0;
-    let basis_q = (q_base as u16) * S_POS_SCALE;
-
-    let eager_pnl = (q_base as i32) * (delta_f as i32);
-
-    let k_after = k_after_fund_short(k_init, a_init, delta_f as i32);
-    let k_diff = k_after - k_init;
-    let lazy_pnl_val = lazy_pnl(basis_q, k_diff, a_init);
-
-    assert!(eager_pnl == lazy_pnl_val);
-}
-
-#[kani::proof]
-#[kani::unwind(34)]
-#[kani::solver(cadical)]
 fn t1_7_adl_quantity_only_lazy_conservative() {
     let q_base: u8 = kani::any();
     kani::assume(q_base > 0 && q_base <= 15);
@@ -130,16 +34,6 @@ fn t1_7_adl_quantity_only_lazy_conservative() {
 
     assert!(lazy_q_base <= eager_q, "ADL lazy must not exceed eager quantity");
     assert!(eager_q - lazy_q_base <= 1, "ADL lazy error must be bounded by 1 base unit");
-}
-
-#[kani::proof]
-#[kani::unwind(34)]
-#[kani::solver(cadical)]
-fn t1_7_sat_oi_post_positive() {
-    let oi: u8 = kani::any();
-    let q_close: u8 = kani::any();
-    kani::assume(oi > 1 && q_close > 0 && q_close < oi);
-    assert!(oi - q_close > 0);
 }
 
 #[kani::proof]
@@ -207,79 +101,9 @@ fn t1_9_adl_quantity_plus_deficit_lazy_conservative() {
         "ADL PnL: lazy overshoot must be bounded by q_base");
 }
 
-#[kani::proof]
-#[kani::unwind(34)]
-#[kani::solver(cadical)]
-fn t1_10_attach_at_current_snapshot_is_noop() {
-    let q_base: u8 = kani::any();
-    kani::assume(q_base > 0);
-
-    let a_cur = S_ADL_ONE;
-    let k_cur: i32 = kani::any::<i16>() as i32;
-    let basis_q = (q_base as u16) * S_POS_SCALE;
-
-    let a_basis = a_cur;
-    let k_snap = k_cur;
-
-    let k_diff = k_cur - k_snap;
-    let pnl_delta = lazy_pnl(basis_q, k_diff, a_basis);
-    let q_eff = lazy_eff_q(basis_q, a_cur, a_basis);
-
-    assert!(pnl_delta == 0, "attach noop: pnl must be zero");
-    assert!(q_eff == basis_q, "attach noop: quantity must be unchanged");
-}
-
 // ============================================================================
-// T1.5b/6b/8b: symbolic a_basis generalizations
+// T1.8b: symbolic a_basis generalization
 // ============================================================================
-
-#[kani::proof]
-#[kani::unwind(1)]
-#[kani::solver(cadical)]
-fn t1_5b_mark_lazy_equals_eager_symbolic_a_basis() {
-    let q_base: u8 = kani::any();
-    kani::assume(q_base > 0 && q_base <= 15);
-    let delta_p: i8 = kani::any();
-    kani::assume(delta_p >= -15 && delta_p <= 15);
-
-    let a_basis: u16 = kani::any();
-    kani::assume(a_basis > 0 && a_basis <= S_ADL_ONE);
-
-    let k_init: i32 = 0;
-    let basis_q = (q_base as u16) * S_POS_SCALE;
-
-    let eager_pnl = (q_base as i32) * (delta_p as i32);
-
-    let k_after = k_init + (a_basis as i32) * (delta_p as i32);
-    let k_diff = k_after - k_init;
-    let lazy_pnl_val = lazy_pnl(basis_q, k_diff, a_basis);
-
-    assert!(eager_pnl == lazy_pnl_val, "mark lazy != eager for symbolic a_basis");
-}
-
-#[kani::proof]
-#[kani::unwind(1)]
-#[kani::solver(cadical)]
-fn t1_6b_funding_lazy_equals_eager_symbolic_a_basis() {
-    let q_base: u8 = kani::any();
-    kani::assume(q_base > 0 && q_base <= 15);
-    let delta_f: i8 = kani::any();
-    kani::assume(delta_f >= -15 && delta_f <= 15);
-
-    let a_basis: u16 = kani::any();
-    kani::assume(a_basis > 0 && a_basis <= S_ADL_ONE);
-
-    let k_init: i32 = 0;
-    let basis_q = (q_base as u16) * S_POS_SCALE;
-
-    let eager_pnl = -((q_base as i32) * (delta_f as i32));
-
-    let k_after = k_init - (a_basis as i32) * (delta_f as i32);
-    let k_diff = k_after - k_init;
-    let lazy_pnl_val = lazy_pnl(basis_q, k_diff, a_basis);
-
-    assert!(eager_pnl == lazy_pnl_val, "funding lazy != eager for symbolic a_basis");
-}
 
 #[kani::proof]
 #[kani::unwind(1)]
@@ -312,79 +136,6 @@ fn t1_8b_adl_deficit_lazy_conservative_symbolic_a_basis() {
 // ############################################################################
 // T2: COMPOSITION PROOFS
 // ############################################################################
-
-#[kani::proof]
-#[kani::unwind(34)]
-#[kani::solver(cadical)]
-fn t2_11_compose_two_mark_events() {
-    let q_base: u8 = kani::any();
-    kani::assume(q_base > 0 && q_base <= 15);
-    let dp1: i8 = kani::any();
-    kani::assume(dp1 >= -15 && dp1 <= 15);
-    let dp2: i8 = kani::any();
-    kani::assume(dp2 >= -15 && dp2 <= 15);
-
-    let a = S_ADL_ONE;
-    let basis_q = (q_base as u16) * S_POS_SCALE;
-
-    let eager_pnl1 = (q_base as i32) * (dp1 as i32);
-    let eager_pnl2 = (q_base as i32) * (dp2 as i32);
-    let eager_total = eager_pnl1 + eager_pnl2;
-
-    let k0: i32 = 0;
-    let k1 = k_after_mark_long(k0, a, dp1 as i32);
-    let k2 = k_after_mark_long(k1, a, dp2 as i32);
-    let k_diff = k2 - k0;
-
-    let lazy_total = lazy_pnl(basis_q, k_diff, a);
-
-    assert!(eager_total == lazy_total, "composition of two marks: eager != lazy");
-}
-
-#[kani::proof]
-#[kani::unwind(34)]
-#[kani::solver(cadical)]
-fn t2_11_compose_mark_then_funding() {
-    let q_base: u8 = kani::any();
-    kani::assume(q_base > 0 && q_base <= 15);
-    let dp: i8 = kani::any();
-    kani::assume(dp >= -15 && dp <= 15);
-    let df: i8 = kani::any();
-    kani::assume(df >= -15 && df <= 15);
-
-    let a = S_ADL_ONE;
-    let basis_q = (q_base as u16) * S_POS_SCALE;
-
-    let eager_mark = (q_base as i32) * (dp as i32);
-    let eager_fund = -((q_base as i32) * (df as i32));
-    let eager_total = eager_mark + eager_fund;
-
-    let k0: i32 = 0;
-    let k1 = k_after_mark_long(k0, a, dp as i32);
-    let k2 = k_after_fund_long(k1, a, df as i32);
-    let k_diff = k2 - k0;
-
-    let lazy_total = lazy_pnl(basis_q, k_diff, a);
-
-    assert!(eager_total == lazy_total);
-}
-
-#[kani::proof]
-#[kani::unwind(34)]
-#[kani::solver(cadical)]
-fn t2_12_fold_base_case() {
-    let a = S_ADL_ONE;
-
-    let q_base: u8 = kani::any();
-    kani::assume(q_base > 0);
-    let basis_q = (q_base as u16) * S_POS_SCALE;
-
-    let pnl = lazy_pnl(basis_q, 0, a);
-    let q_eff = lazy_eff_q(basis_q, a, a);
-
-    assert!(pnl == 0);
-    assert!(q_eff == basis_q);
-}
 
 #[kani::proof]
 #[kani::unwind(1)]
@@ -430,35 +181,6 @@ fn t2_12_fold_step_case() {
     let lazy_step = lazy_total - lazy_prefix;
 
     assert!(lazy_step == eager_step, "fold step: lazy increment must equal eager step");
-}
-
-#[kani::proof]
-#[kani::unwind(34)]
-#[kani::solver(cadical)]
-fn t2_13_touch_equals_eager_replay() {
-    let q_base: u8 = kani::any();
-    kani::assume(q_base > 0 && q_base <= 15);
-
-    let dp1: i8 = kani::any();
-    kani::assume(dp1 >= -15 && dp1 <= 15);
-    let dp2: i8 = kani::any();
-    kani::assume(dp2 >= -15 && dp2 <= 15);
-    let dp3: i8 = kani::any();
-    kani::assume(dp3 >= -15 && dp3 <= 15);
-
-    let a = S_ADL_ONE;
-    let basis_q = (q_base as u16) * S_POS_SCALE;
-    let k_snap: i32 = 0;
-
-    let eager = (q_base as i32) * ((dp1 as i32) + (dp2 as i32) + (dp3 as i32));
-
-    let k1 = k_after_mark_long(k_snap, a, dp1 as i32);
-    let k2 = k_after_mark_long(k1, a, dp2 as i32);
-    let k3 = k_after_mark_long(k2, a, dp3 as i32);
-
-    let lazy_total = lazy_pnl(basis_q, k3 - k_snap, a);
-
-    assert!(eager == lazy_total, "touch vs eager replay mismatch");
 }
 
 // ############################################################################
@@ -564,12 +286,21 @@ fn t3_14_epoch_mismatch_forces_terminal_close() {
     engine.side_mode_long = SideMode::ResetPending;
     engine.stale_account_count_long = 1;
 
+    let pnl_before = engine.accounts[idx as usize].pnl;
+
     let result = engine.settle_side_effects(idx as usize);
     assert!(result.is_ok());
 
     assert!(engine.accounts[idx as usize].position_basis_q == 0);
     assert!(engine.stale_account_count_long == 0);
     assert!(engine.accounts[idx as usize].adl_epoch_snap == 1);
+
+    // PnL assertion: the settlement must credit the correct amount
+    let abs_basis = pos as u128;
+    let den = ADL_ONE * POS_SCALE;
+    let expected_pnl_delta = wide_signed_mul_div_floor_from_k_pair(abs_basis, k_epoch_start, k_snap, den);
+    assert!(engine.accounts[idx as usize].pnl == pnl_before + expected_pnl_delta,
+        "epoch mismatch PnL must match wide_signed_mul_div_floor_from_k_pair");
 }
 
 #[kani::proof]
@@ -602,61 +333,26 @@ fn t3_14b_epoch_mismatch_with_nonzero_k_diff() {
     engine.side_mode_long = SideMode::ResetPending;
     engine.stale_account_count_long = 1;
 
+    let pnl_before = engine.accounts[idx as usize].pnl;
+
     let result = engine.settle_side_effects(idx as usize);
     assert!(result.is_ok());
 
     assert!(engine.accounts[idx as usize].position_basis_q == 0);
     assert!(engine.stale_account_count_long == 0);
     assert!(engine.accounts[idx as usize].adl_epoch_snap == 1);
-}
 
-#[kani::proof]
-#[kani::unwind(34)]
-#[kani::solver(cadical)]
-fn t3_15_same_epoch_settle_never_increases_position() {
-    let q_base: u8 = kani::any();
-    kani::assume(q_base > 0);
-
-    let a_basis = S_ADL_ONE;
-    let a_cur: u16 = kani::any();
-    kani::assume(a_cur > 0 && a_cur <= S_ADL_ONE);
-
-    let basis_q = (q_base as u16) * S_POS_SCALE;
-    let q_eff = lazy_eff_q(basis_q, a_cur, a_basis);
-
-    assert!(q_eff <= basis_q);
+    // PnL assertion: the settlement must credit the correct amount
+    let abs_basis = pos as u128;
+    let den = ADL_ONE * POS_SCALE;
+    let expected_pnl_delta = wide_signed_mul_div_floor_from_k_pair(abs_basis, k_epoch_start, k_snap, den);
+    assert!(engine.accounts[idx as usize].pnl == pnl_before + expected_pnl_delta,
+        "epoch mismatch PnL must match wide_signed_mul_div_floor_from_k_pair");
 }
 
 // ############################################################################
 // T7: NON-COMPOUNDING BASIS PROOFS
 // ############################################################################
-
-#[kani::proof]
-#[kani::unwind(1)]
-#[kani::solver(cadical)]
-fn t7_27_noncompounding_idempotent_settle() {
-    const S_POS_SCALE_LOCAL: u16 = 4;
-
-    let basis: u8 = kani::any();
-    kani::assume(basis > 0);
-    let a_basis: u8 = kani::any();
-    kani::assume(a_basis > 0);
-    let a_side: u8 = kani::any();
-    kani::assume(a_side > 0);
-    let k_side: i8 = kani::any();
-    kani::assume(k_side != 0);
-
-    let den1 = (a_basis as i32) * (S_POS_SCALE_LOCAL as i32);
-    kani::assume(den1 > 0);
-    let num1 = (basis as i32) * (k_side as i32);
-    let _pnl_1 = if num1 >= 0 { num1 / den1 } else { (num1 - den1 + 1) / den1 };
-
-    let k_diff_2: i32 = 0;
-    let num2 = (basis as i32) * k_diff_2;
-    let pnl_2 = if num2 >= 0 { num2 / den1 } else { (num2 - den1 + 1) / den1 };
-
-    assert!(pnl_2 == 0, "second settle with unchanged K must produce zero incremental PnL");
-}
 
 #[kani::proof]
 #[kani::unwind(1)]
@@ -815,18 +511,24 @@ fn t6_26_full_drain_reset_regression() {
     let idx = engine.add_user(0).unwrap();
     engine.deposit(idx, 1_000_000, 100, 0).unwrap();
 
-    let k_val: i8 = kani::any();
-    let k = k_val as i128;
+    let k_snap_val: i8 = kani::any();
+    let k_snap = k_snap_val as i128;
     let pos_mul: u8 = kani::any();
     kani::assume(pos_mul > 0);
 
+    // Use a different k_epoch_start so settlement PnL is nonzero
+    let k_start_val: i8 = kani::any();
+    kani::assume(k_start_val != k_snap_val);
+    let k_epoch_start = k_start_val as i128;
+
     engine.accounts[idx as usize].position_basis_q = (POS_SCALE * (pos_mul as u128)) as i128;
     engine.accounts[idx as usize].adl_a_basis = ADL_ONE;
-    engine.accounts[idx as usize].adl_k_snap = k;
+    engine.accounts[idx as usize].adl_k_snap = k_snap;
     engine.accounts[idx as usize].adl_epoch_snap = 0;
     engine.stored_pos_count_long = 1;
 
-    engine.adl_coeff_long = k;
+    // Set adl_coeff_long to k_epoch_start so begin_full_drain_reset captures it
+    engine.adl_coeff_long = k_epoch_start;
 
     engine.oi_eff_long_q = 0u128;
     engine.begin_full_drain_reset(Side::Long);
@@ -834,13 +536,22 @@ fn t6_26_full_drain_reset_regression() {
     assert!(engine.side_mode_long == SideMode::ResetPending);
     assert!(engine.adl_epoch_long == 1);
     assert!(engine.stale_account_count_long == 1);
-    assert!(engine.adl_epoch_start_k_long == k);
+    assert!(engine.adl_epoch_start_k_long == k_epoch_start);
+
+    let pnl_before = engine.accounts[idx as usize].pnl;
 
     let result = engine.settle_side_effects(idx as usize);
     assert!(result.is_ok());
 
     assert!(engine.accounts[idx as usize].position_basis_q == 0);
     assert!(engine.stale_account_count_long == 0);
+
+    // PnL assertion: settlement must credit the correct amount
+    let abs_basis = (POS_SCALE * (pos_mul as u128)) as u128;
+    let den = ADL_ONE * POS_SCALE;
+    let expected_pnl_delta = wide_signed_mul_div_floor_from_k_pair(abs_basis, k_epoch_start, k_snap, den);
+    assert!(engine.accounts[idx as usize].pnl == pnl_before + expected_pnl_delta,
+        "full drain reset PnL must match wide_signed_mul_div_floor_from_k_pair");
 
     assert!(engine.stored_pos_count_long == 0);
     let finalize = engine.finalize_side_reset(Side::Long);

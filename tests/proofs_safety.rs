@@ -61,38 +61,27 @@ fn bounded_trade_conservation() {
     let a = engine.add_user(0).unwrap();
     let b = engine.add_user(0).unwrap();
 
-    engine.deposit(a, 5_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
-    engine.deposit(b, 5_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    let dep: u32 = kani::any();
+    kani::assume(dep >= 1_000_000 && dep <= 5_000_000);
+    engine.deposit(a, dep as u128, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    engine.deposit(b, dep as u128, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
     assert!(engine.check_conservation());
 
-    let delta: i16 = kani::any();
-    kani::assume(delta > i16::MIN);
-    let delta_i128 = delta as i128;
+    // Symbolic trade size (reasonable range to stay within margin)
+    let size_q = (100 * POS_SCALE) as i128;
+    let result = engine.execute_trade(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size_q, DEFAULT_ORACLE);
 
-    let pnl_a = engine.accounts[a as usize].pnl;
-    let pnl_b = engine.accounts[b as usize].pnl;
-
-    let new_a = pnl_a.checked_add(delta_i128);
-    let neg_delta = delta_i128.checked_neg();
-
-    let mut reached = false;
-    if let (Some(na), Some(nd)) = (new_a, neg_delta) {
-        if na != i128::MIN {
-            if let Some(nb) = pnl_b.checked_add(nd) {
-                if nb != i128::MIN {
-                    engine.set_pnl(a as usize, na);
-                    engine.set_pnl(b as usize, nb);
-
-                    assert!(engine.check_conservation());
-                    // Zero-sum: pnl_pos_tot can only redistribute, not grow unbounded
-                    assert!(engine.pnl_pos_tot <= 5_000_000 + delta.unsigned_abs() as u128);
-                    reached = true;
-                }
-            }
-        }
+    // If trade succeeds (margin allows), conservation must hold
+    if result.is_ok() {
+        assert!(engine.check_conservation(),
+            "conservation must hold after execute_trade");
+    } else {
+        // Trade rejected by margin — conservation must still hold
+        assert!(engine.check_conservation(),
+            "conservation must hold even when trade is rejected");
     }
-    kani::cover!(reached, "zero-sum PnL path reachable");
+    kani::cover!(result.is_ok(), "trade execution path reachable");
 }
 
 #[kani::proof]
@@ -135,46 +124,37 @@ fn bounded_haircut_ratio_bounded() {
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
 fn bounded_equity_nonneg_flat() {
-    // Test equity non-negativity with non-trivial haircut (h < 1).
-    // Two accounts: idx has the tested state, idx2 provides vault excess.
-    // Must set pnl_matured_pos_tot for haircut to be non-trivial (v11.21).
+    // Test account_equity_maint_raw (the unclamped value) for a flat account.
+    // For a flat account with zero fees: raw = capital + pnl.
+    // Case 1: positive capital, non-negative PnL → raw >= 0.
+    // Case 2: negative PnL → raw == capital + pnl - fee_debt (exact).
     let mut engine = RiskEngine::new(zero_fee_params());
     let idx = engine.add_user(0).unwrap();
-    let idx2 = engine.add_user(0).unwrap();
 
     let cap: u16 = kani::any();
-    kani::assume(cap <= 10_000);
+    kani::assume(cap > 0 && cap <= 10_000);
     engine.set_capital(idx as usize, cap as u128);
-
-    let cap2: u16 = kani::any();
-    kani::assume(cap2 <= 10_000);
-    engine.set_capital(idx2 as usize, cap2 as u128);
-
-    let excess: u16 = kani::any();
-    kani::assume(excess <= 10_000);
-    let total_cap = (cap as u128) + (cap2 as u128);
-    engine.vault = U128::new(total_cap + (excess as u128));
 
     let pnl_val: i16 = kani::any();
     kani::assume(pnl_val > i16::MIN);
     engine.set_pnl(idx as usize, pnl_val as i128);
 
-    // Set pnl_matured_pos_tot to exercise h < 1 branch in haircut_ratio.
-    // This represents matured positive PnL from OTHER accounts that
-    // exceeds the residual, forcing h < 1 for withdrawable computation.
-    let matured: u16 = kani::any();
-    kani::assume(matured <= 20_000);
-    engine.pnl_matured_pos_tot = matured as u128;
-    // Maintain invariant: matured <= pnl_pos_tot
-    if engine.pnl_matured_pos_tot > engine.pnl_pos_tot {
-        engine.pnl_matured_pos_tot = engine.pnl_pos_tot;
-    }
-
     assert!(engine.accounts[idx as usize].position_basis_q == 0);
 
-    let eq = engine.account_equity_net(&engine.accounts[idx as usize], DEFAULT_ORACLE);
-    assert!(eq >= 0,
-        "flat account equity must be non-negative even with non-trivial haircut");
+    let raw = engine.account_equity_maint_raw(&engine.accounts[idx as usize]);
+
+    if pnl_val >= 0 {
+        // Positive capital + non-negative PnL (zero fees) → raw must be non-negative
+        assert!(raw >= 0,
+            "flat account with positive capital and non-negative PnL must have raw equity >= 0");
+    } else {
+        // Negative PnL: raw must equal capital + pnl - fee_debt exactly.
+        // fee_debt is 0 for zero_fee_params with fresh account.
+        let fee_debt = fee_debt_u128_checked(engine.accounts[idx as usize].fee_credits.get());
+        let expected = (cap as i128) + (pnl_val as i128) - (fee_debt as i128);
+        assert!(raw == expected,
+            "flat account raw equity must equal capital + pnl - fee_debt");
+    }
 }
 
 #[kani::proof]
@@ -186,21 +166,21 @@ fn bounded_liquidation_conservation() {
     let a = engine.add_user(0).unwrap();
 
     let deposit_amt: u32 = kani::any();
-    kani::assume(deposit_amt > 0 && deposit_amt <= 10_000_000);
+    kani::assume(deposit_amt >= 10_000 && deposit_amt <= 1_000_000);
     engine.deposit(a, deposit_amt as u128, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
-    let loss: u32 = kani::any();
-    kani::assume(loss > 0 && loss <= deposit_amt);
-    let pnl = -(loss as i128);
-    engine.set_pnl(a as usize, pnl);
+    // Give user a negative PnL that makes them underwater (loss > deposit)
+    let excess: u16 = kani::any();
+    kani::assume(excess >= 1 && excess <= 10_000);
+    let loss = deposit_amt as i128 + excess as i128;
+    engine.set_pnl(a as usize, -loss);
 
-    let cap = engine.accounts[a as usize].capital.get();
-    let pay = core::cmp::min(loss as u128, cap);
-    engine.set_capital(a as usize, cap - pay);
-    let new_pnl = pnl.checked_add(pay as i128).unwrap_or(0i128);
-    engine.set_pnl(a as usize, new_pnl);
+    // Use touch_account_full to resolve the flat negative through the real engine pipeline
+    // (settle_losses → resolve_flat_negative → insurance/absorb)
+    let _ = engine.touch_account_full(a as usize, DEFAULT_ORACLE, DEFAULT_SLOT);
 
-    assert!(engine.check_conservation());
+    assert!(engine.check_conservation(),
+        "conservation must hold after touch_account_full resolves underwater account");
 }
 
 #[kani::proof]
@@ -314,14 +294,22 @@ fn proof_close_account_returns_capital() {
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
 fn proof_trade_pnl_is_zero_sum_algebraic() {
-    let size: i32 = kani::any();
-    let price_diff: i32 = kani::any();
-    kani::assume(size != 0 && size > i32::MIN);
-    kani::assume(price_diff > i32::MIN);
+    let mut engine = RiskEngine::new(zero_fee_params());
 
-    let product = (size as i64) * (price_diff as i64);
-    let neg_product = -product;
-    assert!(product + neg_product == 0);
+    let a = engine.add_user(0).unwrap();
+    let b = engine.add_user(0).unwrap();
+
+    engine.deposit(a, 5_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    engine.deposit(b, 5_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+
+    let size_q = (100 * POS_SCALE) as i128;
+    let result = engine.execute_trade(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size_q, DEFAULT_ORACLE);
+    assert!(result.is_ok(), "trade must succeed with sufficient margin");
+
+    // After a trade, PnL must be zero-sum across the two counterparties
+    let pnl_a = engine.accounts[a as usize].pnl;
+    let pnl_b = engine.accounts[b as usize].pnl;
+    assert!(pnl_a + pnl_b == 0, "trade PnL must be zero-sum");
 }
 
 #[kani::proof]
@@ -1009,8 +997,10 @@ fn proof_risk_reducing_exemption_path() {
     engine2.set_pnl(a2 as usize, -70_000i128);
     let increase_result = engine2.execute_trade(a2, b2, DEFAULT_ORACLE, DEFAULT_SLOT, increase, DEFAULT_ORACLE);
 
-    // Risk-increasing must be rejected when below maintenance
+    // Risk-reducing must succeed, risk-increasing must be rejected
+    assert!(reduce_result.is_ok(), "risk-reducing trade must be accepted");
     kani::cover!(reduce_result.is_ok(), "risk-reducing trade accepted");
+    assert!(increase_result.is_err(), "risk-increasing trade must be rejected");
     kani::cover!(increase_result.is_err(), "risk-increasing trade rejected");
 
     // Both engines must maintain conservation

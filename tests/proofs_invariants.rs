@@ -112,145 +112,114 @@ fn t0_4_conservation_check_handles_overflow() {
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
 fn inductive_top_up_insurance_preserves_accounting() {
-    let vault_before: u64 = kani::any();
-    let c_tot_before: u64 = kani::any();
-    let ins_before: u64 = kani::any();
-    let amt: u64 = kani::any();
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let idx = engine.add_user(0).unwrap();
 
-    let v = vault_before as u128;
-    let c = c_tot_before as u128;
-    let i = ins_before as u128;
-    let a = amt as u128;
+    let dep: u32 = kani::any();
+    kani::assume(dep > 0 && dep <= 1_000_000);
+    engine.deposit(idx, dep as u128, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    assert!(engine.check_conservation());
 
-    kani::assume(c.checked_add(i).is_some());
-    kani::assume(v >= c + i);
-    kani::assume(v.checked_add(a).is_some());
-    kani::assume(i.checked_add(a).is_some());
-
-    let v_new = v + a;
-    let i_new = i + a;
-
-    assert!(v_new >= c + i_new);
+    let ins_amt: u32 = kani::any();
+    kani::assume(ins_amt <= 1_000_000);
+    engine.top_up_insurance_fund(ins_amt as u128).unwrap();
+    assert!(engine.check_conservation());
 }
 
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
 fn inductive_set_capital_decrease_preserves_accounting() {
-    let vault: u64 = kani::any();
-    let c_tot: u64 = kani::any();
-    let ins: u64 = kani::any();
-    let delta: u64 = kani::any();
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let idx = engine.add_user(0).unwrap();
 
-    let v = vault as u128;
-    let c = c_tot as u128;
-    let i = ins as u128;
-    let d = delta as u128;
+    let dep: u32 = kani::any();
+    kani::assume(dep >= 1000 && dep <= 1_000_000);
+    engine.deposit(idx, dep as u128, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    assert!(engine.check_conservation());
 
-    kani::assume(c.checked_add(i).is_some());
-    kani::assume(v >= c + i);
-    kani::assume(d <= c);
-
-    let c_new = c - d;
-
-    assert!(v >= c_new + i);
+    let new_cap: u32 = kani::any();
+    kani::assume(new_cap <= dep);
+    engine.set_capital(idx as usize, new_cap as u128);
+    assert!(engine.check_conservation());
 }
 
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
 fn inductive_set_pnl_preserves_pnl_pos_tot_delta() {
-    let old_pnl: i32 = kani::any();
-    let new_pnl: i32 = kani::any();
-    let ppt_other: u32 = kani::any();
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let a = engine.add_user(0).unwrap();
+    let b = engine.add_user(0).unwrap();
 
-    let ppt_o = ppt_other as u128;
+    let pnl_a: i32 = kani::any();
+    kani::assume(pnl_a > i32::MIN);
+    engine.set_pnl(a as usize, pnl_a as i128);
 
-    let old_pos: u128 = if old_pnl > 0 { old_pnl as u128 } else { 0 };
-    let new_pos: u128 = if new_pnl > 0 { new_pnl as u128 } else { 0 };
+    let pnl_b: i32 = kani::any();
+    kani::assume(pnl_b > i32::MIN);
+    engine.set_pnl(b as usize, pnl_b as i128);
 
-    let ppt_before = ppt_o + old_pos;
-
-    let ppt_after = if new_pos >= old_pos {
-        ppt_before + (new_pos - old_pos)
-    } else {
-        ppt_before - (old_pos - new_pos)
-    };
-
-    assert!(ppt_after == ppt_o + new_pos);
+    let pos_a: u128 = if pnl_a > 0 { pnl_a as u128 } else { 0 };
+    let pos_b: u128 = if pnl_b > 0 { pnl_b as u128 } else { 0 };
+    assert!(engine.pnl_pos_tot == pos_a + pos_b);
 }
 
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
 fn inductive_deposit_preserves_accounting() {
-    let vault: u64 = kani::any();
-    let c_tot: u64 = kani::any();
-    let ins: u64 = kani::any();
-    let amt: u64 = kani::any();
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let idx = engine.add_user(0).unwrap();
 
-    let v = vault as u128;
-    let c = c_tot as u128;
-    let i = ins as u128;
-    let a = amt as u128;
-
-    kani::assume(c.checked_add(i).is_some());
-    kani::assume(v >= c + i);
-    kani::assume(v.checked_add(a).is_some());
-    kani::assume(c.checked_add(a).is_some());
-
-    let v_new = v + a;
-    let c_new = c + a;
-
-    assert!(v_new >= c_new + i);
+    let dep: u32 = kani::any();
+    kani::assume(dep >= 1 && dep <= 1_000_000);
+    engine.deposit(idx, dep as u128, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    assert!(engine.check_conservation());
 }
 
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
 fn inductive_withdraw_preserves_accounting() {
-    let vault: u64 = kani::any();
-    let c_tot: u64 = kani::any();
-    let ins: u64 = kani::any();
-    let amt: u64 = kani::any();
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let idx = engine.add_user(0).unwrap();
 
-    let v = vault as u128;
-    let c = c_tot as u128;
-    let i = ins as u128;
-    let a = amt as u128;
+    let dep: u32 = kani::any();
+    kani::assume(dep >= 1000 && dep <= 1_000_000);
+    engine.deposit(idx, dep as u128, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
-    kani::assume(c.checked_add(i).is_some());
-    kani::assume(v >= c + i);
-    kani::assume(a <= c);
-    kani::assume(a <= v);
+    // Run keeper_crank to satisfy fresh-crank requirement for withdraw
+    let _ = engine.keeper_crank(DEFAULT_SLOT, DEFAULT_ORACLE, &[], 0);
 
-    let v_new = v - a;
-    let c_new = c - a;
-
-    assert!(v_new >= c_new + i);
+    let w: u32 = kani::any();
+    kani::assume(w >= 1 && w <= dep);
+    let result = engine.withdraw(idx, w as u128, DEFAULT_ORACLE, DEFAULT_SLOT);
+    if result.is_ok() {
+        assert!(engine.check_conservation());
+    }
 }
 
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
 fn inductive_settle_loss_preserves_accounting() {
-    let vault: u64 = kani::any();
-    let c_tot: u64 = kani::any();
-    let ins: u64 = kani::any();
-    let paid: u64 = kani::any();
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let idx = engine.add_user(0).unwrap();
 
-    let v = vault as u128;
-    let c = c_tot as u128;
-    let i = ins as u128;
-    let p = paid as u128;
+    let dep: u32 = kani::any();
+    kani::assume(dep >= 1000 && dep <= 1_000_000);
+    engine.deposit(idx, dep as u128, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    assert!(engine.check_conservation());
 
-    kani::assume(c.checked_add(i).is_some());
-    kani::assume(v >= c + i);
-    kani::assume(p <= c);
+    let loss: i32 = kani::any();
+    kani::assume(loss < 0 && loss > i32::MIN);
+    kani::assume((-loss as u32) <= dep);
+    engine.set_pnl(idx as usize, loss as i128);
 
-    let c_new = c - p;
-
-    assert!(v >= c_new + i);
+    // touch_account_full settles losses from principal (step 9)
+    let _ = engine.touch_account_full(idx as usize, DEFAULT_ORACLE, DEFAULT_SLOT);
+    assert!(engine.check_conservation());
 }
 
 // ============================================================================

@@ -62,41 +62,53 @@ fn t0_1_sat_negative_with_remainder() {
 // ============================================================================
 
 #[kani::proof]
-#[kani::unwind(1)]
+#[kani::unwind(34)]
 #[kani::solver(cadical)]
 fn t0_2_mul_div_floor_algebraic_identity() {
     let a: u8 = kani::any();
     let b: u8 = kani::any();
     let c: u8 = kani::any();
-    kani::assume(c > 0);
+    // Constrain to 4-bit range to keep U256/U512 division tractable for SAT solver
+    kani::assume(a <= 15 && b <= 15 && c > 0 && c <= 15);
 
-    let product = (a as u32) * (b as u32);
-    let floor_val = product / (c as u32);
-    let remainder = product % (c as u32);
+    let a256 = U256::from_u128(a as u128);
+    let b256 = U256::from_u128(b as u128);
+    let c256 = U256::from_u128(c as u128);
 
-    assert!(floor_val * (c as u32) + remainder == product);
-    assert!(remainder < c as u32);
+    let (q, r) = mul_div_floor_u256_with_rem(a256, b256, c256);
+
+    // Algebraic identity: q * c + r == a * b
+    let lhs = q * c256 + r;
+    let rhs = a256 * b256;
+    assert!(lhs == rhs, "q * c + r must equal a * b");
+
+    // Remainder must be strictly less than divisor
+    assert!(r < c256, "remainder must be less than divisor");
 }
 
 #[kani::proof]
-#[kani::unwind(1)]
+#[kani::unwind(34)]
 #[kani::solver(cadical)]
 fn t0_2_mul_div_ceil_algebraic_identity() {
     let a: u8 = kani::any();
     let b: u8 = kani::any();
     let c: u8 = kani::any();
-    kani::assume(c > 0);
+    // Constrain to 4-bit range to keep U256/U512 division tractable for SAT solver
+    kani::assume(a <= 15 && b <= 15 && c > 0 && c <= 15);
 
-    let product = (a as u32) * (b as u32);
-    let floor_val = product / (c as u32);
-    let remainder = product % (c as u32);
-    let ceil_val = (product + (c as u32) - 1) / (c as u32);
+    let a256 = U256::from_u128(a as u128);
+    let b256 = U256::from_u128(b as u128);
+    let c256 = U256::from_u128(c as u128);
 
-    if remainder == 0 {
-        assert!(ceil_val == floor_val);
+    let (floor, r) = mul_div_floor_u256_with_rem(a256, b256, c256);
+    let ceil = mul_div_ceil_u256(a256, b256, c256);
+
+    let expected_ceil = if r != U256::ZERO {
+        floor + U256::from_u128(1)
     } else {
-        assert!(ceil_val == floor_val + 1);
-    }
+        floor
+    };
+    assert!(ceil == expected_ceil, "ceil must equal floor + (r != 0 ? 1 : 0)");
 }
 
 #[kani::proof]
