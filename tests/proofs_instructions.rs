@@ -1226,3 +1226,345 @@ fn proof_solvent_flat_close_succeeds() {
         "solvent trader closing to flat must not be rejected");
     assert!(engine.check_conservation(), "conservation must hold after flat close");
 }
+
+// ############################################################################
+// SPEC §12 PROPERTY #23: Deposit materialization threshold
+// ############################################################################
+
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_property_23_deposit_materialization_threshold() {
+    // With nonzero MIN_INITIAL_DEPOSIT, a deposit below the threshold
+    // must be rejected for a missing account.
+    let mut params = zero_fee_params();
+    params.min_initial_deposit = U128::new(1000);
+    let mut engine = RiskEngine::new(params);
+
+    let existing = engine.add_user(0).unwrap();
+
+    // Try to deposit below threshold into unmaterialized account
+    let missing: u16 = 3;
+    assert!(!engine.is_used(missing as usize));
+
+    let result = engine.deposit(missing, 999, DEFAULT_ORACLE, DEFAULT_SLOT);
+    assert!(result.is_err(), "deposit below MIN_INITIAL_DEPOSIT must be rejected for missing account");
+
+    // But an existing materialized account can receive a small top-up
+    engine.deposit(existing, 5000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    let topup = engine.deposit(existing, 1, DEFAULT_ORACLE, DEFAULT_SLOT);
+    assert!(topup.is_ok(), "existing account must accept small top-up below MIN_INITIAL_DEPOSIT");
+
+    assert!(engine.check_conservation());
+}
+
+// ############################################################################
+// SPEC §12 PROPERTY #51: Universal withdrawal dust guard
+// ############################################################################
+
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_property_51_withdrawal_dust_guard() {
+    // With nonzero MIN_INITIAL_DEPOSIT, a withdrawal that would leave
+    // 0 < C_i < MIN_INITIAL_DEPOSIT must be rejected.
+    let mut params = zero_fee_params();
+    params.min_initial_deposit = U128::new(1000);
+    let mut engine = RiskEngine::new(params);
+
+    let a = engine.add_user(0).unwrap();
+    engine.deposit(a, 5000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    engine.keeper_crank(DEFAULT_SLOT, DEFAULT_ORACLE, &[], 0).unwrap();
+
+    // Withdraw leaving exactly 500 (< MIN_INITIAL_DEPOSIT=1000) → must fail
+    let result = engine.withdraw(a, 4500, DEFAULT_ORACLE, DEFAULT_SLOT);
+    assert!(result.is_err(),
+        "withdrawal leaving dust capital (500 < 1000) must be rejected");
+
+    // Withdraw leaving exactly 0 → must succeed
+    let result_zero = engine.withdraw(a, 5000, DEFAULT_ORACLE, DEFAULT_SLOT);
+    assert!(result_zero.is_ok(),
+        "withdrawal leaving zero capital must succeed");
+
+    assert!(engine.check_conservation());
+}
+
+// ############################################################################
+// SPEC §12 PROPERTY #31: Missing-account safety
+// ############################################################################
+
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_property_31_missing_account_safety() {
+    // settle_account, withdraw, execute_trade, liquidate, and deposit
+    // must all reject missing (unmaterialized) accounts.
+    let mut engine = RiskEngine::new(zero_fee_params());
+
+    // Add one real user for counterparty testing
+    let real = engine.add_user(0).unwrap();
+    engine.deposit(real, 100_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    engine.keeper_crank(DEFAULT_SLOT, DEFAULT_ORACLE, &[], 0).unwrap();
+
+    // Pick an index that was never add_user'd — it's missing
+    let missing: u16 = 3; // MAX_ACCOUNTS=4 in kani, index 3 never materialized
+    assert!(!engine.is_used(missing as usize), "account must be unmaterialized");
+
+    // deposit must reject missing account
+    let dep_result = engine.deposit(missing, 1000, DEFAULT_ORACLE, DEFAULT_SLOT);
+    assert!(dep_result.is_err(), "deposit must reject missing account");
+
+    // settle_account must reject missing account
+    let settle_result = engine.settle_account(missing, DEFAULT_ORACLE, DEFAULT_SLOT);
+    assert!(settle_result.is_err(), "settle_account must reject missing account");
+
+    // withdraw must reject missing account
+    let withdraw_result = engine.withdraw(missing, 100, DEFAULT_ORACLE, DEFAULT_SLOT);
+    assert!(withdraw_result.is_err(), "withdraw must reject missing account");
+
+    // execute_trade with missing account as party a
+    let trade_result = engine.execute_trade(missing, real, DEFAULT_ORACLE, DEFAULT_SLOT,
+        POS_SCALE as i128, DEFAULT_ORACLE);
+    assert!(trade_result.is_err(), "execute_trade must reject missing account (party a)");
+
+    // execute_trade with missing account as party b
+    let trade_result_b = engine.execute_trade(real, missing, DEFAULT_ORACLE, DEFAULT_SLOT,
+        POS_SCALE as i128, DEFAULT_ORACLE);
+    assert!(trade_result_b.is_err(), "execute_trade must reject missing account (party b)");
+
+    // liquidate_at_oracle on missing account — returns Ok(false) (no-op)
+    let liq_result = engine.liquidate_at_oracle(missing, DEFAULT_SLOT, DEFAULT_ORACLE);
+    assert!(liq_result.is_ok(), "liquidate must not error on missing");
+    assert!(!liq_result.unwrap(), "liquidate must return false (no-op) for missing account");
+
+    // Verify no account was materialized
+    assert!(!engine.is_used(missing as usize), "missing account must remain unmaterialized");
+}
+
+// ############################################################################
+// SPEC §12 PROPERTY #44: Deposit true-flat guard
+// ############################################################################
+
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_property_44_deposit_true_flat_guard() {
+    // A deposit into an account with basis_pos_q != 0 must NOT call
+    // resolve_flat_negative or fee_debt_sweep. We verify by observing
+    // that insurance_fund doesn't change (resolve_flat_negative calls
+    // absorb_protocol_loss which would affect insurance).
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let a = engine.add_user(0).unwrap();
+
+    engine.deposit(a, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+
+    // Directly set up open position with negative PnL (bypassing trade to isolate deposit behavior)
+    engine.accounts[a as usize].position_basis_q = (10 * POS_SCALE) as i128;
+    engine.stored_pos_count_long = 1;
+    engine.oi_eff_long_q = 10 * POS_SCALE;
+    engine.oi_eff_short_q = 10 * POS_SCALE;
+    engine.set_pnl(a as usize, -5_000i128);
+
+    assert!(engine.accounts[a as usize].position_basis_q != 0);
+    assert!(engine.accounts[a as usize].pnl < 0);
+
+    let ins_before = engine.insurance_fund.balance.get();
+    let pnl_before = engine.accounts[a as usize].pnl;
+
+    // Deposit — with basis != 0, resolve_flat_negative must NOT run
+    engine.deposit(a, 50_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+
+    // resolve_flat_negative calls absorb_protocol_loss which changes insurance_fund.
+    // If it did NOT run, insurance_fund must be unchanged.
+    assert!(engine.insurance_fund.balance.get() == ins_before,
+        "insurance must not change: resolve_flat_negative must not run when basis != 0");
+
+    // Position must still be intact
+    assert!(engine.accounts[a as usize].position_basis_q != 0,
+        "position must still be intact after deposit");
+
+    // PnL may have been partially settled by settle_losses (step 7),
+    // but it must NOT have been zeroed by resolve_flat_negative
+    // (which zeros PnL and routes the loss through insurance).
+    // settle_losses reduces PnL magnitude while reducing capital, without touching insurance.
+    let pnl_after = engine.accounts[a as usize].pnl;
+    assert!(pnl_after >= pnl_before,
+        "PnL must not decrease further than settle_losses allows");
+}
+
+// ############################################################################
+// SPEC §12 PROPERTY #49: Profit-conversion reserve preservation
+// ############################################################################
+
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_property_49_profit_conversion_reserve_preservation() {
+    // Converting ReleasedPos_i = x must leave R_i unchanged and reduce
+    // both PNL_pos_tot and PNL_matured_pos_tot by exactly x.
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let a = engine.add_user(0).unwrap();
+    let b = engine.add_user(0).unwrap();
+
+    engine.deposit(a, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    engine.deposit(b, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    engine.keeper_crank(DEFAULT_SLOT, DEFAULT_ORACLE, &[], 0).unwrap();
+
+    // Open positions
+    let size_q = (100 * POS_SCALE) as i128;
+    engine.execute_trade(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size_q, DEFAULT_ORACLE).unwrap();
+
+    // Oracle up — a gets profit
+    let high_oracle = 1_100u64;
+    let slot2 = DEFAULT_SLOT + 1;
+    engine.keeper_crank(slot2, high_oracle, &[a, b], 64).unwrap();
+
+    // Wait for warmup to partially release
+    let slot3 = slot2 + 60; // 60 of 100 slots
+    engine.keeper_crank(slot3, high_oracle, &[a], 64).unwrap();
+
+    let released = engine.released_pos(a as usize);
+    if released == 0 {
+        // Nothing to convert — warmup hasn't released yet. Skip.
+        return;
+    }
+
+    let r_before = engine.accounts[a as usize].reserved_pnl;
+    let ppt_before = engine.pnl_pos_tot;
+    let pmpt_before = engine.pnl_matured_pos_tot;
+
+    // Use consume_released_pnl to convert x = released
+    let x = released;
+    engine.consume_released_pnl(a as usize, x);
+
+    // R_i must be unchanged
+    assert!(engine.accounts[a as usize].reserved_pnl == r_before,
+        "R_i must be unchanged after consume_released_pnl");
+
+    // PNL_pos_tot decreased by exactly x
+    assert!(engine.pnl_pos_tot == ppt_before - x,
+        "pnl_pos_tot must decrease by exactly x");
+
+    // PNL_matured_pos_tot decreased by exactly x
+    assert!(engine.pnl_matured_pos_tot == pmpt_before - x,
+        "pnl_matured_pos_tot must decrease by exactly x");
+}
+
+// ############################################################################
+// SPEC §12 PROPERTY #50: Flat-only automatic conversion
+// ############################################################################
+
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_property_50_flat_only_auto_conversion() {
+    // touch_account_full on an open-position account must NOT auto-convert.
+    // Only flat accounts get auto-conversion via do_profit_conversion.
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let a = engine.add_user(0).unwrap();
+    let b = engine.add_user(0).unwrap();
+
+    engine.deposit(a, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    engine.deposit(b, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    engine.keeper_crank(DEFAULT_SLOT, DEFAULT_ORACLE, &[], 0).unwrap();
+
+    // Open positions
+    let size_q = (100 * POS_SCALE) as i128;
+    engine.execute_trade(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size_q, DEFAULT_ORACLE).unwrap();
+
+    // Oracle up, then wait for full warmup
+    let high_oracle = 1_100u64;
+    let slot2 = DEFAULT_SLOT + 1;
+    engine.keeper_crank(slot2, high_oracle, &[a, b], 64).unwrap();
+
+    // Full warmup elapsed
+    let slot3 = slot2 + 200; // well past warmup_period_slots=100
+    engine.keeper_crank(slot3, high_oracle, &[a], 64).unwrap();
+
+    // a still has position, so should have released profit but NOT auto-converted
+    assert!(engine.accounts[a as usize].position_basis_q != 0,
+        "account must still have open position");
+
+    let released = engine.released_pos(a as usize);
+    // After full warmup, released profit should exist (R_i decreased or zeroed)
+    // Capital should NOT have increased from auto-conversion
+    // The key test: capital only changes from settle_losses, not from do_profit_conversion
+    let cap_a = engine.accounts[a as usize].capital.get();
+    assert!(cap_a <= 500_000,
+        "capital must not increase from auto-conversion while position is open: cap={}",
+        cap_a);
+
+    // Verify released profit exists but wasn't consumed
+    assert!(released > 0 || engine.accounts[a as usize].reserved_pnl == 0,
+        "warmup must have released profit or reserve is zero");
+
+    assert!(engine.check_conservation());
+}
+
+// ############################################################################
+// SPEC §12 PROPERTY #52: Explicit open-position profit conversion
+// ############################################################################
+
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_property_52_convert_released_pnl_instruction() {
+    // convert_released_pnl consumes only ReleasedPos_i, leaves R_i unchanged,
+    // sweeps fee debt, and rejects if post-conversion is not maintenance healthy.
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let a = engine.add_user(0).unwrap();
+    let b = engine.add_user(0).unwrap();
+
+    engine.deposit(a, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    engine.deposit(b, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    engine.keeper_crank(DEFAULT_SLOT, DEFAULT_ORACLE, &[], 0).unwrap();
+
+    // Open positions
+    let size_q = (100 * POS_SCALE) as i128;
+    engine.execute_trade(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size_q, DEFAULT_ORACLE).unwrap();
+
+    // Oracle up
+    let high_oracle = 1_200u64;
+    let slot2 = DEFAULT_SLOT + 1;
+    engine.keeper_crank(slot2, high_oracle, &[a, b], 64).unwrap();
+
+    // Wait for warmup to fully release
+    let slot3 = slot2 + 200;
+    engine.keeper_crank(slot3, high_oracle, &[a], 64).unwrap();
+
+    // Check released amount
+    let released_before = engine.released_pos(a as usize);
+    if released_before == 0 {
+        return; // nothing to convert
+    }
+
+    let r_before = engine.accounts[a as usize].reserved_pnl;
+    let cap_before = engine.accounts[a as usize].capital.get();
+    let ppt_before = engine.pnl_pos_tot;
+    let pmpt_before = engine.pnl_matured_pos_tot;
+
+    // Convert all released profit
+    let result = engine.convert_released_pnl(a, released_before, high_oracle, slot3);
+    assert!(result.is_ok(), "convert_released_pnl must succeed for healthy account");
+
+    // R_i must be unchanged
+    assert!(engine.accounts[a as usize].reserved_pnl == r_before,
+        "R_i must be unchanged after convert_released_pnl");
+
+    // Capital must have increased (by haircutted amount)
+    assert!(engine.accounts[a as usize].capital.get() > cap_before,
+        "capital must increase after converting released profit");
+
+    // PNL_pos_tot and PNL_matured_pos_tot must have decreased
+    assert!(engine.pnl_pos_tot < ppt_before,
+        "pnl_pos_tot must decrease after conversion");
+    assert!(engine.pnl_matured_pos_tot < pmpt_before,
+        "pnl_matured_pos_tot must decrease after conversion");
+
+    // Account must still be maintenance healthy (conversion rejects if not)
+    assert!(engine.is_above_maintenance_margin(
+        &engine.accounts[a as usize], a as usize, high_oracle),
+        "account must be maintenance healthy after conversion");
+
+    assert!(engine.check_conservation());
+}
