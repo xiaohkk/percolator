@@ -462,6 +462,16 @@ impl RiskEngine {
             params.min_initial_deposit.get() <= MAX_VAULT_TVL,
             "min_initial_deposit must be <= MAX_VAULT_TVL"
         );
+
+        // Liquidation fee ordering: 0 <= min_liquidation_abs <= liquidation_fee_cap (spec §1.4)
+        assert!(
+            params.min_liquidation_abs.get() <= params.liquidation_fee_cap.get(),
+            "min_liquidation_abs must be <= liquidation_fee_cap (spec §1.4)"
+        );
+        assert!(
+            params.liquidation_fee_cap.get() <= MAX_PROTOCOL_FEE_ABS,
+            "liquidation_fee_cap must be <= MAX_PROTOCOL_FEE_ABS (spec §1.4)"
+        );
     }
 
     /// Create a new risk engine
@@ -1964,6 +1974,10 @@ impl RiskEngine {
     // ========================================================================
 
     pub fn touch_account_full(&mut self, idx: usize, oracle_price: u64, now_slot: u64) -> Result<()> {
+        // Bounds and existence check (hardened public API surface)
+        if idx >= MAX_ACCOUNTS || !self.is_used(idx) {
+            return Err(RiskError::AccountNotFound);
+        }
         // Preconditions (spec §10.1 steps 1-4)
         if now_slot < self.current_slot {
             return Err(RiskError::Overflow);
@@ -3008,14 +3022,14 @@ impl RiskEngine {
                 if eff != 0 {
                     if !self.is_above_maintenance_margin(&self.accounts[cidx], cidx, oracle_price) {
                         // Validate hint via stateless pre-flight (spec §11.1 rule 3).
-                        // If the hint is an ExactPartial that would fail the §9.4 step 14
-                        // post-partial health check, the pre-flight rejects it and we
-                        // fall back to FullClose to preserve crank liveness.
-                        let policy = self.validate_keeper_hint(candidate_idx, eff, hint, oracle_price);
-                        match self.liquidate_at_oracle_internal(candidate_idx, now_slot, oracle_price, policy, &mut ctx) {
-                            Ok(true) => { num_liquidations += 1; }
-                            Ok(false) => {}
-                            Err(e) => return Err(e),
+                        // None hint → no action per spec §11.2.
+                        // Invalid ExactPartial → FullClose fallback for liveness.
+                        if let Some(policy) = self.validate_keeper_hint(candidate_idx, eff, hint, oracle_price) {
+                            match self.liquidate_at_oracle_internal(candidate_idx, now_slot, oracle_price, policy, &mut ctx) {
+                                Ok(true) => { num_liquidations += 1; }
+                                Ok(false) => {}
+                                Err(e) => return Err(e),
+                            }
                         }
                     }
                 }
@@ -3050,28 +3064,30 @@ impl RiskEngine {
     }
 
     /// Validate a keeper-supplied liquidation-policy hint (spec §11.1 rule 3).
-    /// Returns a safe LiquidationPolicy. ExactPartial hints are validated via a
-    /// stateless pre-flight check that predicts whether the post-partial health
-    /// check (§9.4 step 14) would pass. If it wouldn't, falls back to FullClose
-    /// to preserve crank liveness.
+    /// Returns None if no liquidation action should be taken (absent hint per
+    /// spec §11.2), or Some(policy) if the hint is valid. ExactPartial hints
+    /// are validated via a stateless pre-flight check; invalid partials fall
+    /// back to FullClose to preserve crank liveness.
     ///
     /// Pre-flight correctness: settle_losses preserves C + PNL (spec §7.1),
     /// and the synthetic close at oracle generates zero additional PnL delta,
     /// so Eq_maint_raw after partial = Eq_maint_raw_before - liq_fee.
-    fn validate_keeper_hint(
+    pub fn validate_keeper_hint(
         &self,
         idx: u16,
         eff: i128,
         hint: &Option<LiquidationPolicy>,
         oracle_price: u64,
-    ) -> LiquidationPolicy {
+    ) -> Option<LiquidationPolicy> {
         match hint {
-            None | Some(LiquidationPolicy::FullClose) => LiquidationPolicy::FullClose,
+            // Spec §11.2: absent hint means no liquidation action for this candidate.
+            None => None,
+            Some(LiquidationPolicy::FullClose) => Some(LiquidationPolicy::FullClose),
             Some(LiquidationPolicy::ExactPartial(q_close_q)) => {
                 let abs_eff = eff.unsigned_abs();
                 // Bounds check: 0 < q_close_q < abs(eff)
                 if *q_close_q == 0 || *q_close_q >= abs_eff {
-                    return LiquidationPolicy::FullClose;
+                    return Some(LiquidationPolicy::FullClose);
                 }
 
                 // Stateless pre-flight: predict post-partial maintenance health.
@@ -3089,7 +3105,7 @@ impl RiskEngine {
                 let eq_raw_wide = self.account_equity_maint_raw_wide(account);
                 let predicted_eq = match eq_raw_wide.checked_sub(I256::from_u128(liq_fee)) {
                     Some(v) => v,
-                    None => return LiquidationPolicy::FullClose,
+                    None => return Some(LiquidationPolicy::FullClose),
                 };
 
                 // 3. Predict post-partial MM_req
@@ -3104,10 +3120,10 @@ impl RiskEngine {
 
                 // 4. Health check: predicted_eq > predicted_mm_req
                 if predicted_eq <= I256::from_u128(predicted_mm_req) {
-                    return LiquidationPolicy::FullClose;
+                    return Some(LiquidationPolicy::FullClose);
                 }
 
-                LiquidationPolicy::ExactPartial(*q_close_q)
+                Some(LiquidationPolicy::ExactPartial(*q_close_q))
             }
         }
     }
@@ -3296,10 +3312,12 @@ impl RiskEngine {
         let max_scan = (ACCOUNTS_PER_CRANK as usize).min(MAX_ACCOUNTS);
         let start = self.gc_cursor as usize;
 
+        let mut scanned: usize = 0;
         for offset in 0..max_scan {
             if num_to_free >= GC_CLOSE_BUDGET as usize {
                 break;
             }
+            scanned = offset + 1;
 
             let idx = (start + offset) & ACCOUNT_IDX_MASK;
             let block = idx >> 6;
@@ -3359,7 +3377,9 @@ impl RiskEngine {
             num_to_free += 1;
         }
 
-        self.gc_cursor = ((start + max_scan) & ACCOUNT_IDX_MASK) as u16;
+        // Advance cursor by actual number of offsets scanned, not max_scan.
+        // Prevents skipping unscanned accounts on early break.
+        self.gc_cursor = ((start + scanned) & ACCOUNT_IDX_MASK) as u16;
 
         for i in 0..num_to_free {
             self.free_slot(to_free[i]);

@@ -1024,7 +1024,7 @@ fn test_keeper_crank_liquidates_underwater_accounts() {
     // Crash price
     let slot2 = 2u64;
     let crash = 870u64;
-    let outcome = engine.keeper_crank(slot2, crash, &[(a, None), (b, None)], 64).expect("crank");
+    let outcome = engine.keeper_crank(slot2, crash, &[(a, Some(LiquidationPolicy::FullClose)), (b, Some(LiquidationPolicy::FullClose))], 64).expect("crank");
     // The crank should have liquidated the underwater account
     assert!(outcome.num_liquidations > 0, "crank must liquidate underwater account");
     assert!(engine.check_conservation());
@@ -1595,7 +1595,7 @@ fn test_liquidation_triggers_on_underwater_account() {
     let slot2 = 3;
 
     // Crank at crash price — accrues market internally then liquidates
-    let outcome = engine.keeper_crank(slot2, crash_price, &[(a, None), (b, None)], 64).unwrap();
+    let outcome = engine.keeper_crank(slot2, crash_price, &[(a, Some(LiquidationPolicy::FullClose)), (b, Some(LiquidationPolicy::FullClose))], 64).unwrap();
     assert!(outcome.num_liquidations > 0, "crank must liquidate underwater account after 50% price drop");
 }
 
@@ -2092,8 +2092,8 @@ fn test_min_liquidation_fee_enforced() {
 fn test_min_liquidation_fee_does_not_exceed_cap() {
     // Verify: min(max(bps_fee, min_abs), cap) → cap wins when min > cap
     let mut params = default_params();
-    params.min_liquidation_abs = U128::new(10_000); // high minimum
-    params.liquidation_fee_cap = U128::new(200);    // lower cap overrides
+    params.liquidation_fee_cap = U128::new(200);     // low cap
+    params.min_liquidation_abs = U128::new(150);     // below cap (valid per §1.4)
     params.liquidation_fee_bps = 100;
     params.maintenance_fee_per_slot = U128::ZERO;
     let mut engine = RiskEngine::new(params);
@@ -2107,7 +2107,8 @@ fn test_min_liquidation_fee_does_not_exceed_cap() {
     engine.deposit(b, 50_000, oracle, slot).unwrap();
 
     // 10-unit position: notional = 10000, 1% bps = 100
-    // max(100, 10000) = 10000, but cap = 200 → fee = 200
+    // max(100, 150) = 150, but cap = 200 → fee = 150
+    // The cap wins when fee would exceed it
     let size_q = make_size_q(10);
     engine.execute_trade(a, b, oracle, slot, size_q, oracle).unwrap();
 

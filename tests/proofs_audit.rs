@@ -457,3 +457,168 @@ fn proof_settle_epoch_snap_zero_on_truncation() {
         );
     }
 }
+
+// ############################################################################
+// FIX 9: validate_keeper_hint maps None → None (spec §11.2)
+// ############################################################################
+
+/// A None hint must produce None (no liquidation), not FullClose.
+/// Spec §11.2: absent hint = no liquidation action for this candidate.
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_keeper_hint_none_returns_none() {
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let a = engine.add_user(0).unwrap();
+    let b = engine.add_user(0).unwrap();
+    engine.deposit(a, 100_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    engine.deposit(b, 100_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+
+    // Open a position so eff != 0
+    let size: i128 = (POS_SCALE as i128) * 10;
+    engine.execute_trade(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size, DEFAULT_ORACLE).unwrap();
+
+    let eff = engine.effective_pos_q(a as usize);
+    assert!(eff != 0);
+
+    // None hint must return None per §11.2
+    let result = engine.validate_keeper_hint(a, eff, &None, DEFAULT_ORACLE);
+    assert!(result.is_none(), "None hint must return None per spec §11.2");
+}
+
+/// A FullClose hint must return Some(FullClose).
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_keeper_hint_fullclose_passthrough() {
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let a = engine.add_user(0).unwrap();
+    let b = engine.add_user(0).unwrap();
+    engine.deposit(a, 100_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    engine.deposit(b, 100_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+
+    let size: i128 = (POS_SCALE as i128) * 10;
+    engine.execute_trade(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size, DEFAULT_ORACLE).unwrap();
+
+    let eff = engine.effective_pos_q(a as usize);
+    let hint = Some(LiquidationPolicy::FullClose);
+    let result = engine.validate_keeper_hint(a, eff, &hint, DEFAULT_ORACLE);
+    assert!(
+        matches!(result, Some(LiquidationPolicy::FullClose)),
+        "FullClose hint must pass through"
+    );
+}
+
+// ############################################################################
+// FIX 10: GC cursor advances by actual scan count, not max_scan
+// ############################################################################
+
+/// After garbage_collect_dust with no dust accounts, gc_cursor must still
+/// advance by the number of slots scanned (all MAX_ACCOUNTS when no early break).
+/// With zero used accounts, scanned == min(ACCOUNTS_PER_CRANK, MAX_ACCOUNTS)
+/// and gc_cursor wraps around accordingly.
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_gc_cursor_advances_by_scanned() {
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let cursor_before = engine.gc_cursor;
+
+    // No accounts → nothing to GC, but cursor must advance by scanned count
+    let num_freed = engine.garbage_collect_dust();
+    assert_eq!(num_freed, 0, "no accounts to GC");
+
+    let cursor_after = engine.gc_cursor;
+    let max_scan = core::cmp::min(ACCOUNTS_PER_CRANK as usize, MAX_ACCOUNTS);
+    let mask = MAX_ACCOUNTS - 1;
+    let expected = ((cursor_before as usize + max_scan) & mask) as u16;
+    assert_eq!(
+        cursor_after, expected,
+        "gc_cursor must advance by actual scanned count"
+    );
+}
+
+/// When some dust accounts exist, gc_cursor advances by exactly the number
+/// of offsets scanned (not max_scan). Under Kani (MAX_ACCOUNTS=4),
+/// GC_CLOSE_BUDGET=32 > MAX_ACCOUNTS so the budget never triggers early break,
+/// but the scanned-count tracking is still exercised.
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_gc_cursor_with_dust_accounts() {
+    let mut engine = RiskEngine::new(zero_fee_params());
+
+    // Create 2 dust accounts (< MAX_ACCOUNTS=4 under Kani)
+    let a = engine.add_user(0).unwrap();
+    engine.deposit(a, 1, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    let b = engine.add_user(0).unwrap();
+    engine.deposit(b, 1, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+
+    engine.gc_cursor = 0;
+    let num_freed = engine.garbage_collect_dust();
+
+    // Both accounts are dust (capital=1 < min_initial_deposit=2, flat, pnl=0)
+    assert_eq!(num_freed, 2, "both dust accounts should be freed");
+
+    // Cursor advances by min(ACCOUNTS_PER_CRANK, MAX_ACCOUNTS) = full scan
+    // (no early break since GC_CLOSE_BUDGET=32 > 2 freed)
+    let max_scan = core::cmp::min(ACCOUNTS_PER_CRANK as usize, MAX_ACCOUNTS);
+    let mask = MAX_ACCOUNTS - 1;
+    assert_eq!(engine.gc_cursor, ((0 + max_scan) & mask) as u16);
+}
+
+// ############################################################################
+// FIX 11: validate_params rejects min_liquidation_abs > liquidation_fee_cap
+// ############################################################################
+
+/// validate_params must panic when min_liquidation_abs > liquidation_fee_cap.
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+#[kani::should_panic]
+fn proof_config_rejects_liq_fee_inversion() {
+    let mut params = zero_fee_params();
+    params.liquidation_fee_bps = 100;
+    params.liquidation_fee_cap = U128::new(100);
+    params.min_liquidation_abs = U128::new(200); // > cap → must panic
+    let _ = RiskEngine::new(params);
+}
+
+/// validate_params must panic when liquidation_fee_cap > MAX_PROTOCOL_FEE_ABS.
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+#[kani::should_panic]
+fn proof_config_rejects_fee_cap_exceeds_max() {
+    let mut params = zero_fee_params();
+    params.liquidation_fee_cap = U128::new(MAX_PROTOCOL_FEE_ABS + 1);
+    params.min_liquidation_abs = U128::new(0);
+    let _ = RiskEngine::new(params);
+}
+
+// ############################################################################
+// FIX 12: touch_account_full rejects out-of-bounds and unused accounts
+// ############################################################################
+
+/// touch_account_full on an unused slot must return AccountNotFound.
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_touch_unused_returns_error() {
+    let mut engine = RiskEngine::new(zero_fee_params());
+
+    // Slot 0 is not used (no add_user called)
+    let result = engine.touch_account_full(0, DEFAULT_ORACLE, DEFAULT_SLOT);
+    assert!(result.is_err(), "touch on unused slot must fail");
+}
+
+/// touch_account_full on an out-of-bounds index must return error.
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_touch_oob_returns_error() {
+    let mut engine = RiskEngine::new(zero_fee_params());
+
+    let result = engine.touch_account_full(MAX_ACCOUNTS, DEFAULT_ORACLE, DEFAULT_SLOT);
+    assert!(result.is_err(), "touch on OOB index must fail");
+}
