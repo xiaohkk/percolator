@@ -3114,7 +3114,7 @@ impl RiskEngine {
                 self.resolve_flat_negative(cidx);
             }
 
-            // Step 11: maintenance fees (disabled in this revision, just stamps slot)
+            // Step 11: maintenance fees (spec §8.2)
             self.settle_maintenance_fee_internal(cidx, now_slot)?;
 
             // Step 12: if flat, profit conversion
@@ -3379,6 +3379,16 @@ impl RiskEngine {
 
         // Step 1: Zero position with proper stored_pos_count tracking
         if self.accounts[idx as usize].position_basis_q != 0 {
+            // Decrement stale count if epoch_snap != epoch_side (defense-in-depth)
+            if let Some(side) = side_of_i128(self.accounts[idx as usize].position_basis_q) {
+                let epoch_snap = self.accounts[idx as usize].adl_epoch_snap;
+                if epoch_snap != self.get_epoch_side(side) {
+                    let old = self.get_stale_count(side);
+                    if old > 0 {
+                        self.set_stale_count(side, old - 1);
+                    }
+                }
+            }
             self.set_position_basis_q(idx as usize, 0);
             self.accounts[idx as usize].adl_a_basis = ADL_ONE;
             self.accounts[idx as usize].adl_k_snap = 0;
