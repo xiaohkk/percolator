@@ -784,3 +784,89 @@ fn proof_validate_hint_preflight_conservative() {
     kani::cover!(matches!(validated, Some(LiquidationPolicy::ExactPartial(_))), "pre-flight approved partial");
     kani::cover!(matches!(validated, Some(LiquidationPolicy::FullClose)), "pre-flight escalated to full close");
 }
+
+/// Stronger variant: oracle changes between trade and crank, so settle_side_effects
+/// produces nonzero pnl_delta. The pre-flight is called on the pre-crank engine
+/// (before touch), but the crank's internal path touches the account first.
+/// The pre-flight must still be conservative: if it approves ExactPartial,
+/// step 14 must also pass. This exercises the settle_side_effects path.
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_validate_hint_preflight_oracle_shift() {
+    let mut engine = RiskEngine::new(zero_fee_params());
+
+    let a = engine.add_user(0).unwrap();
+    let b = engine.add_user(0).unwrap();
+
+    engine.deposit(a, 1_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    engine.deposit(b, 1_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+
+    // Open position at DEFAULT_ORACLE (1000)
+    let size = (500 * POS_SCALE) as i128;
+    engine.execute_trade(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size, DEFAULT_ORACLE).unwrap();
+
+    // Inject loss to make a underwater
+    engine.set_pnl(a as usize, -800_000i128);
+
+    // Symbolic oracle shift: 900..1100 (±10% from DEFAULT_ORACLE=1000)
+    let crank_oracle: u16 = kani::any();
+    kani::assume(crank_oracle >= 900 && crank_oracle <= 1100);
+    let crank_oracle = crank_oracle as u64;
+
+    // Symbolic q_close_q: 1..499 units
+    let q_units: u16 = kani::any();
+    kani::assume(q_units >= 1 && q_units <= 499);
+    let q_close = (q_units as u128) * POS_SCALE;
+
+    let eff = engine.effective_pos_q(a as usize);
+    let hint = Some(LiquidationPolicy::ExactPartial(q_close));
+
+    // Pre-flight on pre-touch state with shifted oracle
+    let validated = engine.validate_keeper_hint(a, eff, &hint, crank_oracle);
+
+    // If pre-flight approves ExactPartial, run the actual crank with shifted oracle
+    if let Some(LiquidationPolicy::ExactPartial(q)) = validated {
+        let slot2 = DEFAULT_SLOT + 1;
+        let candidates = [(a, Some(LiquidationPolicy::ExactPartial(q)))];
+        // Crank uses the shifted oracle — touch will run settle_side_effects
+        // producing nonzero pnl_delta from K-pair settlement
+        let result = engine.keeper_crank(slot2, crank_oracle, &candidates, 10);
+
+        assert!(result.is_ok(),
+            "keeper_crank must succeed when pre-flight approved ExactPartial (oracle-shifted)");
+    }
+
+    kani::cover!(matches!(validated, Some(LiquidationPolicy::ExactPartial(_))),
+        "pre-flight approved partial with oracle shift");
+    kani::cover!(matches!(validated, Some(LiquidationPolicy::FullClose)),
+        "pre-flight escalated with oracle shift");
+}
+
+// ############################################################################
+// set_owner defense-in-depth: owner-already-claimed guard
+// ############################################################################
+
+/// set_owner on an account whose owner is already set (non-zero) must reject.
+/// This is a defense-in-depth guard — authorization is the wrapper's job,
+/// but the engine should not silently overwrite an existing owner.
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_set_owner_rejects_claimed() {
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let idx = engine.add_user(0).unwrap();
+    engine.deposit(idx, 10_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+
+    // Set initial owner
+    let owner1 = [1u8; 32];
+    let result1 = engine.set_owner(idx, owner1);
+    assert!(result1.is_ok(), "first set_owner must succeed");
+
+    // Attempt to overwrite with different owner must fail
+    let owner2 = [2u8; 32];
+    let result2 = engine.set_owner(idx, owner2);
+    assert!(result2.is_err(), "set_owner on claimed account must reject");
+    assert!(engine.accounts[idx as usize].owner == owner1,
+        "owner must not change after rejection");
+}

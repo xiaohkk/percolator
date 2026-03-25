@@ -2258,6 +2258,12 @@ impl RiskEngine {
         if idx as usize >= MAX_ACCOUNTS || !self.is_used(idx as usize) {
             return Err(RiskError::Unauthorized);
         }
+        // Defense-in-depth: reject if owner is already claimed (non-zero).
+        // Authorization is the wrapper layer's job, but the engine should
+        // not silently overwrite an existing owner.
+        if self.accounts[idx as usize].owner != [0u8; 32] {
+            return Err(RiskError::Unauthorized);
+        }
         self.accounts[idx as usize].owner = owner;
         Ok(())
     }
