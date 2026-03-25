@@ -1,6 +1,6 @@
-//! Formally Verified Risk Engine for Perpetual DEX — v11.26
+//! Formally Verified Risk Engine for Perpetual DEX — v11.31
 //!
-//! Implements the v11.26 spec: Native 128-bit Architecture.
+//! Implements the v11.31 spec: Native 128-bit Architecture.
 //!
 //! This module implements a formally verified risk engine that guarantees:
 //! 1. Protected principal for flat accounts
@@ -1732,7 +1732,7 @@ impl RiskEngine {
     // ========================================================================
 
     /// Compute haircut ratio (h_num, h_den) as u128 pair (spec §3.3)
-    /// Uses pnl_matured_pos_tot as denominator per v11.21.
+    /// Uses pnl_matured_pos_tot as denominator per v11.31.
     pub fn haircut_ratio(&self) -> (u128, u128) {
         if self.pnl_matured_pos_tot == 0 {
             return (1u128, 1u128);
@@ -2760,7 +2760,7 @@ impl RiskEngine {
         fee: u128,
     ) -> Result<()> {
         if *new_eff == 0 {
-            // v11.26 §10.5 step 29: flat-close guard uses exact Eq_maint_raw_i >= 0
+            // v11.31 §10.5 step 29: flat-close guard uses exact Eq_maint_raw_i >= 0
             // (not just PNL >= 0). Prevents flat exits with negative net wealth from fee debt.
             let maint_raw = self.account_equity_maint_raw_wide(&self.accounts[idx]);
             if maint_raw.is_negative() {
@@ -2792,7 +2792,7 @@ impl RiskEngine {
         } else if self.is_above_maintenance_margin(&self.accounts[idx], idx, oracle_price) {
             // Maintenance healthy: allow
         } else if strictly_reducing {
-            // v11.26 §10.5 step 29: strict risk-reducing exemption (fee-neutral).
+            // v11.31 §10.5 step 29: strict risk-reducing exemption (fee-neutral).
             // Both conditions must hold in exact widened I256:
             // 1. Fee-neutral buffer improves: (Eq_maint_raw_post + fee) - MM_req_post > buffer_pre
             // 2. Fee-neutral shortfall does not worsen: min(Eq_maint_raw_post + fee, 0) >= min(Eq_maint_raw_pre, 0)

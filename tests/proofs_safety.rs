@@ -101,7 +101,7 @@ fn bounded_haircut_ratio_bounded() {
     engine.c_tot = U128::new(c_tot_val as u128);
     engine.insurance_fund.balance = U128::new(ins_val as u128);
     engine.pnl_pos_tot = ppt_val as u128;
-    engine.pnl_matured_pos_tot = matured_val as u128; // v11.21: haircut denominator
+    engine.pnl_matured_pos_tot = matured_val as u128; // v11.31: haircut denominator
 
     let (h_num, h_den) = engine.haircut_ratio();
 
@@ -1173,10 +1173,10 @@ fn proof_settle_fee_rejects_i128_min() {
 }
 
 // ############################################################################
-// v11.26 compliance: flat-close guard uses Eq_maint_raw_i >= 0
+// v11.31 compliance: flat-close guard uses Eq_maint_raw_i >= 0
 // ############################################################################
 
-/// v11.26 change #2: A trade that closes to flat must use Eq_maint_raw_i >= 0,
+/// v11.31 change #2: A trade that closes to flat must use Eq_maint_raw_i >= 0,
 /// not just PNL_i >= 0. An account with positive PNL but large fee debt
 /// (Eq_maint_raw_i = C + PNL - FeeDebt < 0) must be rejected.
 #[kani::proof]
@@ -1203,7 +1203,7 @@ fn proof_v1126_flat_close_uses_eq_maint_raw() {
     engine.accounts[a as usize].fee_credits = I128::new(-5000); // fee debt
 
     // Eq_maint_raw = C(0) + PNL(1000) - FeeDebt(5000) = -4000 < 0
-    // v11.26 requires: reject flat close when Eq_maint_raw < 0
+    // v11.31 requires: reject flat close when Eq_maint_raw < 0
     // Old code only checks PNL >= 0 which would pass (PNL = 1000 > 0)
 
     let close_size = -size;
@@ -1211,14 +1211,14 @@ fn proof_v1126_flat_close_uses_eq_maint_raw() {
 
     // Must be rejected: Eq_maint_raw < 0 even though PNL > 0
     assert!(result.is_err(),
-        "v11.26: flat close must be rejected when Eq_maint_raw < 0 (fee debt exceeds C + PNL)");
+        "v11.31: flat close must be rejected when Eq_maint_raw < 0 (fee debt exceeds C + PNL)");
 }
 
 // ############################################################################
-// v11.26 compliance: risk-reducing exemption is fee-neutral
+// v11.31 compliance: risk-reducing exemption is fee-neutral
 // ############################################################################
 
-/// v11.26 change #1: The risk-reducing buffer comparison must be fee-neutral.
+/// v11.31 change #1: The risk-reducing buffer comparison must be fee-neutral.
 /// A genuine de-risking trade must not fail solely because the trading fee
 /// reduces post-trade equity.
 #[kani::proof]
@@ -1246,7 +1246,7 @@ fn proof_v1126_risk_reducing_fee_neutral() {
     let half_close = -(size / 2);
     let result = engine.execute_trade(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, half_close, DEFAULT_ORACLE);
 
-    // v11.26: fee-neutral comparison means pure fee friction should not block
+    // v11.31: fee-neutral comparison means pure fee friction should not block
     // a genuine de-risking trade at oracle price.
     // The post-trade buffer (with fee added back) should be strictly better.
     // Conservation must hold regardless of whether trade succeeds or fails.
@@ -1255,7 +1255,7 @@ fn proof_v1126_risk_reducing_fee_neutral() {
 }
 
 // ############################################################################
-// v11.26 compliance: MIN_NONZERO_MM_REQ floor (TODO: implement params first)
+// v11.31 compliance: MIN_NONZERO_MM_REQ floor (TODO: implement params first)
 // ############################################################################
 
 // Uncommented: RiskParams now has min_nonzero_mm_req / min_nonzero_im_req
@@ -1286,7 +1286,7 @@ fn proof_v1126_min_nonzero_margin_floor() {
 }
 
 // ############################################################################
-// v11.26 §2.6: flat-dust reclamation (GC sweeps 0 < C_i < MIN_INITIAL_DEPOSIT)
+// v11.31 §2.6: flat-dust reclamation (GC sweeps 0 < C_i < MIN_INITIAL_DEPOSIT)
 // ############################################################################
 
 /// A flat account with 0 < C_i < MIN_INITIAL_DEPOSIT, zero PnL/basis/reserved,
