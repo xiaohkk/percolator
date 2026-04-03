@@ -2444,23 +2444,23 @@ fn test_property_54_unilateral_exact_drain_reset() {
 }
 
 // ============================================================================
-// close_account_resolved
+// force_close_resolved
 // ============================================================================
 
 #[test]
-fn test_close_account_resolved_flat_no_pnl() {
+fn test_force_close_resolved_flat_no_pnl() {
     let mut engine = RiskEngine::new(default_params());
     let idx = engine.add_user(1000).unwrap();
     engine.deposit(idx, 50_000, 1000, 100).unwrap();
 
-    let returned = engine.close_account_resolved(idx).unwrap();
+    let returned = engine.force_close_resolved(idx).unwrap();
     assert_eq!(returned, 50_000);
     assert!(!engine.is_used(idx as usize));
     assert!(engine.check_conservation());
 }
 
 #[test]
-fn test_close_account_resolved_rejects_open_position() {
+fn test_force_close_resolved_with_open_position() {
     let mut engine = RiskEngine::new(default_params());
     let a = engine.add_user(1000).unwrap();
     let b = engine.add_user(1000).unwrap();
@@ -2470,26 +2470,53 @@ fn test_close_account_resolved_rejects_open_position() {
     let size = (100 * POS_SCALE) as i128;
     engine.execute_trade(a, b, 1000, 100, size, 1000, 0i64).unwrap();
 
-    // Account has open position — must be rejected
-    let result = engine.close_account_resolved(a);
-    assert_eq!(result, Err(RiskError::Unauthorized));
+    // Account has open position — force_close settles K-pair PnL and zeros it
+    let result = engine.force_close_resolved(a);
+    assert!(result.is_ok(), "force_close must handle open positions");
+    assert!(!engine.is_used(a as usize));
+    assert!(engine.check_conservation());
 }
 
 #[test]
-fn test_close_account_resolved_rejects_nonzero_pnl() {
+fn test_force_close_resolved_with_negative_pnl() {
+    let mut engine = RiskEngine::new(default_params());
+    let a = engine.add_user(1000).unwrap();
+    let b = engine.add_user(1000).unwrap();
+    engine.deposit(a, 500_000, 1000, 100).unwrap();
+    engine.deposit(b, 500_000, 1000, 100).unwrap();
+
+    let size = (100 * POS_SCALE) as i128;
+    engine.execute_trade(a, b, 1000, 100, size, 1000, 0i64).unwrap();
+
+    // Inject loss
+    engine.set_pnl(a as usize, -100_000i128);
+
+    let cap_before = engine.accounts[a as usize].capital.get();
+    let returned = engine.force_close_resolved(a).unwrap();
+
+    assert!(returned < cap_before, "loss must reduce returned capital");
+    assert!(!engine.is_used(a as usize));
+    assert!(engine.check_conservation());
+}
+
+#[test]
+fn test_force_close_resolved_with_positive_pnl() {
     let mut engine = RiskEngine::new(default_params());
     let idx = engine.add_user(1000).unwrap();
     engine.deposit(idx, 50_000, 1000, 100).unwrap();
 
-    // Inject nonzero PnL on flat account
-    engine.set_pnl(idx as usize, 1000i128);
+    // Inject positive PnL on flat account
+    engine.set_pnl(idx as usize, 10_000i128);
 
-    let result = engine.close_account_resolved(idx);
-    assert_eq!(result, Err(RiskError::Unauthorized));
+    let returned = engine.force_close_resolved(idx).unwrap();
+    // Positive PnL converted to capital (haircutted) before return
+    assert!(returned >= 50_000, "positive PnL must increase returned capital");
+    assert!(!engine.is_used(idx as usize));
+    assert!(engine.check_conservation());
 }
 
 #[test]
-fn test_close_account_resolved_with_fee_debt() {
+fn test_force_close_resolved_with_fee_debt() {
     let mut engine = RiskEngine::new(default_params());
     let idx = engine.add_user(1000).unwrap();
     engine.deposit(idx, 50_000, 1000, 100).unwrap();
@@ -2497,7 +2524,7 @@ fn test_close_account_resolved_with_fee_debt() {
     // Inject fee debt of 5000
     engine.accounts[idx as usize].fee_credits = I128::new(-5000);
 
-    let returned = engine.close_account_resolved(idx).unwrap();
+    let returned = engine.force_close_resolved(idx).unwrap();
     // Fee debt swept from capital first (spec §7.5 fee seniority):
     // 50_000 capital - 5_000 fee sweep = 45_000 returned
     assert_eq!(returned, 45_000, "fee debt swept before capital return");
@@ -2506,9 +2533,9 @@ fn test_close_account_resolved_with_fee_debt() {
 }
 
 #[test]
-fn test_close_account_resolved_unused_slot_rejected() {
+fn test_force_close_resolved_unused_slot_rejected() {
     let mut engine = RiskEngine::new(default_params());
-    let result = engine.close_account_resolved(0);
+    let result = engine.force_close_resolved(0);
     assert_eq!(result, Err(RiskError::AccountNotFound));
 }
 

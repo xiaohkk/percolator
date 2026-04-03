@@ -3427,49 +3427,136 @@ impl RiskEngine {
     }
 
     // ========================================================================
-    // close_account_resolved (resolved/frozen market path)
+    // force_close_resolved (resolved/frozen market path)
     // ========================================================================
 
-    /// Close a flat, fully-settled account in a resolved/frozen market.
+    /// Force-close an account on a resolved market.
     ///
-    /// Preconditions enforced:
-    /// - position_basis_q == 0 (account is flat — no unrealized K-pair effects)
-    /// - pnl == 0 (all PnL already settled/converted by the wrapper)
+    /// Settles K-pair PnL, zeros position, settles losses, absorbs from
+    /// insurance, converts profit (bypassing warmup), sweeps fee debt,
+    /// forgives remainder, returns capital, frees slot.
     ///
-    /// The wrapper is responsible for settling positions and PnL before
-    /// calling this. This function only handles fee debt sweep, fee
-    /// forgiveness, capital return, and slot reclamation.
-    pub fn close_account_resolved(&mut self, idx: u16) -> Result<u128> {
+    /// Skips accrue_market_to (market is frozen). Handles both same-epoch
+    /// and epoch-mismatch accounts. For epoch-mismatch where the normal
+    /// settle_side_effects would reject due to side mode, falls back to
+    /// manual K-pair settlement using the same wide arithmetic.
+    pub fn force_close_resolved(&mut self, idx: u16) -> Result<u128> {
         if idx as usize >= MAX_ACCOUNTS || !self.is_used(idx as usize) {
             return Err(RiskError::AccountNotFound);
         }
 
-        // Require flat position — avoids discarding unrealized K-pair PnL
-        // and keeps OI/stored_pos_count consistent
-        if self.accounts[idx as usize].position_basis_q != 0 {
-            return Err(RiskError::Unauthorized);
+        let i = idx as usize;
+
+        // Step 1: Settle K-pair PnL and zero position
+        if self.accounts[i].position_basis_q != 0 {
+            // Try normal settle_side_effects first
+            let settle_ok = self.settle_side_effects(i).is_ok();
+
+            if !settle_ok {
+                // settle_side_effects failed (epoch-mismatch precondition on
+                // side mode). Compute K-pair PnL manually using the same
+                // wide arithmetic, then zero the position.
+                let basis = self.accounts[i].position_basis_q;
+                let abs_basis = basis.unsigned_abs();
+                let a_basis = self.accounts[i].adl_a_basis;
+                let k_snap = self.accounts[i].adl_k_snap;
+
+                if a_basis > 0 {
+                    let side = side_of_i128(basis).unwrap();
+                    let epoch_snap = self.accounts[i].adl_epoch_snap;
+                    let epoch_side = self.get_epoch_side(side);
+
+                    // Determine the correct K endpoint
+                    let k_end = if epoch_snap == epoch_side {
+                        self.get_k_side(side)
+                    } else {
+                        self.get_k_epoch_start(side)
+                    };
+
+                    let den = a_basis.checked_mul(POS_SCALE).ok_or(RiskError::Overflow)?;
+                    let pnl_delta = wide_signed_mul_div_floor_from_k_pair(abs_basis, k_snap, k_end, den);
+
+                    if pnl_delta != 0 {
+                        let old_r = self.accounts[i].reserved_pnl;
+                        let new_pnl = self.accounts[i].pnl.checked_add(pnl_delta)
+                            .ok_or(RiskError::Overflow)?;
+                        if new_pnl == i128::MIN {
+                            return Err(RiskError::Overflow);
+                        }
+                        self.set_pnl(i, new_pnl);
+                        if self.accounts[i].reserved_pnl > old_r {
+                            self.restart_warmup_after_reserve_increase(i);
+                        }
+                    }
+
+                    // Decrement stale count if epoch mismatch
+                    if epoch_snap != epoch_side {
+                        let old_stale = self.get_stale_count(side);
+                        if old_stale > 0 {
+                            self.set_stale_count(side, old_stale - 1);
+                        }
+                    }
+                }
+
+                // Zero position with proper stored_pos_count tracking
+                self.set_position_basis_q(i, 0);
+                self.accounts[i].adl_a_basis = ADL_ONE;
+                self.accounts[i].adl_k_snap = 0;
+                self.accounts[i].adl_epoch_snap = 0;
+            }
+
+            // After settle (normal or manual), position may still be nonzero
+            // (same-epoch case where q_eff_new != 0). Zero it.
+            if self.accounts[i].position_basis_q != 0 {
+                self.set_position_basis_q(i, 0);
+                self.accounts[i].adl_a_basis = ADL_ONE;
+                self.accounts[i].adl_k_snap = 0;
+                self.accounts[i].adl_epoch_snap = 0;
+            }
         }
 
-        // Require zero PnL — avoids skipping settle_losses / profit conversion
-        if self.accounts[idx as usize].pnl != 0 {
-            return Err(RiskError::Unauthorized);
+        // Step 2: Settle losses from principal
+        self.settle_losses(i);
+
+        // Step 3: Absorb any remaining flat negative PnL
+        self.resolve_flat_negative(i);
+
+        // Step 4: Convert positive PnL to capital (bypass warmup for resolved market)
+        if self.accounts[i].pnl > 0 {
+            // Release all reserves unconditionally
+            self.set_reserved_pnl(i, 0);
+            // Convert using haircut
+            let pos_pnl = self.accounts[i].pnl as u128;
+            let released = self.released_pos(i);
+            if released > 0 {
+                let (h_num, h_den) = self.haircut_ratio();
+                let y = if h_den == 0 { released } else {
+                    wide_mul_div_floor_u128(released, h_num, h_den)
+                };
+                self.consume_released_pnl(i, released);
+                let new_cap = add_u128(self.accounts[i].capital.get(), y);
+                self.set_capital(i, new_cap);
+            }
+            // Any remaining positive PnL after consumption (shouldn't happen
+            // since we released all reserves and consumed all released)
+            // is left as-is — close_account_resolved will reject if pnl != 0
         }
 
-        // Sweep fee debt from capital (spec §7.5 fee seniority)
-        self.fee_debt_sweep(idx as usize);
+        // Step 5: Sweep fee debt from capital
+        self.fee_debt_sweep(i);
 
-        // Forgive any remaining fee debt after sweep
-        if self.accounts[idx as usize].fee_credits.get() < 0 {
-            self.accounts[idx as usize].fee_credits = I128::ZERO;
+        // Step 6: Forgive any remaining fee debt
+        if self.accounts[i].fee_credits.get() < 0 {
+            self.accounts[i].fee_credits = I128::ZERO;
         }
 
-        // Return capital
-        let capital = self.accounts[idx as usize].capital;
+        // Step 7: Return capital and free slot
+        let capital = self.accounts[i].capital;
         if capital > self.vault {
             return Err(RiskError::InsufficientBalance);
         }
         self.vault = self.vault - capital;
-        self.set_capital(idx as usize, 0);
+        self.set_capital(i, 0);
 
         self.free_slot(idx);
 

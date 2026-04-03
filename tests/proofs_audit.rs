@@ -872,14 +872,14 @@ fn proof_set_owner_rejects_claimed() {
 }
 
 // ############################################################################
-// close_account_resolved: conservation and correctness
+// force_close_resolved: conservation and correctness
 // ############################################################################
 
-/// close_account_resolved rejects accounts with open positions.
+/// force_close_resolved settles K-pair PnL on accounts with open positions.
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
-fn proof_close_account_resolved_rejects_open_position() {
+fn proof_force_close_resolved_with_position_conserves() {
     let mut engine = RiskEngine::new(zero_fee_params());
 
     let a = engine.add_user(0).unwrap();
@@ -890,33 +890,43 @@ fn proof_close_account_resolved_rejects_open_position() {
     let size = (100 * POS_SCALE) as i128;
     engine.execute_trade(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size, DEFAULT_ORACLE, 0i64).unwrap();
 
-    let result = engine.close_account_resolved(a);
-    assert!(result.is_err(), "must reject account with open position");
-    assert!(engine.is_used(a as usize), "account must not be freed");
+    // Symbolic loss on the position holder
+    let loss: u32 = kani::any();
+    kani::assume(loss >= 1 && loss <= 400_000);
+    engine.set_pnl(a as usize, -(loss as i128));
+
+    let result = engine.force_close_resolved(a);
+    assert!(result.is_ok(), "force_close must succeed with open position");
+    assert!(!engine.is_used(a as usize), "account must be freed");
+    assert!(engine.check_conservation());
 }
 
-/// close_account_resolved rejects accounts with nonzero PnL.
+/// force_close_resolved converts positive PnL on flat accounts.
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
-fn proof_close_account_resolved_rejects_nonzero_pnl() {
+fn proof_force_close_resolved_with_profit_conserves() {
     let mut engine = RiskEngine::new(zero_fee_params());
     let idx = engine.add_user(0).unwrap();
     engine.deposit(idx, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
-    let pnl: i16 = kani::any();
-    kani::assume(pnl != 0);
-    engine.set_pnl(idx as usize, pnl as i128);
+    let profit: u16 = kani::any();
+    kani::assume(profit >= 1 && profit <= 10000);
+    engine.set_pnl(idx as usize, profit as i128);
 
-    let result = engine.close_account_resolved(idx);
-    assert!(result.is_err(), "must reject account with nonzero PnL");
+    let cap_before = engine.accounts[idx as usize].capital.get();
+    let result = engine.force_close_resolved(idx);
+    assert!(result.is_ok(), "force_close must succeed with positive PnL");
+    assert!(result.unwrap() >= cap_before, "returned must include converted profit");
+    assert!(!engine.is_used(idx as usize));
+    assert!(engine.check_conservation());
 }
 
-/// close_account_resolved on a flat account with no PnL returns exact capital.
+/// force_close_resolved on a flat account with no PnL returns exact capital.
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
-fn proof_close_account_resolved_flat_returns_capital() {
+fn proof_force_close_resolved_flat_returns_capital() {
     let mut engine = RiskEngine::new(zero_fee_params());
     let idx = engine.add_user(0).unwrap();
 
@@ -924,7 +934,7 @@ fn proof_close_account_resolved_flat_returns_capital() {
     kani::assume(dep >= 1 && dep <= 1_000_000);
     engine.deposit(idx, dep as u128, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
-    let result = engine.close_account_resolved(idx);
+    let result = engine.force_close_resolved(idx);
     assert!(result.is_ok());
     assert_eq!(result.unwrap(), dep as u128, "flat account must return exact capital");
     assert!(!engine.is_used(idx as usize));
