@@ -94,6 +94,7 @@ pub const MAX_TRADING_FEE_BPS: u64 = 10_000;
 pub const MAX_MARGIN_BPS: u64 = 10_000;
 pub const MAX_LIQUIDATION_FEE_BPS: u64 = 10_000;
 pub const MAX_PROTOCOL_FEE_ABS: u128 = MAX_ACCOUNT_NOTIONAL;
+pub const MAX_MAINTENANCE_FEE_PER_SLOT: u128 = 10_000_000_000_000_000; // spec §1.4
 
 // ============================================================================
 // BPF-Safe 128-bit Types
@@ -506,8 +507,8 @@ impl RiskEngine {
 
         // Maintenance fee bound (spec §8.2)
         assert!(
-            params.maintenance_fee_per_slot.get() <= MAX_PROTOCOL_FEE_ABS,
-            "maintenance_fee_per_slot must be <= MAX_PROTOCOL_FEE_ABS"
+            params.maintenance_fee_per_slot.get() <= MAX_MAINTENANCE_FEE_PER_SLOT,
+            "maintenance_fee_per_slot must be <= MAX_MAINTENANCE_FEE_PER_SLOT (spec §8.2.1)"
         );
 
         // Insurance floor (spec §1.4: 0 <= I_floor <= MAX_VAULT_TVL)
@@ -2180,10 +2181,39 @@ impl RiskEngine {
         Ok(())
     }
 
-    /// Internal maintenance fee settle (spec §8.2: disabled in this revision).
-    /// Stamps last_fee_slot for slot-tracking consistency. No economic effect.
+    /// realize_recurring_maintenance_fee (spec §8.2.2).
     fn settle_maintenance_fee_internal(&mut self, idx: usize, now_slot: u64) -> Result<()> {
+        let fee_per_slot = self.params.maintenance_fee_per_slot.get();
+        if fee_per_slot == 0 {
+            self.accounts[idx].last_fee_slot = now_slot;
+            return Ok(());
+        }
+
+        let last = self.accounts[idx].last_fee_slot;
+        let dt_fee = now_slot.saturating_sub(last);
+        if dt_fee == 0 {
+            self.accounts[idx].last_fee_slot = now_slot;
+            return Ok(());
+        }
+
+        // Step 4: fee_due = checked_mul(maintenance_fee_per_slot, dt_fee)
+        let fee_due = (dt_fee as u128)
+            .checked_mul(fee_per_slot)
+            .ok_or(RiskError::Overflow)?;
+
+        // Step 5: require fee_due <= MAX_PROTOCOL_FEE_ABS
+        if fee_due > MAX_PROTOCOL_FEE_ABS {
+            return Err(RiskError::Overflow);
+        }
+
+        // Step 7: stamp last_fee_slot BEFORE charge (prevents re-charge on retry)
         self.accounts[idx].last_fee_slot = now_slot;
+
+        // Step 6: charge via charge_fee_to_insurance
+        if fee_due > 0 {
+            self.charge_fee_to_insurance(idx, fee_due)?;
+        }
+
         Ok(())
     }
 
@@ -3567,24 +3597,21 @@ impl RiskEngine {
     // Permissionless account reclamation (spec §10.7 + §2.6)
     // ========================================================================
 
-    /// reclaim_empty_account(i) — permissionless O(1) empty/dust-account recycling.
+    /// reclaim_empty_account(i, now_slot) — permissionless O(1) empty/dust-account recycling.
     /// Spec §10.7: MUST NOT call accrue_market_to, MUST NOT mutate side state,
-    /// MUST NOT materialize any account.
-    pub fn reclaim_empty_account(&mut self, idx: u16) -> Result<()> {
+    /// MUST NOT materialize any account. Realizes recurring maintenance fees
+    /// on the already-flat state before checking final reclaim eligibility.
+    pub fn reclaim_empty_account(&mut self, idx: u16, now_slot: u64) -> Result<()> {
         if idx as usize >= MAX_ACCOUNTS || !self.is_used(idx as usize) {
             return Err(RiskError::AccountNotFound);
         }
-
-        let account = &self.accounts[idx as usize];
-
-        // Spec §2.6 preconditions
-        if account.position_basis_q != 0 {
-            return Err(RiskError::Undercollateralized);
+        if now_slot < self.current_slot {
+            return Err(RiskError::Overflow);
         }
-        // C_i must be 0 or dust (< MIN_INITIAL_DEPOSIT)
-        if account.capital.get() >= self.params.min_initial_deposit.get()
-            && !account.capital.is_zero()
-        {
+
+        // Step 3: Pre-realization flat-clean preconditions (spec §10.7 / §2.6)
+        let account = &self.accounts[idx as usize];
+        if account.position_basis_q != 0 {
             return Err(RiskError::Undercollateralized);
         }
         if account.pnl != 0 {
@@ -3597,7 +3624,21 @@ impl RiskEngine {
             return Err(RiskError::Undercollateralized);
         }
 
-        // Spec §2.6 effects: sweep dust capital into insurance
+        // Step 4: anchor current_slot
+        self.current_slot = now_slot;
+
+        // Step 5: realize recurring maintenance fees (spec §8.2.3 item 3)
+        self.settle_maintenance_fee_internal(idx as usize, now_slot)?;
+
+        // Step 6: final reclaim-eligibility check (spec §2.6)
+        // C_i must be 0 or dust (< MIN_INITIAL_DEPOSIT)
+        if self.accounts[idx as usize].capital.get() >= self.params.min_initial_deposit.get()
+            && !self.accounts[idx as usize].capital.is_zero()
+        {
+            return Err(RiskError::Undercollateralized);
+        }
+
+        // Step 7: reclamation effects (spec §2.6)
         let dust_cap = self.accounts[idx as usize].capital.get();
         if dust_cap > 0 {
             self.set_capital(idx as usize, 0);

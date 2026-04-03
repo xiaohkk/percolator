@@ -1147,9 +1147,10 @@ fn proof_fee_debt_sweep_consumes_released_pnl() {
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
-fn proof_touch_succeeds_with_extreme_fee_credits() {
-    // Spec §8.2: maintenance fees disabled — even with fee_credits near i128::MIN,
-    // touch succeeds because no maintenance fee is charged.
+fn proof_touch_rejects_fee_credits_i128_min() {
+    // Spec §8.2: maintenance fees enabled. With fee_credits near -(i128::MAX)
+    // and zero capital, a fee of 1 would push fee_credits to i128::MIN.
+    // charge_fee_to_insurance must reject this.
     let mut params = zero_fee_params();
     params.maintenance_fee_per_slot = U128::new(1);
     let mut engine = RiskEngine::new(params);
@@ -1164,9 +1165,9 @@ fn proof_touch_succeeds_with_extreme_fee_credits() {
     engine.accounts[a as usize].last_fee_slot = DEFAULT_SLOT;
 
     let result = engine.touch_account_full(a as usize, DEFAULT_ORACLE, DEFAULT_SLOT + 1);
-    // With fees disabled, touch must succeed even with extreme fee_credits
-    assert!(result.is_ok(),
-        "touch must succeed — maintenance fees disabled per spec §8.2");
+    // Must reject: fee_credits would become i128::MIN
+    assert!(result.is_err(),
+        "touch must reject fee charge that would produce i128::MIN fee_credits");
 }
 
 // ############################################################################
@@ -2205,7 +2206,7 @@ fn proof_audit5_reclaim_empty_account_basic() {
     assert!(engine.is_used(idx as usize));
     let used_before = engine.num_used_accounts;
 
-    let result = engine.reclaim_empty_account(idx);
+    let result = engine.reclaim_empty_account(idx, DEFAULT_SLOT);
     assert!(result.is_ok());
     assert!(!engine.is_used(idx as usize), "slot must be freed");
     assert!(engine.num_used_accounts == used_before - 1);
@@ -2229,7 +2230,7 @@ fn proof_audit5_reclaim_dust_sweep() {
 
     let ins_before = engine.insurance_fund.balance.get();
 
-    let result = engine.reclaim_empty_account(idx);
+    let result = engine.reclaim_empty_account(idx, DEFAULT_SLOT);
     assert!(result.is_ok());
 
     // Dust must have been swept to insurance
@@ -2251,7 +2252,7 @@ fn proof_audit5_reclaim_rejects_open_position() {
     // Give the account a position
     engine.accounts[idx as usize].position_basis_q = 100;
 
-    let result = engine.reclaim_empty_account(idx);
+    let result = engine.reclaim_empty_account(idx, DEFAULT_SLOT);
     assert!(result.is_err(), "must reject account with open position");
     assert!(engine.is_used(idx as usize), "slot must not be freed on rejection");
 }
@@ -2271,7 +2272,7 @@ fn proof_audit5_reclaim_rejects_live_capital() {
     engine.accounts[idx as usize].capital = U128::new(1000);
     engine.c_tot = U128::new(1000);
 
-    let result = engine.reclaim_empty_account(idx);
+    let result = engine.reclaim_empty_account(idx, DEFAULT_SLOT);
     assert!(result.is_err(), "must reject account with live capital");
     assert!(engine.is_used(idx as usize));
 }

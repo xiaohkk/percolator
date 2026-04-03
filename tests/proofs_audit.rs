@@ -1025,12 +1025,12 @@ fn proof_force_close_resolved_fee_sweep_conservation() {
 // Maintenance fee: conservation, fee debt, validate_params
 // ############################################################################
 
-/// Spec §8.2: maintenance fees disabled — touch does NOT charge fees or create
-/// fee debt, even with nonzero maintenance_fee_per_slot and symbolic dt.
+/// Spec §8.2: maintenance fees enabled — touch charges dt * fee_per_slot.
+/// Conservation holds with symbolic dt.
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
-fn proof_maintenance_fee_disabled() {
+fn proof_maintenance_fee_conservation() {
     let mut params = zero_fee_params();
     params.maintenance_fee_per_slot = U128::new(100);
     let mut engine = RiskEngine::new(params);
@@ -1041,7 +1041,6 @@ fn proof_maintenance_fee_disabled() {
     engine.last_market_slot = DEFAULT_SLOT;
 
     let cap_before = engine.accounts[a as usize].capital.get();
-    let fc_before = engine.accounts[a as usize].fee_credits.get();
 
     let dt: u16 = kani::any();
     kani::assume(dt >= 1 && dt <= 1000);
@@ -1050,9 +1049,9 @@ fn proof_maintenance_fee_disabled() {
     let result = engine.touch_account_full(a as usize, DEFAULT_ORACLE, slot2);
     assert!(result.is_ok());
 
-    assert_eq!(engine.accounts[a as usize].capital.get(), cap_before,
-        "maintenance fees disabled: capital must not change");
-    assert_eq!(engine.accounts[a as usize].fee_credits.get(), fc_before,
-        "maintenance fees disabled: fee_credits must not change");
+    // Fee = dt * 100, fully covered by 500k capital
+    let expected_fee = (dt as u128) * 100;
+    assert_eq!(cap_before - engine.accounts[a as usize].capital.get(), expected_fee,
+        "capital must decrease by dt * fee_per_slot");
     assert!(engine.check_conservation());
 }
