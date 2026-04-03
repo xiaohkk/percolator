@@ -32,16 +32,16 @@ fn proof_recompute_r_last_stores_rate() {
 // PROPERTY 74: Funding rate bound enforcement
 // ############################################################################
 
-/// recompute_r_last_from_final_state rejects |rate| > MAX_ABS_FUNDING_BPS_PER_SLOT.
+/// recompute_r_last_from_final_state returns Err for |rate| > MAX_ABS_FUNDING_BPS_PER_SLOT.
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
-#[kani::should_panic]
 fn proof_funding_rate_bound_rejected() {
     let mut engine = RiskEngine::new(zero_fee_params());
     let rate: i64 = kani::any();
     kani::assume(rate.unsigned_abs() > MAX_ABS_FUNDING_BPS_PER_SLOT as u64);
-    engine.recompute_r_last_from_final_state(rate);
+    let result = engine.recompute_r_last_from_final_state(rate);
+    assert!(result.is_err(), "out-of-bounds rate must return Err");
 }
 
 // ############################################################################

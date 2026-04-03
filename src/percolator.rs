@@ -1441,12 +1441,12 @@ impl RiskEngine {
     /// Validates the externally computed funding rate and stores it for
     /// the next interval's accrue_market_to funding sub-steps.
     test_visible! {
-    fn recompute_r_last_from_final_state(&mut self, externally_computed_rate: i64) {
-        assert!(
-            externally_computed_rate.unsigned_abs() <= MAX_ABS_FUNDING_BPS_PER_SLOT as u64,
-            "recompute_r_last: |rate| exceeds MAX_ABS_FUNDING_BPS_PER_SLOT"
-        );
+    fn recompute_r_last_from_final_state(&mut self, externally_computed_rate: i64) -> Result<()> {
+        if externally_computed_rate.unsigned_abs() > MAX_ABS_FUNDING_BPS_PER_SLOT as u64 {
+            return Err(RiskError::Overflow);
+        }
         self.funding_rate_bps_per_slot_last = externally_computed_rate;
+        Ok(())
     }
     }
 
@@ -1460,7 +1460,7 @@ impl RiskEngine {
     pub fn run_end_of_instruction_lifecycle(&mut self, ctx: &mut InstructionContext, funding_rate: i64) -> Result<()> {
         self.schedule_end_of_instruction_resets(ctx)?;
         self.finalize_end_of_instruction_resets(ctx);
-        self.recompute_r_last_from_final_state(funding_rate);
+        self.recompute_r_last_from_final_state(funding_rate)?;
         Ok(())
     }
 
@@ -2506,7 +2506,7 @@ impl RiskEngine {
         // Steps 8-9: end-of-instruction resets
         self.schedule_end_of_instruction_resets(&mut ctx)?;
         self.finalize_end_of_instruction_resets(&ctx);
-        self.recompute_r_last_from_final_state(funding_rate);
+        self.recompute_r_last_from_final_state(funding_rate)?;
 
         Ok(())
     }
@@ -2539,7 +2539,7 @@ impl RiskEngine {
         // Steps 4-5: end-of-instruction resets
         self.schedule_end_of_instruction_resets(&mut ctx)?;
         self.finalize_end_of_instruction_resets(&ctx);
-        self.recompute_r_last_from_final_state(funding_rate);
+        self.recompute_r_last_from_final_state(funding_rate)?;
 
         // Step 7: assert OI balance
         assert!(self.oi_eff_long_q == self.oi_eff_short_q, "OI_eff_long != OI_eff_short after settle");
@@ -2730,7 +2730,7 @@ impl RiskEngine {
         self.finalize_end_of_instruction_resets(&ctx);
 
         // Step 32: recompute r_last if funding-rate inputs changed (spec §10.5)
-        self.recompute_r_last_from_final_state(funding_rate);
+        self.recompute_r_last_from_final_state(funding_rate)?;
 
         // Step 18: assert OI balance (spec §10.4)
         assert!(self.oi_eff_long_q == self.oi_eff_short_q, "OI_eff_long != OI_eff_short after trade");
@@ -2750,18 +2750,23 @@ impl RiskEngine {
         }
         let fee_shortfall = fee - fee_paid;
         if fee_shortfall > 0 {
-            // Route shortfall through fee_credits (debit) instead of PNL
-            let shortfall_i128: i128 = if fee_shortfall > i128::MAX as u128 {
-                return Err(RiskError::Overflow);
-            } else {
-                fee_shortfall as i128
+            // Route collectible shortfall through fee_credits (debit).
+            // Cap at collectible headroom to avoid reverting (spec §8.2.2):
+            // fee_credits must stay in [-(i128::MAX), 0]; any excess is dropped.
+            let current_fc = self.accounts[idx].fee_credits.get();
+            // Headroom = current_fc - (-(i128::MAX)) = current_fc + i128::MAX
+            let headroom = match current_fc.checked_add(i128::MAX) {
+                Some(h) if h > 0 => h as u128,
+                _ => 0u128, // at or beyond limit — no room
             };
-            let new_fc = self.accounts[idx].fee_credits.get()
-                .checked_sub(shortfall_i128).ok_or(RiskError::Overflow)?;
-            if new_fc == i128::MIN {
-                return Err(RiskError::Overflow);
+            let collectible = core::cmp::min(fee_shortfall, headroom);
+            if collectible > 0 {
+                // Safe: collectible <= headroom <= i128::MAX, and
+                // current_fc - collectible >= -(i128::MAX)
+                let new_fc = current_fc - (collectible as i128);
+                self.accounts[idx].fee_credits = I128::new(new_fc);
             }
-            self.accounts[idx].fee_credits = I128::new(new_fc);
+            // Any excess beyond collectible headroom is silently dropped
         }
         Ok(())
     }
@@ -2989,7 +2994,7 @@ impl RiskEngine {
         // touch_account_full mutates state even when liquidation doesn't proceed.
         self.schedule_end_of_instruction_resets(&mut ctx)?;
         self.finalize_end_of_instruction_resets(&ctx);
-        self.recompute_r_last_from_final_state(funding_rate);
+        self.recompute_r_last_from_final_state(funding_rate)?;
 
         // Assert OI balance unconditionally (spec §10.6 step 11)
         assert!(self.oi_eff_long_q == self.oi_eff_short_q, "OI_eff_long != OI_eff_short after liquidation");
@@ -3245,7 +3250,7 @@ impl RiskEngine {
         self.finalize_end_of_instruction_resets(&ctx);
 
         // Step 11: recompute r_last exactly once from final post-reset state
-        self.recompute_r_last_from_final_state(funding_rate);
+        self.recompute_r_last_from_final_state(funding_rate)?;
 
         // Step 12: assert OI balance
         assert!(self.oi_eff_long_q == self.oi_eff_short_q,
@@ -3363,7 +3368,7 @@ impl RiskEngine {
         if self.accounts[idx as usize].position_basis_q == 0 {
             self.schedule_end_of_instruction_resets(&mut ctx)?;
             self.finalize_end_of_instruction_resets(&ctx);
-            self.recompute_r_last_from_final_state(funding_rate);
+            self.recompute_r_last_from_final_state(funding_rate)?;
             return Ok(());
         }
 
@@ -3400,7 +3405,7 @@ impl RiskEngine {
         // Steps 11-12: end-of-instruction resets
         self.schedule_end_of_instruction_resets(&mut ctx)?;
         self.finalize_end_of_instruction_resets(&ctx);
-        self.recompute_r_last_from_final_state(funding_rate);
+        self.recompute_r_last_from_final_state(funding_rate)?;
 
         Ok(())
     }
@@ -3449,7 +3454,7 @@ impl RiskEngine {
         // End-of-instruction resets before freeing
         self.schedule_end_of_instruction_resets(&mut ctx)?;
         self.finalize_end_of_instruction_resets(&ctx);
-        self.recompute_r_last_from_final_state(funding_rate);
+        self.recompute_r_last_from_final_state(funding_rate)?;
 
         self.free_slot(idx);
 
