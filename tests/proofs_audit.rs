@@ -1039,6 +1039,8 @@ fn proof_maintenance_fee_conservation() {
     engine.deposit(a, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
     engine.last_oracle_price = DEFAULT_ORACLE;
     engine.last_market_slot = DEFAULT_SLOT;
+    // Align last_fee_slot with DEFAULT_SLOT so dt_fee = dt exactly
+    engine.accounts[a as usize].last_fee_slot = DEFAULT_SLOT;
 
     let cap_before = engine.accounts[a as usize].capital.get();
 

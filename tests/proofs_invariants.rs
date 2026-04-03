@@ -195,6 +195,7 @@ fn inductive_withdraw_preserves_accounting() {
     let w: u32 = kani::any();
     kani::assume(w >= 1 && w <= dep);
     let result = engine.withdraw(idx, w as u128, DEFAULT_ORACLE, DEFAULT_SLOT, 0i64);
+    kani::cover!(result.is_ok(), "withdraw Ok path reachable");
     if result.is_ok() {
         assert!(engine.check_conservation());
     }

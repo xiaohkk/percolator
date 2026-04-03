@@ -816,6 +816,7 @@ fn proof_funding_rate_validated_before_storage() {
 
     // The stored rate should be clamped or validated
     let result = engine.keeper_crank(1, 100, &[(a, None)], 1, 0i64);
+    kani::cover!(result.is_ok(), "crank Ok path reachable");
 
     if result.is_ok() {
         let stored = engine.funding_rate_bps_per_slot_last;
@@ -1032,10 +1033,12 @@ fn proof_buffer_masking_blocked() {
     let equity_before = engine.account_equity_maint_raw(&engine.accounts[victim as usize]);
 
     // Try to close 99% of position with adverse exec_price (slippage extraction)
-    let close_size = -(size * 99 / 100);
+    // Swap buyer/seller to close victim's long (size_q must be > 0)
+    let close_size = size * 99 / 100;
     // Adverse exec_price: much worse than oracle (victim sells at below-oracle price)
     let adverse_price = DEFAULT_ORACLE - (DEFAULT_ORACLE / 10); // 10% adverse slippage
-    let result = engine.execute_trade(victim, attacker, DEFAULT_ORACLE, DEFAULT_SLOT, close_size, adverse_price, 0i64);
+    let result = engine.execute_trade(attacker, victim, DEFAULT_ORACLE, DEFAULT_SLOT, close_size, adverse_price, 0i64);
+    kani::cover!(result.is_ok(), "adverse close trade reachable");
 
     if result.is_ok() {
         // If trade was allowed, raw equity must not have decreased
@@ -1147,10 +1150,11 @@ fn proof_fee_debt_sweep_consumes_released_pnl() {
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
-fn proof_touch_rejects_fee_credits_i128_min() {
-    // Spec §8.2: maintenance fees enabled. With fee_credits near -(i128::MAX)
-    // and zero capital, a fee of 1 would push fee_credits to i128::MIN.
-    // charge_fee_to_insurance must reject this.
+fn proof_touch_drops_excess_at_fee_credits_limit() {
+    // charge_fee_to_insurance drops excess beyond collectible headroom.
+    // With fee_credits at -(i128::MAX) and zero capital, a fee of 1
+    // has zero headroom — the entire fee is dropped. Touch succeeds
+    // and fee_credits stays at -(i128::MAX).
     let mut params = zero_fee_params();
     params.maintenance_fee_per_slot = U128::new(1);
     let mut engine = RiskEngine::new(params);
@@ -1165,9 +1169,12 @@ fn proof_touch_rejects_fee_credits_i128_min() {
     engine.accounts[a as usize].last_fee_slot = DEFAULT_SLOT;
 
     let result = engine.touch_account_full(a as usize, DEFAULT_ORACLE, DEFAULT_SLOT + 1);
-    // Must reject: fee_credits would become i128::MIN
-    assert!(result.is_err(),
-        "touch must reject fee charge that would produce i128::MIN fee_credits");
+    // Must succeed: excess fee dropped instead of reverting
+    assert!(result.is_ok(),
+        "touch must succeed — excess fee dropped at fee_credits limit");
+    // fee_credits must not change (no headroom, fee dropped)
+    assert!(engine.accounts[a as usize].fee_credits.get() == -(i128::MAX),
+        "fee_credits must remain at -(i128::MAX) when no headroom");
 }
 
 // ############################################################################
@@ -2380,6 +2387,7 @@ fn proof_sign_flip_trade_conserves() {
     let size2 = (200 * POS_SCALE) as i128;
     let slot2 = DEFAULT_SLOT + 1;
     let result = engine.execute_trade(b, a, DEFAULT_ORACLE, slot2, size2, DEFAULT_ORACLE, 0i64);
+    kani::cover!(result.is_ok(), "sign-flip trade reachable");
 
     if result.is_ok() {
         assert!(engine.effective_pos_q(a as usize) < 0, "a flipped to short");
@@ -2505,6 +2513,7 @@ fn proof_convert_released_pnl_conservation() {
         let x_req: u32 = kani::any();
         kani::assume(x_req >= 1 && (x_req as u128) <= released);
         let result = engine.convert_released_pnl(a, x_req as u128, high_oracle, slot2 + 1, 0i64);
+        kani::cover!(result.is_ok(), "convert_released_pnl Ok path reachable");
         if result.is_ok() {
             assert!(engine.check_conservation(),
                 "conservation must hold after convert_released_pnl");

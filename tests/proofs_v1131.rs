@@ -623,6 +623,7 @@ fn proof_bilateral_oi_decomposition() {
         engine.execute_trade(b, a, DEFAULT_ORACLE, DEFAULT_SLOT, pos_size_q, DEFAULT_ORACLE, 0i64)
     };
 
+    kani::cover!(result.is_ok(), "bilateral OI trade reachable");
     if result.is_ok() {
         let eff_a = engine.effective_pos_q(a as usize);
         let eff_b = engine.effective_pos_q(b as usize);
