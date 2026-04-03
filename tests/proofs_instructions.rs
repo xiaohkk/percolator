@@ -1116,7 +1116,7 @@ fn t14_65_dust_bound_end_to_end_clearance() {
 // SPEC PROPERTY #17: fee shortfall routes to fee_credits, NOT PnL
 // ############################################################################
 //
-// Spec v12.0.2 §4.10: "Unpaid explicit fees are account-local fee debt.
+// Spec v12.1.0 §4.10: "Unpaid explicit fees are account-local fee debt.
 // They MUST NOT be written into PNL_i."
 // Spec property #17: "trading-fee or liquidation-fee shortfall becomes
 // negative fee_credits_i, does not touch PNL_i."

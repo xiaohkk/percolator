@@ -1524,7 +1524,7 @@ fn test_accrue_market_funding_rate_zero_no_funding_applied() {
 
 #[test]
 fn test_accrue_market_applies_funding_transfer() {
-    // Spec v12.0.2 §5.4: live funding — K coefficients change when r_last != 0
+    // Spec v12.1.0 §5.4: live funding — K coefficients change when r_last != 0
     let mut engine = RiskEngine::new(default_params());
     engine.last_oracle_price = 1000;
     engine.last_market_slot = 0;

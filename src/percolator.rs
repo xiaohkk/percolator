@@ -1,6 +1,6 @@
-//! Formally Verified Risk Engine for Perpetual DEX — v12.0.2
+//! Formally Verified Risk Engine for Perpetual DEX — v12.1.0
 //!
-//! Implements the v12.0.2 spec: Native 128-bit Architecture.
+//! Implements the v12.1.0 spec: Native 128-bit Architecture.
 //!
 //! This module implements a formally verified risk engine that guarantees:
 //! 1. Protected principal for flat accounts
@@ -1387,7 +1387,7 @@ impl RiskEngine {
             }
         }
 
-        // Step 6: Funding transfer via sub-stepping (spec v12.0.2 §5.4)
+        // Step 6: Funding transfer via sub-stepping (spec v12.1.0 §5.4)
         let r_last = self.funding_rate_bps_per_slot_last;
         if r_last != 0 && total_dt > 0 && long_live && short_live {
             // Snapshot fund_px_0 at call start — uses previous interval's price
@@ -1437,7 +1437,7 @@ impl RiskEngine {
         Ok(())
     }
 
-    /// recompute_r_last_from_final_state (spec v12.0.2 §4.12).
+    /// recompute_r_last_from_final_state (spec v12.1.0 §4.12).
     /// Validates the externally computed funding rate and stores it for
     /// the next interval's accrue_market_to funding sub-steps.
     test_visible! {
@@ -1811,7 +1811,7 @@ impl RiskEngine {
     // ========================================================================
 
     /// Compute haircut ratio (h_num, h_den) as u128 pair (spec §3.3)
-    /// Uses pnl_matured_pos_tot as denominator per v12.0.2.
+    /// Uses pnl_matured_pos_tot as denominator per v12.1.0.
     pub fn haircut_ratio(&self) -> (u128, u128) {
         if self.pnl_matured_pos_tot == 0 {
             return (1u128, 1u128);
@@ -2700,23 +2700,26 @@ impl RiskEngine {
         };
 
         // Charge fee from both accounts (spec §10.5 step 28)
+        let mut fee_collected_a = 0u128;
+        let mut fee_collected_b = 0u128;
         if fee > 0 {
             if fee > MAX_PROTOCOL_FEE_ABS {
                 return Err(RiskError::Overflow);
             }
-            self.charge_fee_to_insurance(a as usize, fee)?;
-            self.charge_fee_to_insurance(b as usize, fee)?;
+            fee_collected_a = self.charge_fee_to_insurance(a as usize, fee)?;
+            fee_collected_b = self.charge_fee_to_insurance(b as usize, fee)?;
         }
 
-        // Track LP fees (both sides' fees)
+        // Track LP fees: use actual collected amount, not nominal fee.
+        // LP a earns from counterparty b's fee payment, and vice versa.
         if self.accounts[a as usize].is_lp() {
             self.accounts[a as usize].fees_earned_total = U128::new(
-                add_u128(self.accounts[a as usize].fees_earned_total.get(), fee)
+                add_u128(self.accounts[a as usize].fees_earned_total.get(), fee_collected_b)
             );
         }
         if self.accounts[b as usize].is_lp() {
             self.accounts[b as usize].fees_earned_total = U128::new(
-                add_u128(self.accounts[b as usize].fees_earned_total.get(), fee)
+                add_u128(self.accounts[b as usize].fees_earned_total.get(), fee_collected_a)
             );
         }
 
@@ -2741,8 +2744,9 @@ impl RiskEngine {
     }
 
     /// Charge fee per spec §8.1 — route shortfall through fee_credits instead of PNL.
-    /// Adds MAX_PROTOCOL_FEE_ABS bound.
-    fn charge_fee_to_insurance(&mut self, idx: usize, fee: u128) -> Result<()> {
+    /// Returns the amount actually applied (capital paid + collectible debt recorded).
+    /// Any excess beyond collectible headroom is silently dropped.
+    fn charge_fee_to_insurance(&mut self, idx: usize, fee: u128) -> Result<u128> {
         if fee > MAX_PROTOCOL_FEE_ABS {
             return Err(RiskError::Overflow);
         }
@@ -2771,8 +2775,10 @@ impl RiskEngine {
                 self.accounts[idx].fee_credits = I128::new(new_fc);
             }
             // Any excess beyond collectible headroom is silently dropped
+            Ok(fee_paid + collectible)
+        } else {
+            Ok(fee_paid)
         }
-        Ok(())
     }
 
     /// OI component helpers for exact bilateral decomposition (spec §5.2.2)
@@ -2861,7 +2867,7 @@ impl RiskEngine {
         fee: u128,
     ) -> Result<()> {
         if *new_eff == 0 {
-            // v12.0.2 §10.5 step 29: flat-close guard uses exact Eq_maint_raw_i >= 0
+            // v12.1.0 §10.5 step 29: flat-close guard uses exact Eq_maint_raw_i >= 0
             // (not just PNL >= 0). Prevents flat exits with negative net wealth from fee debt.
             let maint_raw = self.account_equity_maint_raw_wide(&self.accounts[idx]);
             if maint_raw.is_negative() {
@@ -2893,7 +2899,7 @@ impl RiskEngine {
         } else if self.is_above_maintenance_margin(&self.accounts[idx], idx, oracle_price) {
             // Maintenance healthy: allow
         } else if strictly_reducing {
-            // v12.0.2 §10.5 step 29: strict risk-reducing exemption (fee-neutral).
+            // v12.1.0 §10.5 step 29: strict risk-reducing exemption (fee-neutral).
             // Both conditions must hold in exact widened I256:
             // 1. Fee-neutral buffer improves: (Eq_maint_raw_post + fee) - MM_req_post > buffer_pre
             // 2. Fee-neutral shortfall does not worsen: min(Eq_maint_raw_post + fee, 0) >= min(Eq_maint_raw_pre, 0)
@@ -3499,72 +3505,66 @@ impl RiskEngine {
 
         let i = idx as usize;
 
-        // Step 1: Settle K-pair PnL and zero position
+        // Step 1: Settle K-pair PnL and zero position.
+        // Uses validate-then-mutate: compute pnl_delta and validate all checked
+        // ops BEFORE any mutation, preventing partial-mutation-on-error.
+        // Does NOT call settle_side_effects (which interleaves mutations with
+        // fallible checked_sub on stale_count).
         if self.accounts[i].position_basis_q != 0 {
-            // Try normal settle_side_effects first
-            let settle_ok = self.settle_side_effects(i).is_ok();
+            let basis = self.accounts[i].position_basis_q;
+            let abs_basis = basis.unsigned_abs();
+            let a_basis = self.accounts[i].adl_a_basis;
+            let k_snap = self.accounts[i].adl_k_snap;
+            let side = side_of_i128(basis).unwrap();
+            let epoch_snap = self.accounts[i].adl_epoch_snap;
+            let epoch_side = self.get_epoch_side(side);
 
-            if !settle_ok {
-                // settle_side_effects failed (epoch-mismatch precondition on
-                // side mode). Compute K-pair PnL manually using the same
-                // wide arithmetic, then zero the position.
-                let basis = self.accounts[i].position_basis_q;
-                let abs_basis = basis.unsigned_abs();
-                let a_basis = self.accounts[i].adl_a_basis;
-                let k_snap = self.accounts[i].adl_k_snap;
+            // Phase 1: COMPUTE (no mutations)
+            let pnl_delta = if a_basis > 0 {
+                let k_end = if epoch_snap == epoch_side {
+                    self.get_k_side(side)
+                } else {
+                    self.get_k_epoch_start(side)
+                };
+                let den = a_basis.checked_mul(POS_SCALE).ok_or(RiskError::Overflow)?;
+                wide_signed_mul_div_floor_from_k_pair(abs_basis, k_snap, k_end, den)
+            } else {
+                0i128
+            };
 
-                if a_basis > 0 {
-                    let side = side_of_i128(basis).unwrap();
-                    let epoch_snap = self.accounts[i].adl_epoch_snap;
-                    let epoch_side = self.get_epoch_side(side);
-
-                    // Determine the correct K endpoint
-                    let k_end = if epoch_snap == epoch_side {
-                        self.get_k_side(side)
-                    } else {
-                        self.get_k_epoch_start(side)
-                    };
-
-                    let den = a_basis.checked_mul(POS_SCALE).ok_or(RiskError::Overflow)?;
-                    let pnl_delta = wide_signed_mul_div_floor_from_k_pair(abs_basis, k_snap, k_end, den);
-
-                    if pnl_delta != 0 {
-                        let old_r = self.accounts[i].reserved_pnl;
-                        let new_pnl = self.accounts[i].pnl.checked_add(pnl_delta)
-                            .ok_or(RiskError::Overflow)?;
-                        if new_pnl == i128::MIN {
-                            return Err(RiskError::Overflow);
-                        }
-                        self.set_pnl(i, new_pnl);
-                        if self.accounts[i].reserved_pnl > old_r {
-                            self.restart_warmup_after_reserve_increase(i);
-                        }
-                    }
-
-                    // Decrement stale count if epoch mismatch
-                    if epoch_snap != epoch_side {
-                        let old_stale = self.get_stale_count(side);
-                        if old_stale > 0 {
-                            self.set_stale_count(side, old_stale - 1);
-                        }
-                    }
+            // Phase 1b: VALIDATE (check all fallible ops before mutating)
+            let new_pnl = self.accounts[i].pnl.checked_add(pnl_delta)
+                .ok_or(RiskError::Overflow)?;
+            if new_pnl == i128::MIN {
+                return Err(RiskError::Overflow);
+            }
+            if epoch_snap != epoch_side {
+                let old_stale = self.get_stale_count(side);
+                if old_stale == 0 {
+                    return Err(RiskError::CorruptState);
                 }
-
-                // Zero position with proper stored_pos_count tracking
-                self.set_position_basis_q(i, 0);
-                self.accounts[i].adl_a_basis = ADL_ONE;
-                self.accounts[i].adl_k_snap = 0;
-                self.accounts[i].adl_epoch_snap = 0;
             }
 
-            // After settle (normal or manual), position may still be nonzero
-            // (same-epoch case where q_eff_new != 0). Zero it.
-            if self.accounts[i].position_basis_q != 0 {
-                self.set_position_basis_q(i, 0);
-                self.accounts[i].adl_a_basis = ADL_ONE;
-                self.accounts[i].adl_k_snap = 0;
-                self.accounts[i].adl_epoch_snap = 0;
+            // Phase 2: MUTATE (all validated, safe to commit)
+            if pnl_delta != 0 {
+                let old_r = self.accounts[i].reserved_pnl;
+                self.set_pnl(i, new_pnl);
+                if self.accounts[i].reserved_pnl > old_r {
+                    self.restart_warmup_after_reserve_increase(i);
+                }
             }
+
+            // Decrement stale count (pre-validated above)
+            if epoch_snap != epoch_side {
+                let old_stale = self.get_stale_count(side);
+                self.set_stale_count(side, old_stale - 1);
+            }
+
+            // Zero position
+            self.set_position_basis_q(i, 0);
+            self.accounts[i].adl_a_basis = ADL_ONE;
+            self.accounts[i].adl_k_snap = 0;
+            self.accounts[i].adl_epoch_snap = 0;
         }
 
         // Step 2: Settle losses from principal

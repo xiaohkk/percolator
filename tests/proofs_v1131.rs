@@ -1,4 +1,4 @@
-//! Section 7 — v12.0.2 Spec Compliance Proofs
+//! Section 7 — v12.1.0 Spec Compliance Proofs
 //!
 //! Properties 46, 59-75: live funding, configuration immutability,
 //! bilateral OI decomposition, partial liquidation, deposit guards, profit conversion.
@@ -13,7 +13,7 @@ use common::*;
 // ############################################################################
 
 /// recompute_r_last_from_final_state(rate) stores exactly rate when
-/// |rate| <= MAX_ABS_FUNDING_BPS_PER_SLOT (spec v12.0.2 §4.12).
+/// |rate| <= MAX_ABS_FUNDING_BPS_PER_SLOT (spec v12.1.0 §4.12).
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
