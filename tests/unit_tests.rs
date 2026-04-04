@@ -19,7 +19,6 @@ fn default_params() -> RiskParams {
         max_crank_staleness_slots: 1000,
         liquidation_fee_bps: 100,
         liquidation_fee_cap: U128::new(1_000_000),
-        liquidation_buffer_bps: 50,
         min_liquidation_abs: U128::new(0),
         min_initial_deposit: U128::new(1000),
         min_nonzero_mm_req: 1,

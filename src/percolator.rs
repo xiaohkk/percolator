@@ -255,7 +255,6 @@ pub struct RiskParams {
     pub max_crank_staleness_slots: u64,
     pub liquidation_fee_bps: u64,
     pub liquidation_fee_cap: U128,
-    pub liquidation_buffer_bps: u64,
     pub min_liquidation_abs: U128,
     pub min_initial_deposit: U128,
     /// Absolute nonzero-position margin floors (spec §9.1)
@@ -2709,26 +2708,33 @@ impl RiskEngine {
         };
 
         // Charge fee from both accounts (spec §10.5 step 28)
-        let mut fee_collected_a = 0u128;
-        let mut fee_collected_b = 0u128;
+        // (cash_to_insurance, total_equity_impact) for each side
+        let mut fee_cash_a = 0u128;
+        let mut fee_cash_b = 0u128;
+        let mut fee_impact_a = 0u128;
+        let mut fee_impact_b = 0u128;
         if fee > 0 {
             if fee > MAX_PROTOCOL_FEE_ABS {
                 return Err(RiskError::Overflow);
             }
-            fee_collected_a = self.charge_fee_to_insurance(a as usize, fee)?;
-            fee_collected_b = self.charge_fee_to_insurance(b as usize, fee)?;
+            let (cash_a, impact_a) = self.charge_fee_to_insurance(a as usize, fee)?;
+            let (cash_b, impact_b) = self.charge_fee_to_insurance(b as usize, fee)?;
+            fee_cash_a = cash_a;
+            fee_cash_b = cash_b;
+            fee_impact_a = impact_a;
+            fee_impact_b = impact_b;
         }
 
-        // Track LP fees: use actual collected amount, not nominal fee.
-        // LP a earns from counterparty b's fee payment, and vice versa.
+        // Track LP fees: use capital actually paid to insurance (realized revenue),
+        // not including collectible debt that may later be forgiven.
         if self.accounts[a as usize].is_lp() {
             self.accounts[a as usize].fees_earned_total = U128::new(
-                add_u128(self.accounts[a as usize].fees_earned_total.get(), fee_collected_b)
+                add_u128(self.accounts[a as usize].fees_earned_total.get(), fee_cash_b)
             );
         }
         if self.accounts[b as usize].is_lp() {
             self.accounts[b as usize].fees_earned_total = U128::new(
-                add_u128(self.accounts[b as usize].fees_earned_total.get(), fee_collected_a)
+                add_u128(self.accounts[b as usize].fees_earned_total.get(), fee_cash_a)
             );
         }
 
@@ -2736,10 +2742,11 @@ impl RiskEngine {
         // Use actual collected fee per side for fee-neutral comparison,
         // not the nominal fee (which may exceed what was actually applied
         // when charge_fee_to_insurance caps at collectible headroom).
+        // Use total equity impact for fee-neutral margin comparison
         self.enforce_post_trade_margin(
             a as usize, b as usize, oracle_price,
             &old_eff_a, &new_eff_a, &old_eff_b, &new_eff_b,
-            buffer_pre_a, buffer_pre_b, fee_collected_a, fee_collected_b,
+            buffer_pre_a, buffer_pre_b, fee_impact_a, fee_impact_b,
         )?;
 
         // Steps 16-17: end-of-instruction resets
@@ -2756,9 +2763,10 @@ impl RiskEngine {
     }
 
     /// Charge fee per spec §8.1 — route shortfall through fee_credits instead of PNL.
-    /// Returns the amount actually applied (capital paid + collectible debt recorded).
+    /// Returns (capital_paid_to_insurance, total_equity_impact).
+    /// capital_paid is realized revenue; total includes collectible debt.
     /// Any excess beyond collectible headroom is silently dropped.
-    fn charge_fee_to_insurance(&mut self, idx: usize, fee: u128) -> Result<u128> {
+    fn charge_fee_to_insurance(&mut self, idx: usize, fee: u128) -> Result<(u128, u128)> {
         if fee > MAX_PROTOCOL_FEE_ABS {
             return Err(RiskError::Overflow);
         }
@@ -2787,9 +2795,9 @@ impl RiskEngine {
                 self.accounts[idx].fee_credits = I128::new(new_fc);
             }
             // Any excess beyond collectible headroom is silently dropped
-            Ok(fee_paid + collectible)
+            Ok((fee_paid, fee_paid + collectible))
         } else {
-            Ok(fee_paid)
+            Ok((fee_paid, fee_paid))
         }
     }
 
