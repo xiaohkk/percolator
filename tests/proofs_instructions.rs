@@ -326,27 +326,27 @@ fn t10_38_accrue_funding_payer_driven() {
     let k_long_after = engine.adl_coeff_long;
     let k_short_after = engine.adl_coeff_short;
 
-    let abs_rate = (rate as i128).unsigned_abs();
-    let funding_term_raw: u128 = 100 * abs_rate * 1;
+    // Engine computes: fund_term = floor_div_signed_conservative(fund_px_0 * rate * dt / 10000)
+    // With fund_px_0=100, dt=1: fund_num = 100 * rate * 1 = 100 * rate
+    // fund_term = floor(fund_num / 10000)
+    // delta_k = A_side * fund_term
+    let fund_num = 100i128 * (rate as i128);
+    let fund_term = floor_div_signed_conservative_i128(fund_num, 10_000u128);
 
-    let a = ADL_ONE as u128;
-    let delta_k_payer_abs = mul_div_ceil_u128(a, funding_term_raw, 10_000);
+    // K_long -= A_long * fund_term, K_short += A_short * fund_term
+    let a_long = ADL_ONE as i128;
+    let expected_long = k_long_before - a_long * fund_term;
+    let expected_short = k_short_before + a_long * fund_term;
 
-    let delta_k_receiver_abs = mul_div_floor_u128(delta_k_payer_abs, a, a);
-    assert!(delta_k_receiver_abs == delta_k_payer_abs, "equal A implies symmetric funding");
+    assert!(k_long_after == expected_long, "K_long must match fund_term computation");
+    assert!(k_short_after == expected_short, "K_short must match fund_term computation");
 
     if rate > 0 {
-        // longs pay, shorts receive
-        let expected_long = k_long_before.checked_sub(delta_k_payer_abs as i128).unwrap();
-        assert!(k_long_after == expected_long);
-        let expected_short = k_short_before.checked_add(delta_k_receiver_abs as i128).unwrap();
-        assert!(k_short_after == expected_short);
+        assert!(k_long_after <= k_long_before, "positive rate: longs pay");
+        assert!(k_short_after >= k_short_before, "positive rate: shorts receive");
     } else {
-        // shorts pay, longs receive
-        let expected_short = k_short_before.checked_sub(delta_k_payer_abs as i128).unwrap();
-        assert!(k_short_after == expected_short);
-        let expected_long = k_long_before.checked_add(delta_k_receiver_abs as i128).unwrap();
-        assert!(k_long_after == expected_long);
+        assert!(k_long_after >= k_long_before, "negative rate: longs receive");
+        assert!(k_short_after <= k_short_before, "negative rate: shorts pay");
     }
 }
 

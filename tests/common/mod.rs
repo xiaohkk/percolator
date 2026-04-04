@@ -17,6 +17,7 @@ pub use percolator::wide_math::{
     wide_mul_div_floor_u128,
     wide_signed_mul_div_floor_from_k_pair,
     saturating_mul_u128_u64,
+    floor_div_signed_conservative_i128,
 };
 
 // ============================================================================

@@ -197,7 +197,11 @@ fn bounded_margin_withdrawal() {
     engine.deposit(a, deposit_amt as u128, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
     let withdraw_amt: u32 = kani::any();
+    // Dust guard: post-withdrawal capital must be 0 or >= MIN_INITIAL_DEPOSIT (2).
+    // So either withdraw all, or leave at least MIN_INITIAL_DEPOSIT.
+    let min_dep = engine.params.min_initial_deposit.get() as u32;
     kani::assume(withdraw_amt > 0 && withdraw_amt <= deposit_amt);
+    kani::assume(withdraw_amt == deposit_amt || deposit_amt - withdraw_amt >= min_dep);
     let result = engine.withdraw(a, withdraw_amt as u128, DEFAULT_ORACLE, DEFAULT_SLOT, 0i64);
     assert!(result.is_ok());
     assert!(engine.check_conservation());
@@ -1935,7 +1939,7 @@ fn proof_audit4_init_in_place_canonical() {
     engine.free_head = u16::MAX; // break the freelist
 
     // Re-initialize — must fully reset all fields
-    engine.init_in_place(params, 0, 0);
+    engine.init_in_place(params, 0, DEFAULT_ORACLE);
 
     // ---- Vault / insurance ----
     assert!(engine.vault.get() == 0);
@@ -1981,9 +1985,9 @@ fn proof_audit4_init_in_place_canonical() {
     // ---- Account tracking ----
     assert!(engine.num_used_accounts == 0);
     assert!(engine.materialized_account_count == 0);
-    assert!(engine.last_oracle_price == 0);
+    assert!(engine.last_oracle_price == DEFAULT_ORACLE);
     assert!(engine.last_market_slot == 0);
-    assert!(engine.funding_price_sample_last == 0);
+    assert!(engine.funding_price_sample_last == DEFAULT_ORACLE);
     assert!(engine.insurance_floor == 0);
     assert!(engine.next_account_id == 0);
 
