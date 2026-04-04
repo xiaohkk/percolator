@@ -1368,38 +1368,30 @@ impl RiskEngine {
             return Ok(());
         }
 
-        // Mark-once rule (spec §1.5 item 21): apply mark exactly once from P_last to oracle_price.
-        // Validate-then-mutate: compute both deltas before applying either.
+        // Use scratch K values for the entire mark + funding computation.
+        // Only commit to engine state after ALL computations succeed.
+        // This prevents partial K advancement on mid-function errors.
+        let mut k_long = self.adl_coeff_long;
+        let mut k_short = self.adl_coeff_short;
+
+        // Step 5: Mark-to-market (once, spec §1.5 item 21)
         let current_price = self.last_oracle_price;
         let delta_p = (oracle_price as i128).checked_sub(current_price as i128)
             .ok_or(RiskError::Overflow)?;
         if delta_p != 0 {
-            // Phase 1: COMPUTE + VALIDATE
-            let delta_k_long = if long_live {
-                let dk = checked_u128_mul_i128(self.adl_mult_long, delta_p)?;
-                self.adl_coeff_long.checked_add(dk).ok_or(RiskError::Overflow)?;
-                dk
-            } else { 0i128 };
-            let delta_k_short = if short_live {
-                let dk = checked_u128_mul_i128(self.adl_mult_short, delta_p)?;
-                self.adl_coeff_short.checked_sub(dk).ok_or(RiskError::Overflow)?;
-                dk
-            } else { 0i128 };
-
-            // Phase 2: MUTATE (both validated)
             if long_live {
-                self.adl_coeff_long = self.adl_coeff_long.checked_add(delta_k_long).unwrap();
+                let dk = checked_u128_mul_i128(self.adl_mult_long, delta_p)?;
+                k_long = k_long.checked_add(dk).ok_or(RiskError::Overflow)?;
             }
             if short_live {
-                self.adl_coeff_short = self.adl_coeff_short.checked_sub(delta_k_short).unwrap();
+                let dk = checked_u128_mul_i128(self.adl_mult_short, delta_p)?;
+                k_short = k_short.checked_sub(dk).ok_or(RiskError::Overflow)?;
             }
         }
 
         // Step 6: Funding transfer via sub-stepping (spec v12.1.0 §5.4)
         let r_last = self.funding_rate_bps_per_slot_last;
         if r_last != 0 && total_dt > 0 && long_live && short_live {
-            // Snapshot fund_px_0 at call start — uses previous interval's price
-            // (spec §5.4 step 4: "fund_px_0 = fund_px_last")
             let fund_px_0 = self.funding_price_sample_last;
 
             if fund_px_0 > 0 {
@@ -1409,33 +1401,27 @@ impl RiskEngine {
                     let dt_sub = core::cmp::min(dt_remaining, MAX_FUNDING_DT);
                     dt_remaining -= dt_sub;
 
-                    // fund_num = fund_px_0 * r_last * dt_sub (checked i128, spec §1.6)
                     let fund_num: i128 = (fund_px_0 as i128)
                         .checked_mul(r_last as i128)
                         .ok_or(RiskError::Overflow)?
                         .checked_mul(dt_sub as i128)
                         .ok_or(RiskError::Overflow)?;
 
-                    // fund_term = floor(fund_num / 10000) (spec §1.6.9)
                     let fund_term = floor_div_signed_conservative_i128(fund_num, 10_000u128);
 
                     if fund_term != 0 {
-                        // Validate-then-mutate: compute both deltas first
                         let dk_long = checked_u128_mul_i128(self.adl_mult_long, fund_term)?;
-                        let new_k_long = self.adl_coeff_long.checked_sub(dk_long)
-                            .ok_or(RiskError::Overflow)?;
+                        k_long = k_long.checked_sub(dk_long).ok_or(RiskError::Overflow)?;
                         let dk_short = checked_u128_mul_i128(self.adl_mult_short, fund_term)?;
-                        let new_k_short = self.adl_coeff_short.checked_add(dk_short)
-                            .ok_or(RiskError::Overflow)?;
-                        // Both validated — commit
-                        self.adl_coeff_long = new_k_long;
-                        self.adl_coeff_short = new_k_short;
+                        k_short = k_short.checked_add(dk_short).ok_or(RiskError::Overflow)?;
                     }
                 }
             }
         }
 
-        // Synchronize slots and prices (spec §5.4 steps 7-9)
+        // ALL computations succeeded — commit K values and synchronize state
+        self.adl_coeff_long = k_long;
+        self.adl_coeff_short = k_short;
         self.current_slot = now_slot;
         self.last_market_slot = now_slot;
         self.last_oracle_price = oracle_price;
@@ -1444,11 +1430,21 @@ impl RiskEngine {
         Ok(())
     }
 
+    /// Pre-validate funding rate bound (called at top of each instruction,
+    /// before any mutations, so bad rates never cause partial-mutation errors).
+    fn validate_funding_rate(rate: i64) -> Result<()> {
+        if rate.unsigned_abs() > MAX_ABS_FUNDING_BPS_PER_SLOT as u64 {
+            return Err(RiskError::Overflow);
+        }
+        Ok(())
+    }
+
     /// recompute_r_last_from_final_state (spec v12.1.0 §4.12).
-    /// Validates the externally computed funding rate and stores it for
-    /// the next interval's accrue_market_to funding sub-steps.
+    /// Stores the pre-validated funding rate for the next interval.
     test_visible! {
     fn recompute_r_last_from_final_state(&mut self, externally_computed_rate: i64) -> Result<()> {
+        // Rate already validated at instruction entry; store unconditionally.
+        // Belt-and-suspenders: re-check here too.
         if externally_computed_rate.unsigned_abs() > MAX_ABS_FUNDING_BPS_PER_SLOT as u64 {
             return Err(RiskError::Overflow);
         }
@@ -1465,6 +1461,8 @@ impl RiskEngine {
     /// Callers that bypass `keeper_crank` (e.g. the resolved-market
     /// settlement crank) must invoke this before returning.
     pub fn run_end_of_instruction_lifecycle(&mut self, ctx: &mut InstructionContext, funding_rate: i64) -> Result<()> {
+                Self::validate_funding_rate(funding_rate)?;
+
         self.schedule_end_of_instruction_resets(ctx)?;
         self.finalize_end_of_instruction_resets(ctx);
         self.recompute_r_last_from_final_state(funding_rate)?;
@@ -2405,6 +2403,12 @@ impl RiskEngine {
             return Err(RiskError::Overflow);
         }
 
+        // Pre-validate vault capacity before any mutations (prevents ghost account)
+        let v_candidate = self.vault.get().checked_add(amount).ok_or(RiskError::Overflow)?;
+        if v_candidate > MAX_VAULT_TVL {
+            return Err(RiskError::Overflow);
+        }
+
         // Step 2: if account missing, require amount >= MIN_INITIAL_DEPOSIT and materialize
         // Per spec §10.3 step 2 and §2.3: deposit is the canonical materialization path.
         if !self.is_used(idx as usize) {
@@ -2417,12 +2421,6 @@ impl RiskEngine {
 
         // Step 3: current_slot = now_slot
         self.current_slot = now_slot;
-
-        // Step 4: V + amount <= MAX_VAULT_TVL
-        let v_candidate = self.vault.get().checked_add(amount).ok_or(RiskError::Overflow)?;
-        if v_candidate > MAX_VAULT_TVL {
-            return Err(RiskError::Overflow);
-        }
         self.vault = U128::new(v_candidate);
 
         // Step 6: set_capital(i, C_i + amount)
@@ -2461,6 +2459,8 @@ impl RiskEngine {
         now_slot: u64,
         funding_rate: i64,
     ) -> Result<()> {
+                Self::validate_funding_rate(funding_rate)?;
+
         if oracle_price == 0 || oracle_price > MAX_ORACLE_PRICE {
             return Err(RiskError::Overflow);
         }
@@ -2531,6 +2531,8 @@ impl RiskEngine {
         now_slot: u64,
         funding_rate: i64,
     ) -> Result<()> {
+                Self::validate_funding_rate(funding_rate)?;
+
         if oracle_price == 0 || oracle_price > MAX_ORACLE_PRICE {
             return Err(RiskError::Overflow);
         }
@@ -2568,6 +2570,8 @@ impl RiskEngine {
         exec_price: u64,
         funding_rate: i64,
     ) -> Result<()> {
+                Self::validate_funding_rate(funding_rate)?;
+
         if oracle_price == 0 || oracle_price > MAX_ORACLE_PRICE {
             return Err(RiskError::Overflow);
         }
@@ -2998,6 +3002,8 @@ impl RiskEngine {
         policy: LiquidationPolicy,
         funding_rate: i64,
     ) -> Result<bool> {
+                Self::validate_funding_rate(funding_rate)?;
+
         // Bounds and existence check BEFORE touch_account_full to prevent
         // market-state mutation (accrue_market_to) on missing accounts.
         if idx as usize >= MAX_ACCOUNTS || !self.is_used(idx as usize) {
@@ -3169,6 +3175,8 @@ impl RiskEngine {
         max_revalidations: u16,
         funding_rate: i64,
     ) -> Result<CrankOutcome> {
+                Self::validate_funding_rate(funding_rate)?;
+
         if oracle_price == 0 || oracle_price > MAX_ORACLE_PRICE {
             return Err(RiskError::Overflow);
         }
@@ -3253,7 +3261,7 @@ impl RiskEngine {
                     if !self.is_above_maintenance_margin(&self.accounts[cidx], cidx, oracle_price) {
                         // Validate hint via stateless pre-flight (spec §11.1 rule 3).
                         // None hint → no action per spec §11.2.
-                        // Invalid ExactPartial → FullClose fallback for liveness.
+                        // Invalid ExactPartial → None (no action) per spec §11.1 rule 3.
                         if let Some(policy) = self.validate_keeper_hint(candidate_idx, eff, hint, oracle_price) {
                             match self.liquidate_at_oracle_internal(candidate_idx, now_slot, oracle_price, policy, &mut ctx) {
                                 Ok(true) => { num_liquidations += 1; }
@@ -3386,6 +3394,8 @@ impl RiskEngine {
         now_slot: u64,
         funding_rate: i64,
     ) -> Result<()> {
+                Self::validate_funding_rate(funding_rate)?;
+
         if oracle_price == 0 || oracle_price > MAX_ORACLE_PRICE {
             return Err(RiskError::Overflow);
         }
@@ -3449,6 +3459,8 @@ impl RiskEngine {
     // ========================================================================
 
     pub fn close_account(&mut self, idx: u16, now_slot: u64, oracle_price: u64, funding_rate: i64) -> Result<u128> {
+                Self::validate_funding_rate(funding_rate)?;
+
         if idx as usize >= MAX_ACCOUNTS || !self.is_used(idx as usize) {
             return Err(RiskError::AccountNotFound);
         }
@@ -3601,6 +3613,9 @@ impl RiskEngine {
             self.accounts[i].adl_k_snap = 0;
             self.accounts[i].adl_epoch_snap = 0;
         }
+
+        // Step 1b: Realize recurring maintenance fees (spec §8.2)
+        self.settle_maintenance_fee_internal(i, self.current_slot)?;
 
         // Step 2: Settle losses from principal
         self.settle_losses(i);

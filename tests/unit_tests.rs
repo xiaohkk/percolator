@@ -2458,6 +2458,8 @@ fn test_force_close_resolved_flat_no_pnl() {
     let mut engine = RiskEngine::new(default_params());
     let idx = engine.add_user(1000).unwrap();
     engine.deposit(idx, 50_000, 1000, 100).unwrap();
+    // Align last_fee_slot so force_close doesn't charge accrued fee
+    engine.accounts[idx as usize].last_fee_slot = 100;
 
     let returned = engine.force_close_resolved(idx).unwrap();
     assert_eq!(returned, 50_000);
@@ -2510,6 +2512,7 @@ fn test_force_close_resolved_with_positive_pnl() {
     let mut engine = RiskEngine::new(default_params());
     let idx = engine.add_user(1000).unwrap();
     engine.deposit(idx, 50_000, 1000, 100).unwrap();
+    engine.accounts[idx as usize].last_fee_slot = 100;
 
     // Inject positive PnL on flat account
     engine.set_pnl(idx as usize, 10_000i128);
@@ -2526,6 +2529,7 @@ fn test_force_close_resolved_with_fee_debt() {
     let mut engine = RiskEngine::new(default_params());
     let idx = engine.add_user(1000).unwrap();
     engine.deposit(idx, 50_000, 1000, 100).unwrap();
+    engine.accounts[idx as usize].last_fee_slot = 100;
 
     // Inject fee debt of 5000
     engine.accounts[idx as usize].fee_credits = I128::new(-5000);
@@ -2555,16 +2559,23 @@ fn test_force_close_same_epoch_positive_k_pair_pnl() {
     engine.deposit(b, 500_000, 1000, 100).unwrap();
 
     engine.execute_trade(a, b, 1000, 100, (100 * POS_SCALE) as i128, 1000, 0i64).unwrap();
+    // Align fee slots
+    engine.accounts[a as usize].last_fee_slot = 100;
+    engine.accounts[b as usize].last_fee_slot = 100;
+    let cap_after_trade = engine.accounts[a as usize].capital.get();
 
-    // Advance K via price movement (mark-to-market)
-    engine.keeper_crank(200, 1500, &[], 64, 0i64).unwrap();
+    // Advance K via price movement (mark-to-market) — NOT touching a or b as candidates
+    // so K-pair PnL remains unrealized for them
+    engine.accrue_market_to(200, 1500).unwrap();
+    engine.current_slot = 200;
+    // Align fee slots to 200 to prevent fee on force_close
+    engine.accounts[a as usize].last_fee_slot = 200;
 
     // a (long) has unrealized profit from K-pair (K_long increased)
-    let cap_before = engine.accounts[a as usize].capital.get();
     let returned = engine.force_close_resolved(a).unwrap();
 
-    // Returned should include settled K-pair profit (haircutted)
-    assert!(returned >= cap_before, "K-pair profit must increase returned capital");
+    // Returned should include settled K-pair profit
+    assert!(returned >= cap_after_trade, "K-pair profit must increase returned capital");
     assert!(!engine.is_used(a as usize));
     assert!(engine.check_conservation());
 }
@@ -2629,6 +2640,10 @@ fn test_force_close_c_tot_tracks_exactly() {
     engine.deposit(a, 100_000, 1000, 100).unwrap();
     engine.deposit(b, 200_000, 1000, 100).unwrap();
     engine.deposit(c, 300_000, 1000, 100).unwrap();
+    // Align fee slots to prevent maintenance fee interference
+    engine.accounts[a as usize].last_fee_slot = 100;
+    engine.accounts[b as usize].last_fee_slot = 100;
+    engine.accounts[c as usize].last_fee_slot = 100;
 
     let c_tot_before = engine.c_tot.get();
 
