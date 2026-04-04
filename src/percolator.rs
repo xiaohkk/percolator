@@ -11,16 +11,21 @@
 //!
 //! # Atomicity Model
 //!
-//! Functions suffixed with `_not_atomic` can return `Err` after partial state
-//! mutation. **Callers MUST abort the entire transaction on `Err`** — they
-//! must not retry, suppress, or continue with mutated state.
+//! Public functions suffixed with `_not_atomic` can return `Err` after partial
+//! state mutation. **Callers MUST abort the entire transaction on `Err`** —
+//! they must not retry, suppress, or continue with mutated state.
 //!
 //! On Solana SVM, any `Err` return from an instruction aborts the transaction
 //! and rolls back all account state automatically. This is the expected
 //! deployment model.
 //!
-//! Functions WITHOUT the `_not_atomic` suffix are error-atomic: `Err` means
-//! no state was changed.
+//! Public functions WITHOUT the suffix (`deposit`, `top_up_insurance_fund`,
+//! `deposit_fee_credits`, `accrue_market_to`) use validate-then-mutate:
+//! `Err` means no state was changed.
+//!
+//! Internal helpers (`enqueue_adl`, `liquidate_at_oracle_internal`, etc.)
+//! are not individually atomic — they rely on the calling `_not_atomic`
+//! method to propagate `Err` to the transaction boundary.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -2236,8 +2241,7 @@ impl RiskEngine {
     // Account Management
     // ========================================================================
 
-    test_visible! {
-    fn add_user(&mut self, fee_payment: u128) -> Result<u16> {
+    pub fn add_user(&mut self, fee_payment: u128) -> Result<u16> {
         let used_count = self.num_used_accounts as u64;
         if used_count >= self.params.max_accounts {
             return Err(RiskError::Overflow);
@@ -2307,10 +2311,8 @@ impl RiskEngine {
 
         Ok(idx)
     }
-    }
 
-    test_visible! {
-    fn add_lp(
+    pub fn add_lp(
         &mut self,
         matching_engine_program: [u8; 32],
         matching_engine_context: [u8; 32],
@@ -2383,7 +2385,6 @@ impl RiskEngine {
         }
 
         Ok(idx)
-    }
     }
 
     pub fn set_owner(&mut self, idx: u16, owner: [u8; 32]) -> Result<()> {
@@ -3874,7 +3875,7 @@ impl RiskEngine {
         if now_slot < self.current_slot {
             return Err(RiskError::Overflow);
         }
-        self.current_slot = now_slot;
+        // Validate-then-mutate: all checks before any state change
         let new_vault = self.vault.get().checked_add(amount)
             .ok_or(RiskError::Overflow)?;
         if new_vault > MAX_VAULT_TVL {
@@ -3882,6 +3883,8 @@ impl RiskEngine {
         }
         let new_ins = self.insurance_fund.balance.get().checked_add(amount)
             .ok_or(RiskError::Overflow)?;
+        // All checks passed — commit
+        self.current_slot = now_slot;
         self.vault = U128::new(new_vault);
         self.insurance_fund.balance = U128::new(new_ins);
         Ok(self.insurance_fund.balance.get() > self.params.insurance_floor.get())
