@@ -1748,6 +1748,7 @@ fn proof_audit2_funding_rate_clamped() {
     let slot2 = DEFAULT_SLOT + 1;
     let result = engine.keeper_crank_not_atomic(slot2, DEFAULT_ORACLE, &[(a, None), (b, None)], 64, 0i64);
     // May succeed or fail depending on whether accrue overflows — both are acceptable
+    kani::cover!(result.is_ok(), "crank with extreme stored rate reachable");
     if result.is_ok() {
         assert!(engine.check_conservation());
     }

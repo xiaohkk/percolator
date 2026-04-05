@@ -963,7 +963,7 @@ fn proof_force_close_resolved_position_conservation() {
     engine.keeper_crank_not_atomic(DEFAULT_SLOT + 1, 1500, &[], 64, 0i64).unwrap();
 
     let oi_long_before = engine.oi_eff_long_q;
-    let result = engine.force_close_resolved_not_atomic(a, 100);
+    let result = engine.force_close_resolved_not_atomic(a, DEFAULT_SLOT + 1);
     assert!(result.is_ok());
     assert!(!engine.is_used(a as usize));
     assert!(engine.accounts[a as usize].position_basis_q == 0);
