@@ -2075,11 +2075,8 @@ impl RiskEngine {
             let pay_i128 = pay as i128; // pay <= need = |pnl| <= i128::MAX, safe
             let new_pnl = pnl.checked_add(pay_i128)
                 .expect("settle_losses: unreachable overflow (pay <= |pnl|)");
-            if new_pnl == i128::MIN {
-                self.set_pnl(idx, 0i128);
-            } else {
-                self.set_pnl(idx, new_pnl);
-            }
+            assert!(new_pnl != i128::MIN, "settle_losses: new_pnl == i128::MIN is unreachable");
+            self.set_pnl(idx, new_pnl);
         }
     }
 
@@ -2144,7 +2141,9 @@ impl RiskEngine {
             let pay_i128 = core::cmp::min(pay, i128::MAX as u128) as i128;
             self.accounts[idx].fee_credits = I128::new(self.accounts[idx].fee_credits.get()
                 .checked_add(pay_i128).expect("fee_debt_sweep: pay <= debt guarantees no overflow"));
-            self.insurance_fund.balance = self.insurance_fund.balance + pay;
+            self.insurance_fund.balance = U128::new(
+                self.insurance_fund.balance.get().checked_add(pay)
+                    .expect("fee_debt_sweep: insurance overflow (I <= V <= MAX_VAULT_TVL)"));
         }
         // Per spec §7.5: unpaid fee debt remains as local fee_credits until
         // physical capital becomes available or manual profit conversion occurs.
@@ -3837,33 +3836,31 @@ impl RiskEngine {
                 continue;
             }
 
-            // Realize recurring maintenance fees on already-flat state (spec §8.2.3).
-            // Best-effort: skip on error (GC is non-critical).
-            if self.settle_maintenance_fee_internal(idx, self.current_slot).is_err() {
-                continue;
-            }
-
-            // Dust predicate: zero position basis, zero capital, zero reserved,
-            // non-positive pnl, AND zero fee_credits. Must not GC accounts
-            // with prepaid fee credits — those belong to the user.
+            // Dust predicate: check flat-clean preconditions BEFORE fee realization
+            // (matching reclaim_empty_account_not_atomic pattern — spec §8.2.3).
             let account = &self.accounts[idx];
             if account.position_basis_q != 0 {
                 continue;
             }
-            // Spec §2.6: reclaim when C_i == 0 OR 0 < C_i < MIN_INITIAL_DEPOSIT
-            if account.capital.get() >= self.params.min_initial_deposit.get()
-                && !account.capital.is_zero() {
+            if account.pnl != 0 {
                 continue;
             }
             if account.reserved_pnl != 0 {
                 continue;
             }
-            // Spec §2.6 requires PNL_i == 0 as a precondition.
-            // Accounts with PNL != 0 need touch_account_full_not_atomic → §7.3 first.
-            if account.pnl != 0 {
+            if account.fee_credits.get() > 0 {
                 continue;
             }
-            if account.fee_credits.get() > 0 {
+
+            // Realize recurring maintenance fees on already-flat state (spec §8.2.3).
+            // Only called after flat-clean preconditions are verified.
+            if self.settle_maintenance_fee_internal(idx, self.current_slot).is_err() {
+                continue;
+            }
+
+            // Re-check capital after fee realization (fee may have reduced it)
+            if self.accounts[idx].capital.get() >= self.params.min_initial_deposit.get()
+                && !self.accounts[idx].capital.is_zero() {
                 continue;
             }
 
