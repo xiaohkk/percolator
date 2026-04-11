@@ -2388,7 +2388,7 @@ fn test_force_close_resolved_flat_no_pnl() {
     let idx = engine.add_user(1000).unwrap();
     engine.deposit(idx, 50_000, 1000, 100).unwrap();
 
-
+    engine.market_mode = MarketMode::Resolved;
     let returned = engine.force_close_resolved_not_atomic(idx, 100).unwrap();
     assert_eq!(returned, 50_000);
     assert!(!engine.is_used(idx as usize));
@@ -2407,6 +2407,7 @@ fn test_force_close_resolved_with_open_position() {
     engine.execute_trade_not_atomic(a, b, 1000, 100, size, 1000, 0i128, 0).unwrap();
 
     // Account has open position — force_close settles K-pair PnL and zeros it
+    engine.market_mode = MarketMode::Resolved;
     let result = engine.force_close_resolved_not_atomic(a, 100);
     assert!(result.is_ok(), "force_close must handle open positions");
     assert!(!engine.is_used(a as usize));
@@ -2427,6 +2428,7 @@ fn test_force_close_resolved_with_negative_pnl() {
     // Inject loss
     engine.set_pnl(a as usize, -100_000i128);
 
+    engine.market_mode = MarketMode::Resolved;
     let cap_before = engine.accounts[a as usize].capital.get();
     let returned = engine.force_close_resolved_not_atomic(a, 100).unwrap();
 
@@ -2445,6 +2447,8 @@ fn test_force_close_resolved_with_positive_pnl() {
     // Inject positive PnL on flat account
     engine.set_pnl(idx as usize, 10_000i128);
 
+    engine.market_mode = MarketMode::Resolved;
+    engine.pnl_matured_pos_tot = engine.pnl_pos_tot;
     let returned = engine.force_close_resolved_not_atomic(idx, 100).unwrap();
     // Positive PnL converted to capital (haircutted) before return
     assert!(returned >= 50_000, "positive PnL must increase returned capital");
@@ -2462,6 +2466,7 @@ fn test_force_close_resolved_with_fee_debt() {
     // Inject fee debt of 5000
     engine.accounts[idx as usize].fee_credits = I128::new(-5000);
 
+    engine.market_mode = MarketMode::Resolved;
     let returned = engine.force_close_resolved_not_atomic(idx, 100).unwrap();
     // Fee debt swept from capital first (spec §7.5 fee seniority):
     // 50_000 capital - 5_000 fee sweep = 45_000 returned
@@ -2473,6 +2478,7 @@ fn test_force_close_resolved_with_fee_debt() {
 #[test]
 fn test_force_close_resolved_unused_slot_rejected() {
     let mut engine = RiskEngine::new(default_params());
+    engine.market_mode = MarketMode::Resolved;
     let result = engine.force_close_resolved_not_atomic(0, 100);
     assert_eq!(result, Err(RiskError::AccountNotFound));
 }
@@ -2500,6 +2506,8 @@ fn test_force_close_same_epoch_positive_k_pair_pnl() {
 
 
     // a (long) has unrealized profit from K-pair (K_long increased)
+    engine.market_mode = MarketMode::Resolved;
+    engine.pnl_matured_pos_tot = engine.pnl_pos_tot;
     let returned = engine.force_close_resolved_not_atomic(a, 200).unwrap();
 
     // Returned should include settled K-pair profit
@@ -2522,6 +2530,8 @@ fn test_force_close_same_epoch_negative_k_pair_pnl() {
     // Price drops → a (long) has unrealized loss
     engine.keeper_crank_not_atomic(200, 500, &[], 64, 0i128, 0).unwrap();
 
+    engine.market_mode = MarketMode::Resolved;
+    engine.pnl_matured_pos_tot = engine.pnl_pos_tot;
     let cap_before = engine.accounts[a as usize].capital.get();
     let returned = engine.force_close_resolved_not_atomic(a, 200).unwrap();
 
@@ -2540,6 +2550,7 @@ fn test_force_close_with_fee_debt_exceeding_capital() {
     // Fee debt >> capital
     engine.accounts[idx as usize].fee_credits = I128::new(-50_000);
 
+    engine.market_mode = MarketMode::Resolved;
     let returned = engine.force_close_resolved_not_atomic(idx, 100).unwrap();
     // Capital (10k) fully swept to insurance, remaining debt forgiven
     assert_eq!(returned, 0, "all capital swept for fee debt");
@@ -2553,6 +2564,7 @@ fn test_force_close_zero_capital_zero_pnl() {
     let idx = engine.add_user(1000).unwrap();
     // No deposit — capital = 0 (new_account_fee consumed all)
 
+    engine.market_mode = MarketMode::Resolved;
     let returned = engine.force_close_resolved_not_atomic(idx, 100).unwrap();
     assert_eq!(returned, 0);
     assert!(!engine.is_used(idx as usize));
@@ -2575,6 +2587,7 @@ fn test_force_close_c_tot_tracks_exactly() {
 
     let c_tot_before = engine.c_tot.get();
 
+    engine.market_mode = MarketMode::Resolved;
     let ret_a = engine.force_close_resolved_not_atomic(a, 100).unwrap();
     assert_eq!(engine.c_tot.get(), c_tot_before - ret_a);
 
@@ -2602,6 +2615,8 @@ fn test_force_close_stored_pos_count_tracks() {
     assert_eq!(engine.stored_pos_count_long, 1);
     assert_eq!(engine.stored_pos_count_short, 1);
 
+    engine.market_mode = MarketMode::Resolved;
+    engine.pnl_matured_pos_tot = engine.pnl_pos_tot;
     engine.force_close_resolved_not_atomic(a, 100).unwrap();
     assert_eq!(engine.stored_pos_count_long, 0, "long count must decrement");
     // Short count unchanged — b still has position
@@ -2621,6 +2636,7 @@ fn test_force_close_multiple_sequential_no_aggregate_drift() {
         accounts.push(idx);
     }
 
+    engine.market_mode = MarketMode::Resolved;
     for &idx in &accounts {
         engine.force_close_resolved_not_atomic(idx, 100).unwrap();
     }
@@ -2646,6 +2662,8 @@ fn test_force_close_decrements_oi() {
     assert!(engine.oi_eff_long_q > 0);
     assert!(engine.oi_eff_short_q > 0);
 
+    engine.market_mode = MarketMode::Resolved;
+    engine.pnl_matured_pos_tot = engine.pnl_pos_tot;
     engine.force_close_resolved_not_atomic(a, 100).unwrap();
     // Bilateral decrement: both sides go to 0 together
     assert_eq!(engine.oi_eff_long_q, 0);
@@ -2677,6 +2695,8 @@ fn test_force_close_oi_symmetry_after_one_side() {
     assert_eq!(engine.oi_eff_long_q, engine.oi_eff_short_q);
 
     // Force-close only account a (the long side)
+    engine.market_mode = MarketMode::Resolved;
+    engine.pnl_matured_pos_tot = engine.pnl_pos_tot;
     engine.force_close_resolved_not_atomic(a, 100).unwrap();
 
     // After force-closing one side, OI must stay symmetric so the
@@ -2702,6 +2722,7 @@ fn test_force_close_rejects_corrupt_a_basis() {
     engine.stored_pos_count_long = 1;
     engine.accounts[a as usize].adl_a_basis = 0;
 
+    engine.market_mode = MarketMode::Resolved;
     let result = engine.force_close_resolved_not_atomic(a, 100);
     assert_eq!(result, Err(RiskError::CorruptState),
         "must reject corrupt a_basis = 0");

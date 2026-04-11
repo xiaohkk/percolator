@@ -75,6 +75,7 @@ pub const MAX_ACCOUNTS: usize = 4096;
 
 pub const BITMAP_WORDS: usize = (MAX_ACCOUNTS + 63) / 64;
 pub const MAX_ROUNDING_SLACK: u128 = MAX_ACCOUNTS as u128;
+pub const MAX_ACTIVE_POSITIONS_PER_SIDE: u64 = MAX_ACCOUNTS as u64;
 const ACCOUNT_IDX_MASK: usize = MAX_ACCOUNTS - 1;
 
 pub const GC_CLOSE_BUDGET: u32 = 32;
@@ -1253,10 +1254,14 @@ impl RiskEngine {
                 Side::Long => {
                     self.stored_pos_count_long = self.stored_pos_count_long
                         .checked_add(1).expect("set_position_basis_q: long count overflow");
+                    assert!(self.stored_pos_count_long <= MAX_ACTIVE_POSITIONS_PER_SIDE,
+                        "set_position_basis_q: exceeds MAX_ACTIVE_POSITIONS_PER_SIDE");
                 }
                 Side::Short => {
                     self.stored_pos_count_short = self.stored_pos_count_short
                         .checked_add(1).expect("set_position_basis_q: short count overflow");
+                    assert!(self.stored_pos_count_short <= MAX_ACTIVE_POSITIONS_PER_SIDE,
+                        "set_position_basis_q: exceeds MAX_ACTIVE_POSITIONS_PER_SIDE");
                 }
             }
         }
@@ -1839,7 +1844,9 @@ impl RiskEngine {
             let a_new = a_candidate_u256.try_into_u128().expect("A_candidate exceeds u128");
             self.set_a_side(opp, a_new);
             self.set_oi_eff(opp, oi_post);
-            // Only account for global A-truncation dust when actual truncation occurs
+            // Unconditionally increment phantom dust by 1 on any A_side decay
+            self.inc_phantom_dust_bound(opp);
+            // Additionally account for global A-truncation dust when actual truncation occurs
             if !a_trunc_rem.is_zero() {
                 let n_opp = self.get_stored_pos_count(opp) as u128;
                 let n_opp_u256 = U256::from_u128(n_opp);
@@ -2374,13 +2381,12 @@ impl RiskEngine {
             return;
         }
 
-        // Step 8: merge into existing overflow_newest (first-write horizon preserved)
+        // Step 8: merge into existing overflow_newest (use max horizon for safety)
         let n = &mut a.overflow_newest;
         n.remaining_q = n.remaining_q.checked_add(reserve_add).expect("reserve overflow");
         n.anchor_q = n.anchor_q.checked_add(reserve_add).expect("anchor overflow");
-        n.start_slot = now_slot; // inert metadata
-        // n.horizon_slots MUST remain unchanged
-        // n.sched_release_q stays 0
+        n.start_slot = now_slot;
+        n.horizon_slots = core::cmp::max(n.horizon_slots, h_lock); // conservative: longest horizon wins
         a.reserved_pnl = a.reserved_pnl.checked_add(reserve_add).expect("R_i overflow");
     }
 
@@ -2940,6 +2946,9 @@ impl RiskEngine {
     // ========================================================================
 
     pub fn deposit(&mut self, idx: u16, amount: u128, _oracle_price: u64, now_slot: u64) -> Result<()> {
+        if self.market_mode != MarketMode::Live {
+            return Err(RiskError::Unauthorized);
+        }
         // Time monotonicity (spec §10.3 step 1)
         if now_slot < self.current_slot {
             return Err(RiskError::Overflow);
@@ -3019,6 +3028,10 @@ impl RiskEngine {
             return Err(RiskError::AccountNotFound);
         }
 
+        if self.market_mode != MarketMode::Live {
+            return Err(RiskError::Unauthorized);
+        }
+
         let mut ctx = InstructionContext::new_with_h_lock(h_lock);
 
         // Step 2: accrue market
@@ -3094,6 +3107,10 @@ impl RiskEngine {
             return Err(RiskError::AccountNotFound);
         }
 
+        if self.market_mode != MarketMode::Live {
+            return Err(RiskError::Unauthorized);
+        }
+
         let mut ctx = InstructionContext::new_with_h_lock(h_lock);
 
         // Step 2: accrue market
@@ -3163,6 +3180,10 @@ impl RiskEngine {
         }
         if a == b {
             return Err(RiskError::Overflow);
+        }
+
+        if self.market_mode != MarketMode::Live {
+            return Err(RiskError::Unauthorized);
         }
 
         let mut ctx = InstructionContext::new_with_h_lock(h_lock);
@@ -3614,6 +3635,10 @@ impl RiskEngine {
             return Ok(false);
         }
 
+        if self.market_mode != MarketMode::Live {
+            return Err(RiskError::Unauthorized);
+        }
+
         let mut ctx = InstructionContext::new_with_h_lock(h_lock);
 
         // Step 2: accrue market
@@ -3790,6 +3815,10 @@ impl RiskEngine {
 
         if oracle_price == 0 || oracle_price > MAX_ORACLE_PRICE {
             return Err(RiskError::Overflow);
+        }
+
+        if self.market_mode != MarketMode::Live {
+            return Err(RiskError::Unauthorized);
         }
 
         // Step 1: initialize instruction context
@@ -4151,7 +4180,10 @@ impl RiskEngine {
         // Step 6: capture barrier snapshot
         let barrier = self.capture_barrier_snapshot(now_slot, oracle_price);
 
-        // Phase 1: read-only scan — classify accounts into buckets
+        // Phase 1: read-only scan — classify accounts into buckets.
+        // NOTE: These stack arrays are BPF-incompatible at MAX_ACCOUNTS=4096 (24KB stack).
+        // On Solana BPF (4KB stack limit), this function must only be used with bounded
+        // scan_window.len(). Under test/kani (MAX_ACCOUNTS=4/64) this is safe.
         let mut review_liq: [u16; MAX_ACCOUNTS] = [0; MAX_ACCOUNTS];
         let mut review_liq_count: usize = 0;
         let mut review_reset: [u16; MAX_ACCOUNTS] = [0; MAX_ACCOUNTS];
@@ -4311,7 +4343,11 @@ impl RiskEngine {
             }
         } // 'phase2
 
-        // Finalize: GC, end-of-instruction resets, OI balance
+        // Finalize: shared-snapshot whole-only conversion + fee sweep on all touched,
+        // then GC, end-of-instruction resets, OI balance.
+        // Without this, barrier-wave-touched accounts miss auto-conversion that the
+        // regular crank path provides via finalize_touched_accounts_post_live.
+        self.finalize_touched_accounts_post_live(&ctx);
         self.garbage_collect_dust();
         self.schedule_end_of_instruction_resets(&mut ctx)?;
         self.finalize_end_of_instruction_resets(&ctx);
@@ -4357,6 +4393,10 @@ impl RiskEngine {
             return Err(RiskError::AccountNotFound);
         }
 
+        if self.market_mode != MarketMode::Live {
+            return Err(RiskError::Unauthorized);
+        }
+
         let mut ctx = InstructionContext::new_with_h_lock(h_lock);
 
         // Step 2: accrue market
@@ -4366,14 +4406,8 @@ impl RiskEngine {
         // Step 3: live local touch (no auto-convert)
         self.touch_account_live_local(idx as usize, &mut ctx)?;
 
-        // Step 4: if flat, finalize (which does whole-only conversion) and return
-        if self.accounts[idx as usize].position_basis_q == 0 {
-            self.finalize_touched_accounts_post_live(&ctx);
-            self.schedule_end_of_instruction_resets(&mut ctx)?;
-            self.finalize_end_of_instruction_resets(&ctx);
-            self.recompute_r_last_from_final_state(funding_rate_e9)?;
-            return Ok(());
-        }
+        // Step 4: finalize (which does whole-only conversion)
+        self.finalize_touched_accounts_post_live(&ctx);
 
         // Step 5: require 0 < x_req <= ReleasedPos_i
         let released = self.released_pos(idx as usize);
@@ -4513,6 +4547,8 @@ impl RiskEngine {
             return Err(RiskError::Overflow); // price outside settlement band
         }
 
+        // Zero funding for final accrual (spec §10.7 step 6)
+        self.funding_rate_e9_per_slot_last = 0;
         // Step 6: final accrual at resolved price with zero funding
         self.accrue_market_to(now_slot, resolved_price)?;
 
@@ -4556,6 +4592,9 @@ impl RiskEngine {
     }
 
     pub fn force_close_resolved_not_atomic(&mut self, idx: u16, resolved_slot: u64) -> Result<u128> {
+        if self.market_mode != MarketMode::Resolved {
+            return Err(RiskError::Unauthorized);
+        }
         if idx as usize >= MAX_ACCOUNTS || !self.is_used(idx as usize) {
             return Err(RiskError::AccountNotFound);
         }
@@ -4621,8 +4660,11 @@ impl RiskEngine {
             }
 
             // Phase 2: MUTATE (all validated, safe to commit)
+            self.prepare_account_for_resolved_touch(i);
             if pnl_delta != 0 {
                 self.set_pnl(i, new_pnl);
+                // In resolved mode all positive PnL is immediately matured
+                self.pnl_matured_pos_tot = self.pnl_pos_tot;
             }
 
             // Decrement stale count (pre-validated above)
@@ -4674,16 +4716,9 @@ impl RiskEngine {
         // inherent to the haircut model, not a force_close-specific issue.
         // No engine-native maintenance fee in v12.14.0 (spec §8).
         if self.accounts[i].pnl > 0 {
-            // Release all reserves unconditionally (bypass warmup).
-            // Inline set_reserved_pnl(i, 0): mature all reserved PnL.
-            let old_r = self.accounts[i].reserved_pnl;
-            if old_r > 0 {
-                self.pnl_matured_pos_tot = self.pnl_matured_pos_tot.checked_add(old_r)
-                    .expect("force_close: pnl_matured_pos_tot overflow");
-                assert!(self.pnl_matured_pos_tot <= self.pnl_pos_tot,
-                    "force_close: pnl_matured_pos_tot > pnl_pos_tot");
-                self.accounts[i].reserved_pnl = 0;
-            }
+            // Release all reserves via prepare_account_for_resolved_touch (does NOT
+            // adjust pnl_matured_pos_tot — resolve_market already matured everything).
+            self.prepare_account_for_resolved_touch(i);
             // Convert using post-release haircut
             let released = self.released_pos(i);
             if released > 0 {
@@ -4726,6 +4761,9 @@ impl RiskEngine {
     /// Spec §10.7: MUST NOT call accrue_market_to, MUST NOT mutate side state,
     /// MUST NOT materialize any account.
     pub fn reclaim_empty_account_not_atomic(&mut self, idx: u16, now_slot: u64) -> Result<()> {
+        if self.market_mode != MarketMode::Live {
+            return Err(RiskError::Unauthorized);
+        }
         if idx as usize >= MAX_ACCOUNTS || !self.is_used(idx as usize) {
             return Err(RiskError::AccountNotFound);
         }
@@ -4857,29 +4895,15 @@ impl RiskEngine {
     }
     }
 
-    // ========================================================================
-    // Crank freshness
-    // ========================================================================
-
-    fn require_fresh_crank(&self, now_slot: u64) -> Result<()> {
-        if now_slot.saturating_sub(self.last_crank_slot) > self.max_crank_staleness_slots {
-            return Err(RiskError::Unauthorized);
-        }
-        Ok(())
-    }
-
-    fn require_recent_full_sweep(&self, now_slot: u64) -> Result<()> {
-        if now_slot.saturating_sub(self.last_full_sweep_start_slot) > self.max_crank_staleness_slots {
-            return Err(RiskError::Unauthorized);
-        }
-        Ok(())
-    }
 
     // ========================================================================
     // Insurance fund operations
     // ========================================================================
 
     pub fn top_up_insurance_fund(&mut self, amount: u128, now_slot: u64) -> Result<bool> {
+        if self.market_mode != MarketMode::Live {
+            return Err(RiskError::Unauthorized);
+        }
         // Spec §10.3.2: time monotonicity
         if now_slot < self.current_slot {
             return Err(RiskError::Overflow);
@@ -4907,6 +4931,9 @@ impl RiskEngine {
     // ========================================================================
 
     pub fn deposit_fee_credits(&mut self, idx: u16, amount: u128, now_slot: u64) -> Result<()> {
+        if self.market_mode != MarketMode::Live {
+            return Err(RiskError::Unauthorized);
+        }
         if idx as usize >= MAX_ACCOUNTS || !self.is_used(idx as usize) {
             return Err(RiskError::Unauthorized);
         }
