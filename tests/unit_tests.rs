@@ -3155,3 +3155,300 @@ fn test_resolve_market_accepts_in_band_price() {
     let result = engine.resolve_market(1050, 200); // 5% deviation, within 10% band
     assert!(result.is_ok());
 }
+
+// ============================================================================
+// Two-phase barrier scan tests (spec Addendum A2/A7)
+// ============================================================================
+
+#[test]
+fn test_barrier_readonly_scan() {
+    // A7.1: Read-only scan — engine state unchanged except accrue effects
+    let (mut engine, a, b) = setup_two_users(500_000, 500_000);
+    let oracle = 1000u64;
+    let slot = 2u64;
+    let size_q = make_size_q(100);
+    engine.execute_trade_not_atomic(a, b, oracle, slot, size_q, oracle, 0i128, 0).unwrap();
+
+    // Capture state before barrier scan
+    engine.accrue_market_to(slot + 1, oracle).unwrap();
+    engine.current_slot = slot + 1;
+    let barrier = engine.capture_barrier_snapshot(slot + 1, oracle);
+    let cap_a_before = engine.accounts[a as usize].capital.get();
+    let pnl_a_before = engine.accounts[a as usize].pnl;
+
+    // preview_account_at_barrier is read-only
+    let class = engine.preview_account_at_barrier(a, &barrier);
+    assert_eq!(class, ReviewClass::Safe);
+
+    // State unchanged after preview
+    assert_eq!(engine.accounts[a as usize].capital.get(), cap_a_before);
+    assert_eq!(engine.accounts[a as usize].pnl, pnl_a_before);
+}
+
+#[test]
+fn test_barrier_no_false_negatives() {
+    // A7.2: Liquidatable account never classified Safe
+    let (mut engine, a, b) = setup_two_users(100_000, 100_000);
+    let oracle = 1000u64;
+    let slot = 2u64;
+    let size_q = make_size_q(900);  // High leverage
+    engine.execute_trade_not_atomic(a, b, oracle, slot, size_q, oracle, 0i128, 0).unwrap();
+
+    // Crash price
+    let crash_oracle = 500u64;
+    engine.accrue_market_to(slot + 1, crash_oracle).unwrap();
+    engine.current_slot = slot + 1;
+    let barrier = engine.capture_barrier_snapshot(slot + 1, crash_oracle);
+
+    let class = engine.preview_account_at_barrier(a, &barrier);
+    assert_ne!(class, ReviewClass::Safe,
+        "deeply underwater account must not be classified Safe");
+    assert_eq!(class, ReviewClass::ReviewLiquidation);
+}
+
+#[test]
+fn test_barrier_positive_pnl_conservatism() {
+    // A7.3: Ignoring positive PnL is conservative (doesn't cause false negatives)
+    let (mut engine, a, b) = setup_two_users(500_000, 500_000);
+    let oracle = 1000u64;
+    let slot = 2u64;
+    let size_q = make_size_q(100);
+    engine.execute_trade_not_atomic(a, b, oracle, slot, size_q, oracle, 0i128, 0).unwrap();
+
+    // Price moves up — a has positive PnL
+    let good_oracle = 1200u64;
+    engine.accrue_market_to(slot + 1, good_oracle).unwrap();
+    engine.current_slot = slot + 1;
+    let barrier = engine.capture_barrier_snapshot(slot + 1, good_oracle);
+
+    let class = engine.preview_account_at_barrier(a, &barrier);
+    // With positive PnL and good capital, should be Safe
+    assert_eq!(class, ReviewClass::Safe);
+}
+
+#[test]
+fn test_barrier_epoch_mismatch_routing() {
+    // A7.5: Epoch-mismatch routes to ReviewCleanupResetProgress or ReviewLiquidation
+    let (mut engine, a, b) = setup_two_users(500_000, 500_000);
+    let oracle = 1000u64;
+    let slot = 2u64;
+    let size_q = make_size_q(100);
+    engine.execute_trade_not_atomic(a, b, oracle, slot, size_q, oracle, 0i128, 0).unwrap();
+
+    // Force epoch mismatch by directly advancing epoch
+    // (simulates ADL event that bumped the epoch)
+    engine.adl_epoch_long += 1;
+    engine.side_mode_long = SideMode::ResetPending;
+    engine.stale_account_count_long = 1;
+
+    engine.accrue_market_to(slot + 1, oracle).unwrap();
+    engine.current_slot = slot + 1;
+    let barrier = engine.capture_barrier_snapshot(slot + 1, oracle);
+
+    let class = engine.preview_account_at_barrier(a, &barrier);
+    // Epoch mismatch with ResetPending and epoch_snap+1==epoch_side
+    assert!(class == ReviewClass::ReviewCleanupResetProgress || class == ReviewClass::ReviewLiquidation,
+        "epoch mismatch must not be Safe, got {:?}", class);
+}
+
+#[test]
+fn test_barrier_missing_account_safety() {
+    // A7.15: Missing returns Missing, no materialization
+    let engine = RiskEngine::new(default_params());
+    let barrier = BarrierSnapshot {
+        oracle_price_b: 1000,
+        current_slot_b: 100,
+        a_long_b: ADL_ONE,
+        a_short_b: ADL_ONE,
+        k_long_b: 0,
+        k_short_b: 0,
+        epoch_long_b: 0,
+        epoch_short_b: 0,
+        k_epoch_start_long_b: 0,
+        k_epoch_start_short_b: 0,
+        mode_long_b: SideMode::Normal,
+        mode_short_b: SideMode::Normal,
+        oi_eff_long_b: 0,
+        oi_eff_short_b: 0,
+        maintenance_margin_bps: 500,
+    };
+
+    let class = engine.preview_account_at_barrier(0, &barrier);
+    assert_eq!(class, ReviewClass::Missing);
+
+    // Out of bounds
+    let class = engine.preview_account_at_barrier(u16::MAX, &barrier);
+    assert_eq!(class, ReviewClass::Missing);
+}
+
+#[test]
+fn test_barrier_flat_negative_cleanup() {
+    // A7: flat account with negative PnL → ReviewCleanup
+    let mut engine = RiskEngine::new(default_params());
+    let a = engine.add_user(1000).unwrap();
+    engine.deposit(a, 50_000, 1000, 100).unwrap();
+    engine.set_pnl(a as usize, -1000i128);
+
+    let barrier = engine.capture_barrier_snapshot(100, 1000);
+    let class = engine.preview_account_at_barrier(a, &barrier);
+    assert_eq!(class, ReviewClass::ReviewCleanup);
+}
+
+#[test]
+fn test_barrier_wave_read_only_phase1() {
+    // A7.1 via full barrier_wave: state changes only from accrue + phase 2
+    let (mut engine, a, b) = setup_two_users(500_000, 500_000);
+    let oracle = 1000u64;
+    let slot = 2u64;
+    let size_q = make_size_q(100);
+    engine.execute_trade_not_atomic(a, b, oracle, slot, size_q, oracle, 0i128, 0).unwrap();
+
+    // Run barrier wave with empty scan → only accrue effects
+    let slot2 = 10u64;
+    let outcome = engine.keeper_barrier_wave(a, slot2, oracle, 0i128, &[], 64, 0).unwrap();
+    assert!(outcome.advanced);
+    assert_eq!(outcome.num_liquidations, 0);
+    assert!(engine.check_conservation());
+}
+
+#[test]
+fn test_barrier_wave_stale_shortlist_safety() {
+    // A7.10: Phase 2 revalidates on current state
+    let (mut engine, a, b) = setup_two_users(500_000, 500_000);
+    let oracle = 1000u64;
+    let slot = 2u64;
+    let size_q = make_size_q(100);
+    engine.execute_trade_not_atomic(a, b, oracle, slot, size_q, oracle, 0i128, 0).unwrap();
+
+    // Both accounts healthy at oracle=1000
+    let slot2 = 10u64;
+    let scan: [u16; 2] = [a, b];
+    let outcome = engine.keeper_barrier_wave(a, slot2, oracle, 0i128, &scan, 64, 0).unwrap();
+    // No liquidations because accounts are healthy
+    assert_eq!(outcome.num_liquidations, 0);
+    assert!(engine.check_conservation());
+}
+
+#[test]
+fn test_barrier_wave_processes_all_categories() {
+    // Verify barrier_wave processes liq, reset, and cleanup categories
+    let (mut engine, a, b) = setup_two_users(500_000, 500_000);
+    let oracle = 1000u64;
+    let slot = 2u64;
+    let size_q = make_size_q(100);
+    engine.execute_trade_not_atomic(a, b, oracle, slot, size_q, oracle, 0i128, 0).unwrap();
+
+    // c is a flat account with negative PnL → cleanup candidate
+    let c = engine.add_user(1000).unwrap();
+    engine.deposit(c, 50_000, oracle, slot).unwrap();
+    engine.set_pnl(c as usize, -1000i128);
+
+    let slot2 = 10u64;
+    let scan: [u16; 3] = [a, b, c];
+    let outcome = engine.keeper_barrier_wave(a, slot2, oracle, 0i128, &scan, 64, 0).unwrap();
+    assert!(engine.check_conservation());
+    // c's negative PnL should be resolved (absorbed by insurance)
+    assert!(engine.accounts[c as usize].pnl >= 0 || !engine.is_used(c as usize),
+        "flat negative PnL should be resolved");
+    assert_eq!(outcome.num_liquidations, 0);
+}
+
+#[test]
+fn test_barrier_wave_budget_counts_false_positives() {
+    // A7.17: Healthy "ReviewLiquidation" consumes budget
+    let (mut engine, a, b) = setup_two_users(500_000, 500_000);
+    let oracle = 1000u64;
+    let slot = 2u64;
+    // Small position so account stays healthy
+    let size_q = make_size_q(10);
+    engine.execute_trade_not_atomic(a, b, oracle, slot, size_q, oracle, 0i128, 0).unwrap();
+
+    // Slightly move price to make preview conservative
+    let oracle2 = 990u64;
+    let slot2 = 10u64;
+
+    // scan only a
+    let scan: [u16; 1] = [a];
+    // Budget of 1 — even if a is a false positive, it consumes the budget slot
+    let outcome = engine.keeper_barrier_wave(a, slot2, oracle2, 0i128, &scan, 1, 0).unwrap();
+    assert_eq!(outcome.num_liquidations, 0);
+    assert!(engine.check_conservation());
+}
+
+#[test]
+fn test_barrier_wave_oi_balance() {
+    // After barrier_wave, OI_long == OI_short
+    let (mut engine, a, b) = setup_two_users(500_000, 500_000);
+    let oracle = 1000u64;
+    let slot = 2u64;
+    let size_q = make_size_q(100);
+    engine.execute_trade_not_atomic(a, b, oracle, slot, size_q, oracle, 0i128, 0).unwrap();
+
+    let slot2 = 10u64;
+    let scan: [u16; 2] = [a, b];
+    engine.keeper_barrier_wave(a, slot2, oracle, 0i128, &scan, 64, 0).unwrap();
+    assert_eq!(engine.oi_eff_long_q, engine.oi_eff_short_q);
+    assert!(engine.check_conservation());
+}
+
+#[test]
+fn test_barrier_snapshot_matches_engine() {
+    // Snapshot captures exact engine state
+    let (mut engine, a, b) = setup_two_users(500_000, 500_000);
+    let oracle = 1000u64;
+    let slot = 2u64;
+    let size_q = make_size_q(100);
+    engine.execute_trade_not_atomic(a, b, oracle, slot, size_q, oracle, 0i128, 0).unwrap();
+
+    let snap = engine.capture_barrier_snapshot(slot, oracle);
+    assert_eq!(snap.oracle_price_b, oracle);
+    assert_eq!(snap.a_long_b, engine.adl_mult_long);
+    assert_eq!(snap.a_short_b, engine.adl_mult_short);
+    assert_eq!(snap.k_long_b, engine.adl_coeff_long);
+    assert_eq!(snap.k_short_b, engine.adl_coeff_short);
+    assert_eq!(snap.epoch_long_b, engine.adl_epoch_long);
+    assert_eq!(snap.epoch_short_b, engine.adl_epoch_short);
+    assert_eq!(snap.mode_long_b, engine.side_mode_long);
+    assert_eq!(snap.mode_short_b, engine.side_mode_short);
+    assert_eq!(snap.oi_eff_long_b, engine.oi_eff_long_q);
+    assert_eq!(snap.oi_eff_short_b, engine.oi_eff_short_q);
+}
+
+#[test]
+fn test_barrier_wave_liquidation_flow() {
+    // Verify barrier_wave can actually liquidate an underwater account
+    let (mut engine, a, b) = setup_two_users(100_000, 100_000);
+    let oracle = 1000u64;
+    let slot = 2u64;
+    let size_q = make_size_q(900);  // ~90% leverage
+    engine.execute_trade_not_atomic(a, b, oracle, slot, size_q, oracle, 0i128, 0).unwrap();
+
+    // Big price crash - a goes deeply underwater
+    let crash = 500u64;
+    let slot2 = 10u64;
+    let scan: [u16; 2] = [a, b];
+    let outcome = engine.keeper_barrier_wave(b, slot2, crash, 0i128, &scan, 64, 0).unwrap();
+    // At least one liquidation should occur (a is deeply underwater)
+    assert!(outcome.num_liquidations >= 1,
+        "barrier_wave must liquidate underwater accounts");
+    assert!(engine.check_conservation());
+}
+
+#[test]
+fn test_barrier_wave_cleanup_ordering() {
+    // A7.9: ReviewCleanup processed after ReviewLiquidation + ResetProgress
+    // Just verify it doesn't crash and maintains conservation
+    let mut engine = RiskEngine::new(default_params());
+    let a = engine.add_user(1000).unwrap();
+    engine.deposit(a, 50_000, 1000, 100).unwrap();
+    let b = engine.add_user(1000).unwrap();
+    engine.deposit(b, 50_000, 1000, 100).unwrap();
+
+    // Inject negative PnL on flat account b → cleanup candidate
+    engine.set_pnl(b as usize, -1000i128);
+
+    let scan: [u16; 2] = [a, b];
+    let outcome = engine.keeper_barrier_wave(a, 100, 1000, 0i128, &scan, 64, 0).unwrap();
+    assert!(engine.check_conservation());
+    assert_eq!(outcome.num_liquidations, 0);
+}

@@ -517,6 +517,61 @@ pub struct CrankOutcome {
 }
 
 // ============================================================================
+// Two-phase barrier scan types (spec Addendum A2)
+// ============================================================================
+
+/// Classification result from phase-1 barrier scan (spec §A2.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewClass {
+    Safe,
+    ReviewLiquidation,
+    ReviewCleanupResetProgress,
+    ReviewCleanup,
+    Missing,
+}
+
+/// Frozen market snapshot for phase-1 read-only scan (spec §A2.0).
+#[derive(Clone, Copy, Debug)]
+pub struct BarrierSnapshot {
+    pub oracle_price_b: u64,
+    pub current_slot_b: u64,
+    pub a_long_b: u128,
+    pub a_short_b: u128,
+    pub k_long_b: i128,
+    pub k_short_b: i128,
+    pub epoch_long_b: u64,
+    pub epoch_short_b: u64,
+    pub k_epoch_start_long_b: i128,
+    pub k_epoch_start_short_b: i128,
+    pub mode_long_b: SideMode,
+    pub mode_short_b: SideMode,
+    pub oi_eff_long_b: u128,
+    pub oi_eff_short_b: u128,
+    pub maintenance_margin_bps: u64,
+}
+
+impl BarrierSnapshot {
+    pub fn a_side(&self, s: Side) -> u128 {
+        match s { Side::Long => self.a_long_b, Side::Short => self.a_short_b }
+    }
+    pub fn k_side(&self, s: Side) -> i128 {
+        match s { Side::Long => self.k_long_b, Side::Short => self.k_short_b }
+    }
+    pub fn epoch_side(&self, s: Side) -> u64 {
+        match s { Side::Long => self.epoch_long_b, Side::Short => self.epoch_short_b }
+    }
+    pub fn k_epoch_start_side(&self, s: Side) -> i128 {
+        match s { Side::Long => self.k_epoch_start_long_b, Side::Short => self.k_epoch_start_short_b }
+    }
+    pub fn mode_side(&self, s: Side) -> SideMode {
+        match s { Side::Long => self.mode_long_b, Side::Short => self.mode_short_b }
+    }
+    pub fn oi_eff_side(&self, s: Side) -> u128 {
+        match s { Side::Long => self.oi_eff_long_b, Side::Short => self.oi_eff_short_b }
+    }
+}
+
+// ============================================================================
 // Small Helpers
 // ============================================================================
 
@@ -4265,6 +4320,355 @@ impl RiskEngine {
             }
         }
     }
+    }
+
+    // ========================================================================
+    // Two-phase barrier scan (spec Addendum A2)
+    // ========================================================================
+
+    /// Capture a frozen barrier snapshot of market-level state (spec §A2.0).
+    /// Pure &self reader. Called after accrue_market_to.
+    test_visible! {
+    fn capture_barrier_snapshot(&self, now_slot: u64, oracle_price: u64) -> BarrierSnapshot {
+        BarrierSnapshot {
+            oracle_price_b: oracle_price,
+            current_slot_b: now_slot,
+            a_long_b: self.adl_mult_long,
+            a_short_b: self.adl_mult_short,
+            k_long_b: self.adl_coeff_long,
+            k_short_b: self.adl_coeff_short,
+            epoch_long_b: self.adl_epoch_long,
+            epoch_short_b: self.adl_epoch_short,
+            k_epoch_start_long_b: self.adl_epoch_start_k_long,
+            k_epoch_start_short_b: self.adl_epoch_start_k_short,
+            mode_long_b: self.side_mode_long,
+            mode_short_b: self.side_mode_short,
+            oi_eff_long_b: self.oi_eff_long_q,
+            oi_eff_short_b: self.oi_eff_short_q,
+            maintenance_margin_bps: self.params.maintenance_margin_bps,
+        }
+    }
+    }
+
+    /// Read-only classifier: classify account against frozen barrier (spec §A2.1 + §A3).
+    test_visible! {
+    fn preview_account_at_barrier(&self, idx: u16, barrier: &BarrierSnapshot) -> ReviewClass {
+        let i = idx as usize;
+        if i >= MAX_ACCOUNTS || !self.is_used(i) {
+            return ReviewClass::Missing;
+        }
+
+        let basis = self.accounts[i].position_basis_q;
+
+        // Flat account (basis == 0)
+        if basis == 0 {
+            if self.accounts[i].pnl < 0 {
+                return ReviewClass::ReviewCleanup;
+            }
+            return ReviewClass::Safe;
+        }
+
+        // Open position
+        let side = match side_of_i128(basis) {
+            Some(s) => s,
+            None => return ReviewClass::ReviewLiquidation, // defensive
+        };
+        let abs_basis = basis.unsigned_abs();
+        let a_basis = self.accounts[i].adl_a_basis;
+        if a_basis == 0 {
+            return ReviewClass::ReviewLiquidation; // corrupt → conservative
+        }
+
+        let epoch_snap = self.accounts[i].adl_epoch_snap;
+        let epoch_side = barrier.epoch_side(side);
+
+        if epoch_snap == epoch_side {
+            // Same epoch: compute q_eff, pnl_delta, virtual equity lower bound
+            let a_side = barrier.a_side(side);
+            let q_eff_abs = mul_div_floor_u128(abs_basis, a_side, a_basis);
+
+            if q_eff_abs == 0 {
+                // Dust-zero: effective position is zero
+                let mode_s = barrier.mode_side(side);
+                if mode_s == SideMode::ResetPending {
+                    return ReviewClass::ReviewCleanupResetProgress;
+                }
+                return ReviewClass::ReviewCleanup;
+            }
+
+            // Compute pnl_delta using barrier K values
+            let k_side = barrier.k_side(side);
+            let k_snap = self.accounts[i].adl_k_snap;
+            let den = match a_basis.checked_mul(POS_SCALE) {
+                Some(d) if d > 0 => d,
+                _ => return ReviewClass::ReviewLiquidation, // overflow → conservative
+            };
+            let pnl_delta = wide_signed_mul_div_floor_from_k_pair(abs_basis, k_snap, k_side, den);
+
+            let pnl_virtual = match self.accounts[i].pnl.checked_add(pnl_delta) {
+                Some(v) => v,
+                None => return ReviewClass::ReviewLiquidation, // overflow → conservative
+            };
+
+            // Conservative equity lower bound: ignore positive PnL, use fee_debt upper bound
+            let capital = self.accounts[i].capital.get();
+            let fee_debt = fee_debt_u128_checked(self.accounts[i].fee_credits.get());
+            // eq_lb = max(0, C + min(pnl_virtual, 0) - fee_debt)
+            let pnl_neg_part = if pnl_virtual < 0 {
+                pnl_virtual.unsigned_abs()
+            } else {
+                0u128
+            };
+            let eq_lb = capital.saturating_sub(pnl_neg_part).saturating_sub(fee_debt);
+
+            // MM requirement
+            let notional = mul_div_floor_u128(q_eff_abs, barrier.oracle_price_b as u128, POS_SCALE);
+            let mm_req = core::cmp::max(
+                mul_div_floor_u128(notional, barrier.maintenance_margin_bps as u128, 10_000),
+                self.params.min_nonzero_mm_req,
+            );
+
+            if eq_lb <= mm_req {
+                return ReviewClass::ReviewLiquidation;
+            }
+            return ReviewClass::Safe;
+        }
+
+        // Epoch mismatch
+        let mode_s = barrier.mode_side(side);
+        if mode_s == SideMode::ResetPending {
+            if epoch_snap.checked_add(1) == Some(epoch_side) {
+                return ReviewClass::ReviewCleanupResetProgress;
+            }
+        }
+        // Any other epoch mismatch → conservative
+        ReviewClass::ReviewLiquidation
+    }
+    }
+
+    /// Two-phase keeper barrier wave (spec Addendum A2).
+    /// Phase 1: read-only scan to classify accounts.
+    /// Phase 2: bounded exact-state processing of shortlisted accounts.
+    pub fn keeper_barrier_wave(
+        &mut self,
+        caller_idx: u16,
+        now_slot: u64,
+        oracle_price: u64,
+        funding_rate_e9: i128,
+        scan_window: &[u16],
+        max_phase2_revalidations: u16,
+        h_lock: u64,
+    ) -> Result<CrankOutcome> {
+        Self::validate_funding_rate_e9(funding_rate_e9)?;
+
+        if oracle_price == 0 || oracle_price > MAX_ORACLE_PRICE {
+            return Err(RiskError::Overflow);
+        }
+
+        // Step 1: initialize instruction context
+        let mut ctx = InstructionContext::new_with_h_lock(h_lock);
+
+        // Steps 2-4: validate inputs
+        if now_slot < self.current_slot {
+            return Err(RiskError::Overflow);
+        }
+        if now_slot < self.last_market_slot {
+            return Err(RiskError::Overflow);
+        }
+
+        // Step 5: accrue_market_to exactly once
+        self.accrue_market_to(now_slot, oracle_price)?;
+        self.current_slot = now_slot;
+
+        let advanced = now_slot > self.last_crank_slot;
+        if advanced {
+            self.last_crank_slot = now_slot;
+        }
+
+        // Step 6: capture barrier snapshot
+        let barrier = self.capture_barrier_snapshot(now_slot, oracle_price);
+
+        // Phase 1: read-only scan — classify accounts into buckets
+        let mut review_liq: [u16; MAX_ACCOUNTS] = [0; MAX_ACCOUNTS];
+        let mut review_liq_count: usize = 0;
+        let mut review_reset: [u16; MAX_ACCOUNTS] = [0; MAX_ACCOUNTS];
+        let mut review_reset_count: usize = 0;
+        let mut review_cleanup: [u16; MAX_ACCOUNTS] = [0; MAX_ACCOUNTS];
+        let mut review_cleanup_count: usize = 0;
+
+        for &candidate_idx in scan_window {
+            let class = self.preview_account_at_barrier(candidate_idx, &barrier);
+            match class {
+                ReviewClass::ReviewLiquidation => {
+                    if review_liq_count < MAX_ACCOUNTS {
+                        review_liq[review_liq_count] = candidate_idx;
+                        review_liq_count += 1;
+                    }
+                }
+                ReviewClass::ReviewCleanupResetProgress => {
+                    if review_reset_count < MAX_ACCOUNTS {
+                        review_reset[review_reset_count] = candidate_idx;
+                        review_reset_count += 1;
+                    }
+                }
+                ReviewClass::ReviewCleanup => {
+                    if review_cleanup_count < MAX_ACCOUNTS {
+                        review_cleanup[review_cleanup_count] = candidate_idx;
+                        review_cleanup_count += 1;
+                    }
+                }
+                ReviewClass::Safe | ReviewClass::Missing => {
+                    // Skip
+                }
+            }
+        }
+
+        // Phase 2: bounded exact-state processing
+        let mut attempts: u16 = 0;
+        let mut num_liquidations: u32 = 0;
+
+        // Reserve 1 revalidation slot for reset-progress if any exist
+        let reserve_for_reset = if review_reset_count > 0 { 1u16 } else { 0u16 };
+
+        // 2a: process review_liq (reserving 1 slot for reset-progress)
+        'phase2: {
+            let liq_budget = max_phase2_revalidations.saturating_sub(reserve_for_reset);
+            let mut liq_idx = 0usize;
+
+            while liq_idx < review_liq_count {
+                if attempts >= liq_budget { break; }
+                if ctx.pending_reset_long || ctx.pending_reset_short { break 'phase2; }
+
+                let cidx = review_liq[liq_idx] as usize;
+                liq_idx += 1;
+
+                if cidx >= MAX_ACCOUNTS || !self.is_used(cidx) { continue; }
+                attempts += 1;
+
+                // Exact touch + revalidate
+                self.advance_profit_warmup_cohort(cidx);
+                self.settle_side_effects_with_h_lock(cidx, h_lock)?;
+                self.settle_losses(cidx);
+                if self.effective_pos_q(cidx) == 0 && self.accounts[cidx].pnl < 0 {
+                    self.resolve_flat_negative(cidx);
+                }
+                self.fee_debt_sweep(cidx);
+
+                // Check if still liquidatable after exact touch
+                let eff = self.effective_pos_q(cidx);
+                if eff != 0 && !self.is_above_maintenance_margin(&self.accounts[cidx], cidx, oracle_price) {
+                    match self.liquidate_at_oracle_internal(review_liq[liq_idx - 1], now_slot, oracle_price, LiquidationPolicy::FullClose, &mut ctx) {
+                        Ok(true) => { num_liquidations += 1; }
+                        Ok(false) => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+
+            // 2b: process reserved reset-progress candidate
+            if review_reset_count > 0 && attempts < max_phase2_revalidations {
+                if ctx.pending_reset_long || ctx.pending_reset_short { break 'phase2; }
+
+                let cidx = review_reset[0] as usize;
+                if cidx < MAX_ACCOUNTS && self.is_used(cidx) {
+                    attempts += 1;
+                    self.advance_profit_warmup_cohort(cidx);
+                    self.settle_side_effects_with_h_lock(cidx, h_lock)?;
+                    self.settle_losses(cidx);
+                    if self.effective_pos_q(cidx) == 0 && self.accounts[cidx].pnl < 0 {
+                        self.resolve_flat_negative(cidx);
+                    }
+                    self.fee_debt_sweep(cidx);
+                }
+            }
+
+            // 2c: continue remaining review_liq
+            while liq_idx < review_liq_count {
+                if attempts >= max_phase2_revalidations { break; }
+                if ctx.pending_reset_long || ctx.pending_reset_short { break 'phase2; }
+
+                let cidx = review_liq[liq_idx] as usize;
+                liq_idx += 1;
+
+                if cidx >= MAX_ACCOUNTS || !self.is_used(cidx) { continue; }
+                attempts += 1;
+
+                self.advance_profit_warmup_cohort(cidx);
+                self.settle_side_effects_with_h_lock(cidx, h_lock)?;
+                self.settle_losses(cidx);
+                if self.effective_pos_q(cidx) == 0 && self.accounts[cidx].pnl < 0 {
+                    self.resolve_flat_negative(cidx);
+                }
+                self.fee_debt_sweep(cidx);
+
+                let eff = self.effective_pos_q(cidx);
+                if eff != 0 && !self.is_above_maintenance_margin(&self.accounts[cidx], cidx, oracle_price) {
+                    match self.liquidate_at_oracle_internal(review_liq[liq_idx - 1], now_slot, oracle_price, LiquidationPolicy::FullClose, &mut ctx) {
+                        Ok(true) => { num_liquidations += 1; }
+                        Ok(false) => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+
+            // 2d: process remaining review_reset
+            for ri in 1..review_reset_count {
+                if attempts >= max_phase2_revalidations { break; }
+                if ctx.pending_reset_long || ctx.pending_reset_short { break 'phase2; }
+
+                let cidx = review_reset[ri] as usize;
+                if cidx >= MAX_ACCOUNTS || !self.is_used(cidx) { continue; }
+                attempts += 1;
+
+                self.advance_profit_warmup_cohort(cidx);
+                self.settle_side_effects_with_h_lock(cidx, h_lock)?;
+                self.settle_losses(cidx);
+                if self.effective_pos_q(cidx) == 0 && self.accounts[cidx].pnl < 0 {
+                    self.resolve_flat_negative(cidx);
+                }
+                self.fee_debt_sweep(cidx);
+            }
+
+            // 2e: process review_cleanup
+            for ci in 0..review_cleanup_count {
+                if attempts >= max_phase2_revalidations { break; }
+                if ctx.pending_reset_long || ctx.pending_reset_short { break 'phase2; }
+
+                let cidx = review_cleanup[ci] as usize;
+                if cidx >= MAX_ACCOUNTS || !self.is_used(cidx) { continue; }
+                attempts += 1;
+
+                self.advance_profit_warmup_cohort(cidx);
+                self.settle_side_effects_with_h_lock(cidx, h_lock)?;
+                self.settle_losses(cidx);
+                if self.effective_pos_q(cidx) == 0 && self.accounts[cidx].pnl < 0 {
+                    self.resolve_flat_negative(cidx);
+                }
+                self.fee_debt_sweep(cidx);
+            }
+        } // 'phase2
+
+        // Finalize: GC, end-of-instruction resets, OI balance
+        self.garbage_collect_dust();
+        self.schedule_end_of_instruction_resets(&mut ctx)?;
+        self.finalize_end_of_instruction_resets(&ctx);
+        self.recompute_r_last_from_final_state(funding_rate_e9)?;
+
+        assert!(self.oi_eff_long_q == self.oi_eff_short_q,
+            "OI_eff_long != OI_eff_short after keeper_barrier_wave");
+
+        Ok(CrankOutcome {
+            advanced,
+            slots_forgiven: 0,
+            caller_settle_ok: true,
+            force_realize_needed: false,
+            panic_needed: false,
+            num_liquidations,
+            num_liq_errors: 0,
+            num_gc_closed: 0,
+            last_cursor: 0,
+            sweep_complete: false,
+        })
     }
 
     // ========================================================================
