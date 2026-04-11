@@ -2906,3 +2906,59 @@ fn test_prepare_account_for_resolved_touch() {
     assert!(!engine.accounts[idx as usize].overflow_newest_present);
 }
 
+
+#[test]
+fn test_advance_profit_warmup_cohort_exact_maturity() {
+    let mut engine = RiskEngine::new(default_params());
+    let idx = engine.add_user(1000).unwrap();
+    engine.deposit(idx, 100_000, 1000, 100).unwrap();
+    engine.current_slot = 100;
+
+    // Create a cohort: 10_000 reserve, horizon 100 slots, starting at slot 100
+    engine.accounts[idx as usize].pnl = 10_000;
+    engine.pnl_pos_tot = 10_000;
+    engine.append_or_route_new_reserve(idx as usize, 10_000, 100, 100);
+    assert_eq!(engine.accounts[idx as usize].reserved_pnl, 10_000);
+
+    // Advance 50 slots → should release floor(10_000 * 50 / 100) = 5_000
+    engine.current_slot = 150;
+    let matured_before = engine.pnl_matured_pos_tot;
+    engine.advance_profit_warmup_cohort(idx as usize);
+
+    let released = engine.pnl_matured_pos_tot - matured_before;
+    assert_eq!(released, 5_000, "50% of horizon should release 50% of reserve");
+    assert_eq!(engine.accounts[idx as usize].reserved_pnl, 5_000);
+
+    // Advance to full maturity (slot 200)
+    engine.current_slot = 200;
+    engine.advance_profit_warmup_cohort(idx as usize);
+
+    assert_eq!(engine.accounts[idx as usize].reserved_pnl, 0, "fully matured");
+    assert_eq!(engine.accounts[idx as usize].exact_cohort_count, 0, "empty cohort removed");
+}
+
+#[test]
+fn test_advance_profit_warmup_cohort_multiple_cohorts() {
+    let mut engine = RiskEngine::new(default_params());
+    let idx = engine.add_user(1000).unwrap();
+    engine.deposit(idx, 100_000, 1000, 100).unwrap();
+    engine.current_slot = 100;
+
+    // Two cohorts with different horizons
+    engine.accounts[idx as usize].pnl = 15_000;
+    engine.pnl_pos_tot = 15_000;
+    engine.append_or_route_new_reserve(idx as usize, 10_000, 100, 100); // 100-slot horizon
+    engine.append_or_route_new_reserve(idx as usize, 5_000, 100, 200);  // 200-slot horizon
+
+    assert_eq!(engine.accounts[idx as usize].exact_cohort_count, 2);
+    assert_eq!(engine.accounts[idx as usize].reserved_pnl, 15_000);
+
+    // At slot 200: first cohort fully matured, second cohort 50% matured
+    engine.current_slot = 200;
+    engine.advance_profit_warmup_cohort(idx as usize);
+
+    // First: 10_000 released. Second: floor(5_000 * 100/200) = 2_500 released.
+    // Total released: 12_500. Remaining: 2_500.
+    assert_eq!(engine.accounts[idx as usize].reserved_pnl, 2_500);
+    assert_eq!(engine.accounts[idx as usize].exact_cohort_count, 1, "fully matured cohort removed");
+}
