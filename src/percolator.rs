@@ -2184,6 +2184,73 @@ impl RiskEngine {
         eq_init_raw >= im_req_i128
     }
 
+    /// Eq_trade_open_raw_i (spec §3.5, v12.14.0): counterfactual trade approval
+    /// metric with the candidate trade's own positive slippage removed.
+    /// `candidate_trade_pnl` is the signed execution-slippage PnL for this account
+    /// from the candidate trade under evaluation.
+    pub fn account_equity_trade_open_raw(
+        &self, account: &Account, idx: usize, candidate_trade_pnl: i128
+    ) -> i128 {
+        let trade_gain = if candidate_trade_pnl > 0 { candidate_trade_pnl as u128 } else { 0u128 };
+
+        // PNL_trade_open_i = PNL_i - TradeGain
+        let pnl_trade_open = account.pnl.checked_sub(trade_gain as i128)
+            .unwrap_or(i128::MIN + 1);
+        let pos_pnl_trade_open = i128_clamp_pos(pnl_trade_open);
+
+        // Counterfactual global positive aggregate
+        let pos_pnl_i = i128_clamp_pos(account.pnl);
+        let pnl_pos_tot_trade_open = self.pnl_pos_tot
+            .checked_sub(pos_pnl_i).unwrap_or(0)
+            .checked_add(pos_pnl_trade_open).unwrap_or(self.pnl_pos_tot);
+
+        // Counterfactual haircut
+        let pnl_eff_trade_open = if pnl_pos_tot_trade_open == 0 {
+            pos_pnl_trade_open
+        } else {
+            let senior_sum = self.c_tot.get().checked_add(
+                self.insurance_fund.balance.get()).unwrap_or(u128::MAX);
+            let residual = if self.vault.get() >= senior_sum {
+                self.vault.get() - senior_sum
+            } else { 0u128 };
+            let g_num = core::cmp::min(residual, pnl_pos_tot_trade_open);
+            mul_div_floor_u128(pos_pnl_trade_open, g_num, pnl_pos_tot_trade_open)
+        };
+
+        // Eq_trade_open_base_i = C_i + min(PNL_trade_open, 0) + PNL_eff_trade_open
+        let cap = I256::from_u128(account.capital.get());
+        let neg_pnl = I256::from_i128(if pnl_trade_open < 0 { pnl_trade_open } else { 0i128 });
+        let eff = I256::from_u128(pnl_eff_trade_open);
+        let fee_debt = I256::from_u128(fee_debt_u128_checked(account.fee_credits.get()));
+
+        let result = cap.checked_add(neg_pnl).expect("I256 add")
+            .checked_add(eff).expect("I256 add")
+            .checked_sub(fee_debt).expect("I256 sub");
+
+        match result.try_into_i128() {
+            Some(v) => v,
+            None => if result.is_negative() { i128::MIN + 1 } else { i128::MAX },
+        }
+    }
+
+    /// is_above_initial_margin_trade_open (spec §9.1 + §3.5):
+    /// Uses Eq_trade_open_raw_i for risk-increasing trade approval.
+    pub fn is_above_initial_margin_trade_open(
+        &self, account: &Account, idx: usize, oracle_price: u64,
+        candidate_trade_pnl: i128,
+    ) -> bool {
+        let eq = self.account_equity_trade_open_raw(account, idx, candidate_trade_pnl);
+        let eff = self.effective_pos_q(idx);
+        if eff == 0 {
+            return eq >= 0;
+        }
+        let not = self.notional(idx, oracle_price);
+        let proportional = mul_div_floor_u128(not, self.params.initial_margin_bps as u128, 10_000);
+        let im_req = core::cmp::max(proportional, self.params.min_nonzero_im_req);
+        let im_req_i128 = if im_req > i128::MAX as u128 { i128::MAX } else { im_req as i128 };
+        eq >= im_req_i128
+    }
+
     // ========================================================================
     // Conservation check (spec §3.1)
     // ========================================================================
@@ -3349,6 +3416,7 @@ impl RiskEngine {
             a as usize, b as usize, oracle_price,
             &old_eff_a, &new_eff_a, &old_eff_b, &new_eff_b,
             buffer_pre_a, buffer_pre_b, fee_impact_a, fee_impact_b,
+            trade_pnl_a, trade_pnl_b,
         )?;
 
         // Steps 16-17: end-of-instruction resets
@@ -3474,9 +3542,11 @@ impl RiskEngine {
         buffer_pre_b: I256,
         fee_a: u128,
         fee_b: u128,
+        trade_pnl_a: i128,
+        trade_pnl_b: i128,
     ) -> Result<()> {
-        self.enforce_one_side_margin(a, oracle_price, old_eff_a, new_eff_a, buffer_pre_a, fee_a)?;
-        self.enforce_one_side_margin(b, oracle_price, old_eff_b, new_eff_b, buffer_pre_b, fee_b)?;
+        self.enforce_one_side_margin(a, oracle_price, old_eff_a, new_eff_a, buffer_pre_a, fee_a, trade_pnl_a)?;
+        self.enforce_one_side_margin(b, oracle_price, old_eff_b, new_eff_b, buffer_pre_b, fee_b, trade_pnl_b)?;
         Ok(())
     }
 
@@ -3488,6 +3558,7 @@ impl RiskEngine {
         new_eff: &i128,
         buffer_pre: I256,
         fee: u128,
+        candidate_trade_pnl: i128,
     ) -> Result<()> {
         if *new_eff == 0 {
             // v12.14.0 §10.5 step 29: flat-close guard uses exact Eq_maint_raw_i >= 0
@@ -3515,8 +3586,10 @@ impl RiskEngine {
             && abs_new < abs_old;
 
         if risk_increasing {
-            // Require initial-margin healthy using Eq_init_net_i
-            if !self.is_above_initial_margin(&self.accounts[idx], idx, oracle_price) {
+            // Require Eq_trade_open_raw_i >= IM_req (spec §3.5 + §9.1)
+            // Uses counterfactual equity with candidate trade's positive slippage removed
+            if !self.is_above_initial_margin_trade_open(
+                &self.accounts[idx], idx, oracle_price, candidate_trade_pnl) {
                 return Err(RiskError::Undercollateralized);
             }
         } else if self.is_above_maintenance_margin(&self.accounts[idx], idx, oracle_price) {
