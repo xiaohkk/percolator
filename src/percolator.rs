@@ -114,6 +114,10 @@ pub const MAX_LIQUIDATION_FEE_BPS: u64 = 10_000;
 pub const MAX_PROTOCOL_FEE_ABS: u128 = 1_000_000_000_000_000_000_000_000_000_000_000_000; // 10^36, spec §1.4
 
 // Reserve cohort queue bounds (spec §1.4)
+// Bounded to 3 under Kani per checklist §L — induction extends to 62 by hand.
+#[cfg(kani)]
+pub const MAX_EXACT_RESERVE_COHORTS_PER_ACCOUNT: usize = 3;
+#[cfg(not(kani))]
 pub const MAX_EXACT_RESERVE_COHORTS_PER_ACCOUNT: usize = 62;
 pub const MAX_OVERFLOW_RESERVE_SEGMENTS: usize = 2;
 pub const MAX_RESERVE_SEGMENTS_PER_ACCOUNT: usize =
