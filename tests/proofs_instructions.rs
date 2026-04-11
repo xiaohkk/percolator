@@ -44,10 +44,10 @@ fn t3_16_reset_pending_counter_invariant() {
     assert!(engine.side_mode_long == SideMode::ResetPending);
     assert!(engine.stale_account_count_long == 2);
 
-    let _ = engine.settle_side_effects(a as usize);
+    let _ = engine.settle_side_effects_with_h_lock(a as usize, 0);
     assert!(engine.stale_account_count_long == 1);
 
-    let _ = engine.settle_side_effects(b as usize);
+    let _ = engine.settle_side_effects_with_h_lock(b as usize, 0);
     assert!(engine.stale_account_count_long == 0);
 }
 
@@ -85,9 +85,9 @@ fn t3_16b_reset_counter_with_nonzero_k_diff() {
     assert!(engine.adl_epoch_start_k_long == k_long);
     assert!(engine.stale_account_count_long == 2);
 
-    let _ = engine.settle_side_effects(a as usize);
+    let _ = engine.settle_side_effects_with_h_lock(a as usize, 0);
     assert!(engine.stale_account_count_long == 1);
-    let _ = engine.settle_side_effects(b as usize);
+    let _ = engine.settle_side_effects_with_h_lock(b as usize, 0);
     assert!(engine.stale_account_count_long == 0);
 }
 
@@ -174,7 +174,7 @@ fn t6_26b_full_drain_reset_nonzero_k_diff() {
     assert!(engine.adl_epoch_long == 1);
     assert!(engine.stale_account_count_long == 1);
 
-    let result = engine.settle_side_effects(idx as usize);
+    let result = engine.settle_side_effects_with_h_lock(idx as usize, 0);
     assert!(result.is_ok());
 
     assert!(engine.accounts[idx as usize].position_basis_q == 0);
@@ -203,7 +203,6 @@ fn t9_35_warmup_release_monotone_in_time() {
     let pnl_val: u8 = kani::any();
     kani::assume(pnl_val > 0);
     engine.set_pnl(idx as usize, pnl_val as i128);
-    engine.restart_warmup_after_reserve_increase(idx as usize);
 
     let r_initial = engine.accounts[idx as usize].reserved_pnl;
 
@@ -214,13 +213,13 @@ fn t9_35_warmup_release_monotone_in_time() {
     // Compute release at t1 on a clone
     let mut e1 = engine.clone();
     e1.current_slot = t1 as u64;
-    e1.advance_profit_warmup(idx as usize);
+    e1.advance_profit_warmup_cohort(idx as usize);
     let released1 = r_initial - e1.accounts[idx as usize].reserved_pnl;
 
     // Compute release at t2 on another clone
     let mut e2 = engine;
     e2.current_slot = t2 as u64;
-    e2.advance_profit_warmup(idx as usize);
+    e2.advance_profit_warmup_cohort(idx as usize);
     let released2 = r_initial - e2.accounts[idx as usize].reserved_pnl;
 
     assert!(released2 >= released1, "warmup release must be monotone non-decreasing in time");
@@ -250,7 +249,7 @@ fn t9_36_fee_seniority_after_restart() {
     engine.stale_account_count_long = 1;
     engine.adl_coeff_long = 0i128;
 
-    let _ = engine.settle_side_effects(idx as usize);
+    let _ = engine.settle_side_effects_with_h_lock(idx as usize, 0);
 
     let fc_after = engine.accounts[idx as usize].fee_credits;
     assert!(fc_after == fc_before, "fee_credits must be preserved across epoch restart");
@@ -373,12 +372,12 @@ fn t11_39_same_epoch_settle_idempotent_real_engine() {
 
     engine.adl_coeff_long = 100i128;
 
-    let r1 = engine.settle_side_effects(idx as usize);
+    let r1 = engine.settle_side_effects_with_h_lock(idx as usize, 0);
     assert!(r1.is_ok());
     let pnl_after_first = engine.accounts[idx as usize].pnl;
     assert!(engine.accounts[idx as usize].adl_k_snap == 100i128);
 
-    let r2 = engine.settle_side_effects(idx as usize);
+    let r2 = engine.settle_side_effects_with_h_lock(idx as usize, 0);
     assert!(r2.is_ok());
     let pnl_after_second = engine.accounts[idx as usize].pnl;
 
@@ -405,14 +404,14 @@ fn t11_40_non_compounding_quantity_basis_two_touches() {
     engine.oi_eff_long_q = POS_SCALE;
 
     engine.adl_coeff_long = 50i128;
-    let _ = engine.settle_side_effects(idx as usize);
+    let _ = engine.settle_side_effects_with_h_lock(idx as usize, 0);
 
     assert!(engine.accounts[idx as usize].position_basis_q == pos);
     assert!(engine.accounts[idx as usize].adl_a_basis == ADL_ONE);
     assert!(engine.accounts[idx as usize].adl_k_snap == 50i128);
 
     engine.adl_coeff_long = 120i128;
-    let _ = engine.settle_side_effects(idx as usize);
+    let _ = engine.settle_side_effects_with_h_lock(idx as usize, 0);
 
     assert!(engine.accounts[idx as usize].position_basis_q == pos);
     assert!(engine.accounts[idx as usize].adl_a_basis == ADL_ONE);
@@ -478,11 +477,11 @@ fn t11_42_dynamic_dust_bound_inductive() {
 
     engine.adl_mult_long = 1;
 
-    let _ = engine.settle_side_effects(a as usize);
+    let _ = engine.settle_side_effects_with_h_lock(a as usize, 0);
     assert!(engine.accounts[a as usize].position_basis_q == 0);
     assert!(engine.phantom_dust_bound_long_q == 1u128);
 
-    let _ = engine.settle_side_effects(b as usize);
+    let _ = engine.settle_side_effects_with_h_lock(b as usize, 0);
     assert!(engine.accounts[b as usize].position_basis_q == 0);
     assert!(engine.phantom_dust_bound_long_q == 2u128);
 }
@@ -544,9 +543,7 @@ fn t11_51_execute_trade_slippage_zero_sum() {
 #[kani::proof]
 #[kani::solver(cadical)]
 fn t11_52_touch_account_full_restart_fee_seniority() {
-    let mut params = zero_fee_params();
-    params.warmup_period_slots = 10;
-    let mut engine = RiskEngine::new(params);
+    let mut engine = RiskEngine::new(zero_fee_params());
 
     let idx = engine.add_user(0).unwrap();
     engine.deposit(idx, 10_000_000, 100, 0).unwrap();
@@ -567,17 +564,20 @@ fn t11_52_touch_account_full_restart_fee_seniority() {
 
     engine.accounts[idx as usize].fee_credits = I128::new(-500i128);
 
-    engine.accounts[idx as usize].warmup_started_at_slot = 0;
-    engine.accounts[idx as usize].warmup_slope_per_step = 100u128;
-
     engine.last_oracle_price = 100;
     engine.last_market_slot = 100;
 
     let cap_before = engine.accounts[idx as usize].capital.get();
     let ins_before = engine.insurance_fund.balance.get();
 
-    let result = engine.touch_account_full_not_atomic(idx as usize, 100, 100);
-    assert!(result.is_ok());
+    // New touch pattern: accrue market, then touch_account_live_local + finalize
+    {
+        let mut ctx = InstructionContext::new_with_h_lock(0);
+        engine.accrue_market_to(100, 100).unwrap();
+        engine.current_slot = 100;
+        engine.touch_account_live_local(idx as usize, &mut ctx).unwrap();
+        engine.finalize_touched_accounts_post_live(&ctx);
+    }
 
     assert!(engine.accounts[idx as usize].adl_k_snap == engine.adl_coeff_long);
 
@@ -621,7 +621,7 @@ fn t11_54_worked_example_regression() {
     assert!(engine.oi_eff_long_q == POS_SCALE);
     assert!(engine.adl_coeff_long != 0i128);
 
-    let _ = engine.settle_side_effects(a as usize);
+    let _ = engine.settle_side_effects_with_h_lock(a as usize, 0);
 
     assert!(engine.accounts[a as usize].adl_k_snap == engine.adl_coeff_long);
     assert!(engine.check_conservation());
@@ -654,10 +654,10 @@ fn t5_24_dynamic_dust_bound_sufficient() {
     engine.adl_mult_long = 1;
     engine.adl_coeff_long = 0i128;
 
-    let _ = engine.settle_side_effects(a as usize);
+    let _ = engine.settle_side_effects_with_h_lock(a as usize, 0);
     assert!(engine.phantom_dust_bound_long_q == 1u128);
 
-    let _ = engine.settle_side_effects(b as usize);
+    let _ = engine.settle_side_effects_with_h_lock(b as usize, 0);
     assert!(engine.phantom_dust_bound_long_q == 2u128);
 }
 
@@ -878,7 +878,7 @@ fn t12_53_adl_truncation_dust_must_not_deadlock() {
     assert!(engine.oi_eff_short_q == 9 * POS_SCALE);
 
     // Settle account a to get actual effective position under new A
-    let settle_a = engine.settle_side_effects(a as usize);
+    let settle_a = engine.settle_side_effects_with_h_lock(a as usize, 0);
     assert!(settle_a.is_ok());
 
     // eff_a = floor(10_000_000 * 6 / 7) = 8_571_428 (< 9_000_000)
@@ -968,7 +968,7 @@ fn t14_62_dust_bound_same_epoch_zeroing() {
 
     let dust_before = engine.phantom_dust_bound_long_q;
 
-    let result = engine.settle_side_effects(idx as usize);
+    let result = engine.settle_side_effects_with_h_lock(idx as usize, 0);
     assert!(result.is_ok());
 
     // Position must be zeroed
@@ -1085,9 +1085,9 @@ fn t14_65_dust_bound_end_to_end_clearance() {
     assert!(engine.phantom_dust_bound_long_q != 0);
 
     // Settle long accounts to get actual effective positions under new A
-    let sa = engine.settle_side_effects(a_idx as usize);
+    let sa = engine.settle_side_effects_with_h_lock(a_idx as usize, 0);
     assert!(sa.is_ok());
-    let sb = engine.settle_side_effects(b_idx as usize);
+    let sb = engine.settle_side_effects_with_h_lock(b_idx as usize, 0);
     assert!(sb.is_ok());
 
     // Compute sum of actual effective positions
@@ -1457,7 +1457,7 @@ fn proof_property_49_profit_conversion_reserve_preservation() {
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
 fn proof_property_50_flat_only_auto_conversion() {
-    // touch_account_full_not_atomic on an open-position account must NOT auto-convert.
+    // touch_account_live_local on an open-position account must NOT auto-convert.
     // Only flat accounts get auto-conversion via do_profit_conversion.
     let mut engine = RiskEngine::new(zero_fee_params());
     let a = engine.add_user(0).unwrap();
@@ -1477,7 +1477,7 @@ fn proof_property_50_flat_only_auto_conversion() {
     engine.keeper_crank_not_atomic(slot2, high_oracle, &[(a, None), (b, None)], 64, 0i128, 0).unwrap();
 
     // Full warmup elapsed
-    let slot3 = slot2 + 200; // well past warmup_period_slots=100
+    let slot3 = slot2 + 200; // well past warmup period
     engine.keeper_crank_not_atomic(slot3, high_oracle, &[(a, None)], 64, 0i128, 0).unwrap();
 
     // a still has position, so should have released profit but NOT auto-converted

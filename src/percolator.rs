@@ -112,7 +112,6 @@ pub const MAX_TRADING_FEE_BPS: u64 = 10_000;
 pub const MAX_MARGIN_BPS: u64 = 10_000;
 pub const MAX_LIQUIDATION_FEE_BPS: u64 = 10_000;
 pub const MAX_PROTOCOL_FEE_ABS: u128 = 1_000_000_000_000_000_000_000_000_000_000_000_000; // 10^36, spec §1.4
-pub const MAX_MAINTENANCE_FEE_PER_SLOT: u128 = 10_000_000_000_000_000; // spec §1.4
 
 // Reserve cohort queue bounds (spec §1.4)
 pub const MAX_EXACT_RESERVE_COHORTS_PER_ACCOUNT: usize = 62;
@@ -271,12 +270,6 @@ pub struct Account {
     /// Reserved positive PnL (u128, spec §2.1)
     pub reserved_pnl: u128,
 
-    /// Warmup start slot
-    pub warmup_started_at_slot: u64,
-
-    /// Linear warmup slope (u128, spec §2.1)
-    pub warmup_slope_per_step: u128,
-
     /// Signed fixed-point base quantity basis (i128, spec §2.1)
     pub position_basis_q: i128,
 
@@ -298,7 +291,6 @@ pub struct Account {
 
     /// Fee credits
     pub fee_credits: I128,
-    pub last_fee_slot: u64,
 
     /// Cumulative LP trading fees
     pub fees_earned_total: U128,
@@ -335,8 +327,6 @@ fn empty_account() -> Account {
         kind: Account::KIND_USER,
         pnl: 0i128,
         reserved_pnl: 0u128,
-        warmup_started_at_slot: 0,
-        warmup_slope_per_step: 0u128,
         position_basis_q: 0i128,
         adl_a_basis: ADL_ONE,
         adl_k_snap: 0i128,
@@ -345,7 +335,6 @@ fn empty_account() -> Account {
         matcher_context: [0; 32],
         owner: [0; 32],
         fee_credits: I128::ZERO,
-        last_fee_slot: 0,
         fees_earned_total: U128::ZERO,
         exact_reserve_cohorts: [ReserveCohort::EMPTY; MAX_EXACT_RESERVE_COHORTS_PER_ACCOUNT],
         exact_cohort_count: 0,
@@ -367,13 +356,11 @@ pub struct InsuranceFund {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RiskParams {
-    pub warmup_period_slots: u64,
     pub maintenance_margin_bps: u64,
     pub initial_margin_bps: u64,
     pub trading_fee_bps: u64,
     pub max_accounts: u64,
     pub new_account_fee: U128,
-    pub maintenance_fee_per_slot: U128,
     pub max_crank_staleness_slots: u64,
     pub liquidation_fee_bps: u64,
     pub liquidation_fee_cap: U128,
@@ -691,12 +678,6 @@ impl RiskEngine {
             "liquidation_fee_cap must be <= MAX_PROTOCOL_FEE_ABS (spec §1.4)"
         );
 
-        // Maintenance fee bound (spec §8.2)
-        assert!(
-            params.maintenance_fee_per_slot.get() <= MAX_MAINTENANCE_FEE_PER_SLOT,
-            "maintenance_fee_per_slot must be <= MAX_MAINTENANCE_FEE_PER_SLOT (spec §8.2.1)"
-        );
-
         // Insurance floor (spec §1.4: 0 <= I_floor <= MAX_VAULT_TVL)
         assert!(
             params.insurance_floor.get() <= MAX_VAULT_TVL,
@@ -1000,8 +981,6 @@ impl RiskEngine {
             capital: U128::ZERO,
             pnl: 0i128,
             reserved_pnl: 0u128,
-            warmup_started_at_slot: slot_anchor,
-            warmup_slope_per_step: 0u128,
             position_basis_q: 0i128,
             adl_a_basis: ADL_ONE,
             adl_k_snap: 0i128,
@@ -1010,7 +989,6 @@ impl RiskEngine {
             matcher_context: [0; 32],
             owner: [0; 32],
             fee_credits: I128::ZERO,
-            last_fee_slot: slot_anchor,
             fees_earned_total: U128::ZERO,
 
             exact_reserve_cohorts: [ReserveCohort::EMPTY; MAX_EXACT_RESERVE_COHORTS_PER_ACCOUNT],
@@ -1189,33 +1167,6 @@ impl RiskEngine {
             assert!(self.pnl_matured_pos_tot <= self.pnl_pos_tot);
             return Ok(());
         }
-    }
-    }
-
-    /// set_reserved_pnl (spec §4.3): update R_i and maintain pnl_matured_pos_tot.
-    test_visible! {
-    fn set_reserved_pnl(&mut self, idx: usize, new_r: u128) {
-        let pos = i128_clamp_pos(self.accounts[idx].pnl);
-        assert!(new_r <= pos, "set_reserved_pnl: new_R > max(PNL_i, 0)");
-
-        let old_r = self.accounts[idx].reserved_pnl;
-        let old_rel = pos - old_r;
-        let new_rel = pos - new_r;
-
-        // Update pnl_matured_pos_tot by exact delta
-        if new_rel > old_rel {
-            let delta = new_rel - old_rel;
-            self.pnl_matured_pos_tot = self.pnl_matured_pos_tot.checked_add(delta)
-                .expect("set_reserved_pnl: pnl_matured_pos_tot overflow");
-        } else if old_rel > new_rel {
-            let delta = old_rel - new_rel;
-            self.pnl_matured_pos_tot = self.pnl_matured_pos_tot.checked_sub(delta)
-                .expect("set_reserved_pnl: pnl_matured_pos_tot underflow");
-        }
-        assert!(self.pnl_matured_pos_tot <= self.pnl_pos_tot,
-            "set_reserved_pnl: pnl_matured_pos_tot > pnl_pos_tot");
-
-        self.accounts[idx].reserved_pnl = new_r;
     }
     }
 
@@ -1543,118 +1494,9 @@ impl RiskEngine {
         }
     }
 
-    // ========================================================================
-    // settle_side_effects (spec §5.3)
-    // ========================================================================
-
-    test_visible! {
-    fn settle_side_effects(&mut self, idx: usize) -> Result<()> {
-        let basis = self.accounts[idx].position_basis_q;
-        if basis == 0 {
-            return Ok(());
-        }
-
-        let side = side_of_i128(basis).unwrap();
-        let epoch_snap = self.accounts[idx].adl_epoch_snap;
-        let epoch_side = self.get_epoch_side(side);
-        let a_basis = self.accounts[idx].adl_a_basis;
-
-        if a_basis == 0 {
-            return Err(RiskError::CorruptState);
-        }
-
-        let abs_basis = basis.unsigned_abs();
-
-        if epoch_snap == epoch_side {
-            // Same epoch (spec §5.3 step 4)
-            let a_side = self.get_a_side(side);
-            let k_side = self.get_k_side(side);
-            let k_snap = self.accounts[idx].adl_k_snap;
-
-            // q_eff_new = floor(|basis| * A_s / a_basis)
-            let q_eff_new = mul_div_floor_u128(abs_basis, a_side, a_basis);
-
-            // Record old_R before set_pnl (spec §5.3)
-            let old_r = self.accounts[idx].reserved_pnl;
-
-            // pnl_delta (spec §5.3 step 4: k_then=k_snap, k_now=K_s)
-            let den = a_basis.checked_mul(POS_SCALE).ok_or(RiskError::Overflow)?;
-            let pnl_delta = wide_signed_mul_div_floor_from_k_pair(abs_basis, k_snap, k_side, den);
-
-            let old_pnl = self.accounts[idx].pnl;
-            let new_pnl = old_pnl.checked_add(pnl_delta).ok_or(RiskError::Overflow)?;
-            if new_pnl == i128::MIN {
-                return Err(RiskError::Overflow);
-            }
-            self.set_pnl(idx, new_pnl);
-
-            // Caller obligation: if R_i increased, restart warmup (spec §4.4 / §5.3)
-            if self.accounts[idx].reserved_pnl > old_r {
-                self.restart_warmup_after_reserve_increase(idx);
-            }
-
-            if q_eff_new == 0 {
-                // Position effectively zeroed (spec §5.3 step 4)
-                // Reset to canonical zero-position defaults (spec §2.4)
-                self.inc_phantom_dust_bound(side);
-                self.set_position_basis_q(idx, 0i128);
-                self.accounts[idx].adl_a_basis = ADL_ONE;
-                self.accounts[idx].adl_k_snap = 0i128;
-                self.accounts[idx].adl_epoch_snap = 0;
-            } else {
-                // Update k_snap only; do NOT change basis or a_basis (non-compounding)
-                self.accounts[idx].adl_k_snap = k_side;
-                self.accounts[idx].adl_epoch_snap = epoch_side;
-            }
-        } else {
-            // Epoch mismatch (spec §5.3 step 5)
-            // Validate-then-mutate: all fallible checks before any mutation.
-            let side_mode = self.get_side_mode(side);
-            if side_mode != SideMode::ResetPending {
-                return Err(RiskError::CorruptState);
-            }
-            if epoch_snap.checked_add(1) != Some(epoch_side) {
-                return Err(RiskError::CorruptState);
-            }
-
-            let k_epoch_start = self.get_k_epoch_start(side);
-            let k_snap = self.accounts[idx].adl_k_snap;
-
-            // Phase 1: COMPUTE + VALIDATE (no mutations)
-            let den = a_basis.checked_mul(POS_SCALE).ok_or(RiskError::Overflow)?;
-            let pnl_delta = wide_signed_mul_div_floor_from_k_pair(abs_basis, k_snap, k_epoch_start, den);
-
-            let new_pnl = self.accounts[idx].pnl.checked_add(pnl_delta).ok_or(RiskError::Overflow)?;
-            if new_pnl == i128::MIN {
-                return Err(RiskError::Overflow);
-            }
-
-            let old_stale = self.get_stale_count(side);
-            let new_stale = old_stale.checked_sub(1).ok_or(RiskError::CorruptState)?;
-
-            // Phase 2: MUTATE (all validated)
-            let old_r = self.accounts[idx].reserved_pnl;
-            self.set_pnl(idx, new_pnl);
-
-            if self.accounts[idx].reserved_pnl > old_r {
-                self.restart_warmup_after_reserve_increase(idx);
-            }
-
-            self.set_position_basis_q(idx, 0i128);
-            self.set_stale_count(side, new_stale);
-
-            // Reset to canonical zero-position defaults (spec §2.4)
-            self.accounts[idx].adl_a_basis = ADL_ONE;
-            self.accounts[idx].adl_k_snap = 0i128;
-            self.accounts[idx].adl_epoch_snap = 0;
-        }
-
-        Ok(())
-    }
-    }
-
     /// settle_side_effects_live (spec §5.3, v12.14.0) — routes PnL delta
     /// through set_pnl_with_reserve with UseHLock for cohort queue.
+    test_visible! {
     fn settle_side_effects_with_h_lock(&mut self, idx: usize, h_lock: u64) -> Result<()> {
         let basis = self.accounts[idx].position_basis_q;
         if basis == 0 { return Ok(()); }
@@ -1719,6 +1561,8 @@ impl RiskEngine {
         }
 
         Ok(())
+    }
+
     }
 
     // ========================================================================
@@ -2637,32 +2481,6 @@ impl RiskEngine {
     }
     }
 
-    /// restart_warmup_after_reserve_increase (spec §4.9) — LEGACY, used until
-    /// all callers are migrated to set_pnl with reserve_mode.
-    test_visible! {
-    fn restart_warmup_after_reserve_increase(&mut self, idx: usize) {
-        let t = self.params.warmup_period_slots;
-        if t == 0 {
-            // Instantaneous warmup: release all reserve immediately
-            self.set_reserved_pnl(idx, 0);
-            self.accounts[idx].warmup_slope_per_step = 0;
-            self.accounts[idx].warmup_started_at_slot = self.current_slot;
-            return;
-        }
-        let r = self.accounts[idx].reserved_pnl;
-        if r == 0 {
-            self.accounts[idx].warmup_slope_per_step = 0;
-            self.accounts[idx].warmup_started_at_slot = self.current_slot;
-            return;
-        }
-        // slope = max(1, floor(R_i / T))
-        let base = r / (t as u128);
-        let slope = if base == 0 { 1u128 } else { base };
-        self.accounts[idx].warmup_slope_per_step = slope;
-        self.accounts[idx].warmup_started_at_slot = self.current_slot;
-    }
-    }
-
     /// advance_profit_warmup (spec §4.7, v12.14.0 cohort-based)
     /// Releases reserve per stored scheduled cohort maturity.
     test_visible! {
@@ -2787,35 +2605,6 @@ impl RiskEngine {
     }
     }
 
-    /// advance_profit_warmup (LEGACY linear slope, spec §4.9 pre-v12.14)
-    test_visible! {
-    fn advance_profit_warmup(&mut self, idx: usize) {
-        let r = self.accounts[idx].reserved_pnl;
-        if r == 0 {
-            self.accounts[idx].warmup_slope_per_step = 0;
-            self.accounts[idx].warmup_started_at_slot = self.current_slot;
-            return;
-        }
-        let t = self.params.warmup_period_slots;
-        if t == 0 {
-            self.set_reserved_pnl(idx, 0);
-            self.accounts[idx].warmup_slope_per_step = 0;
-            self.accounts[idx].warmup_started_at_slot = self.current_slot;
-            return;
-        }
-        let elapsed = self.current_slot.saturating_sub(self.accounts[idx].warmup_started_at_slot);
-        let cap = saturating_mul_u128_u64(self.accounts[idx].warmup_slope_per_step, elapsed);
-        let release = core::cmp::min(r, cap);
-        if release > 0 {
-            self.set_reserved_pnl(idx, r - release);
-        }
-        if self.accounts[idx].reserved_pnl == 0 {
-            self.accounts[idx].warmup_slope_per_step = 0;
-        }
-        self.accounts[idx].warmup_started_at_slot = self.current_slot;
-    }
-    }
-
     // ========================================================================
     // Loss settlement and profit conversion (spec §7)
     // ========================================================================
@@ -2855,36 +2644,6 @@ impl RiskEngine {
         }
     }
 
-    /// Profit conversion (spec §7.4): converts matured released profit into
-    /// protected principal using consume_released_pnl. Flat-only in automatic touch.
-    fn do_profit_conversion(&mut self, idx: usize) {
-        let x = self.released_pos(idx);
-        if x == 0 {
-            return;
-        }
-
-        // Compute y using pre-conversion haircut (spec §7.4).
-        // Because x > 0 implies pnl_matured_pos_tot > 0, h_den is strictly positive
-        // (spec test property 69).
-        let (h_num, h_den) = self.haircut_ratio();
-        assert!(h_den > 0, "do_profit_conversion: h_den must be > 0 when x > 0");
-        let y: u128 = wide_mul_div_floor_u128(x, h_num, h_den);
-
-        // consume_released_pnl(i, x) — leaves R_i unchanged
-        self.consume_released_pnl(idx, x);
-
-        // set_capital(i, C_i + y)
-        let new_cap = add_u128(self.accounts[idx].capital.get(), y);
-        self.set_capital(idx, new_cap);
-
-        // Handle warmup schedule per spec §7.4 step 3-4
-        if self.accounts[idx].reserved_pnl == 0 {
-            self.accounts[idx].warmup_slope_per_step = 0;
-            self.accounts[idx].warmup_started_at_slot = self.current_slot;
-        }
-        // else leave the existing warmup schedule unchanged
-    }
-
     /// fee_debt_sweep (spec §7.5): after any capital increase, sweep fee debt
     test_visible! {
     fn fee_debt_sweep(&mut self, idx: usize) {
@@ -2910,10 +2669,6 @@ impl RiskEngine {
         // MUST NOT consume junior PnL claims to mint senior insurance capital.
     }
     }
-
-    // ========================================================================
-    // touch_account_full_not_atomic (spec §10.1)
-    // ========================================================================
 
     // ========================================================================
     // touch_account_live_local (spec §7.7, v12.14.0)
@@ -3001,96 +2756,6 @@ impl RiskEngine {
     }
 
     // ========================================================================
-    // touch_account_full_not_atomic (LEGACY, pre-v12.14.0)
-    // ========================================================================
-
-    pub fn touch_account_full_not_atomic(&mut self, idx: usize, oracle_price: u64, now_slot: u64) -> Result<()> {
-        // Bounds and existence check (hardened public API surface)
-        if idx >= MAX_ACCOUNTS || !self.is_used(idx) {
-            return Err(RiskError::AccountNotFound);
-        }
-        // Preconditions (spec §10.1 steps 1-4)
-        if now_slot < self.current_slot {
-            return Err(RiskError::Overflow);
-        }
-        if now_slot < self.last_market_slot {
-            return Err(RiskError::Overflow);
-        }
-        if oracle_price == 0 || oracle_price > MAX_ORACLE_PRICE {
-            return Err(RiskError::Overflow);
-        }
-
-        // Step 5: current_slot = now_slot
-        self.current_slot = now_slot;
-
-        // Step 6: accrue_market_to
-        self.accrue_market_to(now_slot, oracle_price)?;
-
-        // Step 7: advance_profit_warmup (spec §4.9)
-        self.advance_profit_warmup(idx);
-
-        // Step 8: settle_side_effects (handles restart_warmup_after_reserve_increase internally)
-        self.settle_side_effects(idx)?;
-
-        // Step 9: settle losses from principal
-        self.settle_losses(idx);
-
-        // Step 10: resolve flat negative (eff == 0 and PNL < 0)
-        if self.effective_pos_q(idx) == 0 && self.accounts[idx].pnl < 0 {
-            self.resolve_flat_negative(idx);
-        }
-
-        // Step 11: maintenance fees (spec §8.2)
-        self.settle_maintenance_fee_internal(idx, now_slot)?;
-
-        // Step 12: if flat, convert matured released profits (spec §7.4)
-        if self.accounts[idx].position_basis_q == 0 {
-            self.do_profit_conversion(idx);
-        }
-
-        // Step 13: fee debt sweep
-        self.fee_debt_sweep(idx);
-
-        Ok(())
-    }
-
-    /// realize_recurring_maintenance_fee (spec §8.2.2).
-    fn settle_maintenance_fee_internal(&mut self, idx: usize, now_slot: u64) -> Result<()> {
-        let fee_per_slot = self.params.maintenance_fee_per_slot.get();
-        if fee_per_slot == 0 {
-            self.accounts[idx].last_fee_slot = now_slot;
-            return Ok(());
-        }
-
-        let last = self.accounts[idx].last_fee_slot;
-        let dt_fee = now_slot.saturating_sub(last);
-        if dt_fee == 0 {
-            self.accounts[idx].last_fee_slot = now_slot;
-            return Ok(());
-        }
-
-        // Step 4: fee_due = checked_mul(maintenance_fee_per_slot, dt_fee)
-        let fee_due = (dt_fee as u128)
-            .checked_mul(fee_per_slot)
-            .ok_or(RiskError::Overflow)?;
-
-        // Step 5: require fee_due <= MAX_PROTOCOL_FEE_ABS
-        if fee_due > MAX_PROTOCOL_FEE_ABS {
-            return Err(RiskError::Overflow);
-        }
-
-        // Step 6: charge via charge_fee_to_insurance (spec §8.2.2 ordering)
-        if fee_due > 0 {
-            self.charge_fee_to_insurance(idx, fee_due)?;
-        }
-
-        // Step 7: stamp last_fee_slot after charge (matches spec ordering)
-        self.accounts[idx].last_fee_slot = now_slot;
-
-        Ok(())
-    }
-
-    // ========================================================================
     // Account Management
     // ========================================================================
 
@@ -3144,8 +2809,6 @@ impl RiskEngine {
             capital: U128::new(excess),
             pnl: 0i128,
             reserved_pnl: 0u128,
-            warmup_started_at_slot: self.current_slot,
-            warmup_slope_per_step: 0u128,
             position_basis_q: 0i128,
             adl_a_basis: ADL_ONE,
             adl_k_snap: 0i128,
@@ -3154,7 +2817,6 @@ impl RiskEngine {
             matcher_context: [0; 32],
             owner: [0; 32],
             fee_credits: I128::ZERO,
-            last_fee_slot: self.current_slot,
             fees_earned_total: U128::ZERO,
 
             exact_reserve_cohorts: [ReserveCohort::EMPTY; MAX_EXACT_RESERVE_COHORTS_PER_ACCOUNT],
@@ -3228,8 +2890,6 @@ impl RiskEngine {
             capital: U128::new(excess),
             pnl: 0i128,
             reserved_pnl: 0u128,
-            warmup_started_at_slot: self.current_slot,
-            warmup_slope_per_step: 0u128,
             position_basis_q: 0i128,
             adl_a_basis: ADL_ONE,
             adl_k_snap: 0i128,
@@ -3238,7 +2898,6 @@ impl RiskEngine {
             matcher_context: matching_engine_context,
             owner: [0; 32],
             fee_credits: I128::ZERO,
-            last_fee_slot: self.current_slot,
             fees_earned_total: U128::ZERO,
 
             exact_reserve_cohorts: [ReserveCohort::EMPTY; MAX_EXACT_RESERVE_COHORTS_PER_ACCOUNT],
@@ -5012,8 +4671,15 @@ impl RiskEngine {
         // No engine-native maintenance fee in v12.14.0 (spec §8).
         if self.accounts[i].pnl > 0 {
             // Release all reserves unconditionally (bypass warmup).
-            // set_reserved_pnl properly adjusts pnl_matured_pos_tot for the R → 0 transition.
-            self.set_reserved_pnl(i, 0);
+            // Inline set_reserved_pnl(i, 0): mature all reserved PnL.
+            let old_r = self.accounts[i].reserved_pnl;
+            if old_r > 0 {
+                self.pnl_matured_pos_tot = self.pnl_matured_pos_tot.checked_add(old_r)
+                    .expect("force_close: pnl_matured_pos_tot overflow");
+                assert!(self.pnl_matured_pos_tot <= self.pnl_pos_tot,
+                    "force_close: pnl_matured_pos_tot > pnl_pos_tot");
+                self.accounts[i].reserved_pnl = 0;
+            }
             // Convert using post-release haircut
             let released = self.released_pos(i);
             if released > 0 {

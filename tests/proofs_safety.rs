@@ -175,12 +175,18 @@ fn bounded_liquidation_conservation() {
     let loss = deposit_amt as i128 + excess as i128;
     engine.set_pnl(a as usize, -loss);
 
-    // Use touch_account_full_not_atomic to resolve the flat negative through the real engine pipeline
+    // Use touch_account_live_local to resolve the flat negative through the real engine pipeline
     // (settle_losses → resolve_flat_negative → insurance/absorb)
-    let _ = engine.touch_account_full_not_atomic(a as usize, DEFAULT_ORACLE, DEFAULT_SLOT);
+    {
+        let mut ctx = InstructionContext::new_with_h_lock(0);
+        let _ = engine.accrue_market_to(DEFAULT_SLOT, DEFAULT_ORACLE);
+        engine.current_slot = DEFAULT_SLOT;
+        let _ = engine.touch_account_live_local(a as usize, &mut ctx);
+        engine.finalize_touched_accounts_post_live(&ctx);
+    }
 
     assert!(engine.check_conservation(),
-        "conservation must hold after touch_account_full_not_atomic resolves underwater account");
+        "conservation must hold after touch resolves underwater account");
 }
 
 #[kani::proof]
@@ -330,8 +336,13 @@ fn proof_flat_negative_resolves_through_insurance() {
 
     let ins_before = engine.insurance_fund.balance.get();
 
-    let result = engine.touch_account_full_not_atomic(idx as usize, DEFAULT_ORACLE, DEFAULT_SLOT);
-    assert!(result.is_ok());
+    {
+        let mut ctx = InstructionContext::new_with_h_lock(0);
+        engine.accrue_market_to(DEFAULT_SLOT, DEFAULT_ORACLE).unwrap();
+        engine.current_slot = DEFAULT_SLOT;
+        engine.touch_account_live_local(idx as usize, &mut ctx).unwrap();
+        engine.finalize_touched_accounts_post_live(&ctx);
+    }
 
     assert!(engine.accounts[idx as usize].pnl == 0i128);
     assert!(engine.insurance_fund.balance.get() <= ins_before);
@@ -711,7 +722,7 @@ fn proof_junior_profit_backing() {
 // ############################################################################
 
 /// Flat account capital unaffected by other's insolvency.
-/// Uses touch_account_full_not_atomic which internally calls settle_losses + resolve_flat_negative.
+/// Uses touch_account_live_local which internally calls settle_losses + resolve_flat_negative.
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
@@ -737,11 +748,17 @@ fn proof_protected_principal() {
     let loss_val = dep_b as u128 + (loss as u128);
     engine.set_pnl(b as usize, -(loss_val as i128));
 
-    // touch_account_full_not_atomic runs the real settlement pipeline:
-    // settle_side_effects → settle_losses → resolve_flat_negative
+    // touch_account_live_local runs the real settlement pipeline:
+    // settle_side_effects_with_h_lock → settle_losses → resolve_flat_negative
     engine.last_oracle_price = DEFAULT_ORACLE;
     engine.last_market_slot = DEFAULT_SLOT;
-    let _ = engine.touch_account_full_not_atomic(b as usize, DEFAULT_ORACLE, DEFAULT_SLOT);
+    {
+        let mut ctx = InstructionContext::new_with_h_lock(0);
+        let _ = engine.accrue_market_to(DEFAULT_SLOT, DEFAULT_ORACLE);
+        engine.current_slot = DEFAULT_SLOT;
+        let _ = engine.touch_account_live_local(b as usize, &mut ctx);
+        engine.finalize_touched_accounts_post_live(&ctx);
+    }
 
     // a's capital must be unchanged through b's entire loss resolution
     let a_cap_after = engine.accounts[a as usize].capital.get();
@@ -941,7 +958,13 @@ fn proof_trading_loss_seniority() {
 
     // Advance 50 slots — settle_losses runs during touch
     let touch_slot = DEFAULT_SLOT + 50;
-    let _ = engine.touch_account_full_not_atomic(a as usize, DEFAULT_ORACLE, touch_slot);
+    {
+        let mut ctx = InstructionContext::new_with_h_lock(0);
+        let _ = engine.accrue_market_to(touch_slot, DEFAULT_ORACLE);
+        engine.current_slot = touch_slot;
+        let _ = engine.touch_account_live_local(a as usize, &mut ctx);
+        engine.finalize_touched_accounts_post_live(&ctx);
+    }
 
     let pnl_after = engine.accounts[a as usize].pnl;
 
@@ -1146,36 +1169,8 @@ fn proof_fee_debt_sweep_consumes_released_pnl() {
 // ############################################################################
 // settle_maintenance_fee_internal rejects fee_credits == i128::MIN (spec §2.1)
 // ############################################################################
-
-#[kani::proof]
-#[kani::unwind(34)]
-#[kani::solver(cadical)]
-fn proof_touch_drops_excess_at_fee_credits_limit() {
-    // charge_fee_to_insurance drops excess beyond collectible headroom.
-    // With fee_credits at -(i128::MAX) and zero capital, a fee of 1
-    // has zero headroom — the entire fee is dropped. Touch succeeds
-    // and fee_credits stays at -(i128::MAX).
-    let mut params = zero_fee_params();
-    params.maintenance_fee_per_slot = U128::new(1);
-    let mut engine = RiskEngine::new(params);
-
-    let a = engine.add_user(0).unwrap();
-    engine.deposit(a, 10_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
-    engine.last_oracle_price = DEFAULT_ORACLE;
-    engine.last_market_slot = DEFAULT_SLOT;
-
-    engine.set_capital(a as usize, 0);
-    engine.accounts[a as usize].fee_credits = I128::new(-(i128::MAX));
-    engine.accounts[a as usize].last_fee_slot = DEFAULT_SLOT;
-
-    let result = engine.touch_account_full_not_atomic(a as usize, DEFAULT_ORACLE, DEFAULT_SLOT + 1);
-    // Must succeed: excess fee dropped instead of reverting
-    assert!(result.is_ok(),
-        "touch must succeed — excess fee dropped at fee_credits limit");
-    // fee_credits must not change (no headroom, fee dropped)
-    assert!(engine.accounts[a as usize].fee_credits.get() == -(i128::MAX),
-        "fee_credits must remain at -(i128::MAX) when no headroom");
-}
+// REMOVED in v12.14.0: engine-native maintenance_fee_per_slot was removed.
+// proof_touch_drops_excess_at_fee_credits_limit deleted — tested removed feature.
 
 // ############################################################################
 // v12.14.0 compliance: flat-close guard uses Eq_maint_raw_i >= 0
@@ -1465,8 +1460,8 @@ fn proof_property_26_maintenance_vs_im_dual_equity() {
     // Let's verify pure warmup release doesn't reduce Eq_maint_raw:
     let eq_maint_before_warmup = engine.account_equity_maint_raw(&engine.accounts[a as usize]);
 
-    // Advance warmup partially (not enough to fully release)
-    let slot3 = slot2 + 50; // half of warmup_period_slots=100
+    // Advance time partially
+    let slot3 = slot2 + 50;
     engine.keeper_crank_not_atomic(slot3, new_oracle, &[(a, None)], 64, 0i128, 0).unwrap();
 
     let eq_maint_after_warmup = engine.account_equity_maint_raw(&engine.accounts[a as usize]);
@@ -2412,7 +2407,7 @@ fn proof_sign_flip_trade_conserves() {
 // ############################################################################
 
 /// close_account_not_atomic on an account with substantial fee debt forgives it safely.
-/// The debt was already uncollectible because touch_account_full_not_atomic swept
+/// The debt was already uncollectible because touch_account_live_local swept
 /// everything it could via fee_debt_sweep.
 #[kani::proof]
 #[kani::unwind(34)]
@@ -2486,13 +2481,12 @@ fn bounded_trade_conservation_symbolic_size() {
 
 /// convert_released_pnl_not_atomic must preserve V >= C_tot + I.
 /// Uses symbolic oracle to cover more of the conversion path.
-/// Warmup_period_slots = 0 ensures instantaneous release (no early-return).
+/// h_lock=0 gives ImmediateRelease through set_pnl_with_reserve.
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
 fn proof_convert_released_pnl_conservation() {
     let mut params = zero_fee_params();
-    params.warmup_period_slots = 0; // instant release — guarantees released > 0 when pnl > 0
     let mut engine = RiskEngine::new(params);
 
     let a = engine.add_user(0).unwrap();
@@ -2511,7 +2505,7 @@ fn proof_convert_released_pnl_conservation() {
     let slot2 = DEFAULT_SLOT + 1;
     engine.keeper_crank_not_atomic(slot2, high_oracle, &[(a, None), (b, None)], 64, 0i128, 0).unwrap();
 
-    // With warmup_period_slots=0, touch already set reserved_pnl=0 → all PnL released
+    // With h_lock=0 (ImmediateRelease), touch already set reserved_pnl=0 → all PnL released
     let released = engine.released_pos(a as usize);
 
     let v_before = engine.vault.get();
@@ -2706,13 +2700,12 @@ fn proof_execute_trade_full_margin_enforcement() {
 
 /// Verifies that convert_released_pnl_not_atomic actually exercises the conversion path
 /// (steps 5-10), not just the early-return at step 4. We guarantee
-/// position_basis_q != 0 and released > 0 using warmup_period_slots=0.
+/// position_basis_q != 0 and released > 0 using h_lock=0 (ImmediateRelease).
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
 fn proof_convert_released_pnl_exercises_conversion() {
     let mut params = zero_fee_params();
-    params.warmup_period_slots = 0;
     let mut engine = RiskEngine::new(params);
 
     let a = engine.add_user(0).unwrap();
@@ -2735,7 +2728,7 @@ fn proof_convert_released_pnl_exercises_conversion() {
 
     let released = engine.released_pos(a as usize);
     // With warmup=0 and positive PnL, released should be > 0
-    assert!(released > 0, "released must be > 0 with warmup=0 and positive PnL");
+    assert!(released > 0, "released must be > 0 with h_lock=0 and positive PnL");
 
     let cap_before = engine.accounts[a as usize].capital.get();
 

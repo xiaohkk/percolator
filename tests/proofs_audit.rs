@@ -449,7 +449,13 @@ fn proof_settle_epoch_snap_zero_on_truncation() {
     engine.adl_mult_long = 1; // Very small — floor(1 * 1 / 1_000_000) = 0
 
     // Now touch the account — settle_side_effects should zero the position
-    let _ = engine.touch_account_full_not_atomic(a as usize, DEFAULT_ORACLE, DEFAULT_SLOT);
+    {
+        let mut ctx = InstructionContext::new_with_h_lock(0);
+        engine.accrue_market_to(DEFAULT_SLOT, DEFAULT_ORACLE).unwrap();
+        engine.current_slot = DEFAULT_SLOT;
+        let _ = engine.touch_account_live_local(a as usize, &mut ctx);
+        engine.finalize_touched_accounts_post_live(&ctx);
+    }
 
     // If position was zeroed, epoch_snap must be 0 per §2.4
     if engine.accounts[a as usize].position_basis_q == 0 {
@@ -599,10 +605,10 @@ fn proof_config_rejects_fee_cap_exceeds_max() {
 }
 
 // ############################################################################
-// FIX 12: touch_account_full_not_atomic rejects out-of-bounds and unused accounts
+// FIX 12: touch_account_live_local rejects out-of-bounds and unused accounts
 // ############################################################################
 
-/// touch_account_full_not_atomic on an unused slot must return AccountNotFound.
+/// touch_account_live_local on an unused slot must return AccountNotFound.
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
@@ -610,18 +616,24 @@ fn proof_touch_unused_returns_error() {
     let mut engine = RiskEngine::new(zero_fee_params());
 
     // Slot 0 is not used (no add_user called)
-    let result = engine.touch_account_full_not_atomic(0, DEFAULT_ORACLE, DEFAULT_SLOT);
+    let mut ctx = InstructionContext::new_with_h_lock(0);
+    engine.accrue_market_to(DEFAULT_SLOT, DEFAULT_ORACLE).unwrap();
+    engine.current_slot = DEFAULT_SLOT;
+    let result = engine.touch_account_live_local(0, &mut ctx);
     assert!(result.is_err(), "touch on unused slot must fail");
 }
 
-/// touch_account_full_not_atomic on an out-of-bounds index must return error.
+/// touch_account_live_local on an out-of-bounds index must return error.
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
 fn proof_touch_oob_returns_error() {
     let mut engine = RiskEngine::new(zero_fee_params());
 
-    let result = engine.touch_account_full_not_atomic(MAX_ACCOUNTS, DEFAULT_ORACLE, DEFAULT_SLOT);
+    let mut ctx = InstructionContext::new_with_h_lock(0);
+    engine.accrue_market_to(DEFAULT_SLOT, DEFAULT_ORACLE).unwrap();
+    engine.current_slot = DEFAULT_SLOT;
+    let result = engine.touch_account_live_local(MAX_ACCOUNTS, &mut ctx);
     assert!(result.is_err(), "touch on OOB index must fail");
 }
 
@@ -682,7 +694,7 @@ fn proof_gc_skips_negative_pnl() {
 
     // Directly set negative PnL to simulate a flat account with unresolved loss.
     // In production this arises when a position is closed at a loss but
-    // touch_account_full_not_atomic → §7.3 hasn't run yet.
+    // touch_account_live_local → §7.3 hasn't run yet.
     engine.set_pnl(idx as usize, -100i128);
 
     let ins_before = engine.insurance_fund.balance.get();
@@ -1027,64 +1039,4 @@ fn proof_force_close_resolved_fee_sweep_conservation() {
     assert!(engine.check_conservation());
 }
 
-// ############################################################################
-// Maintenance fee: conservation, fee debt, validate_params
-// ############################################################################
-
-/// Spec §8.2: maintenance fees enabled — touch charges dt * fee_per_slot.
-/// Conservation holds with symbolic dt.
-#[kani::proof]
-#[kani::unwind(34)]
-#[kani::solver(cadical)]
-fn proof_maintenance_fee_conservation() {
-    let mut params = zero_fee_params();
-    params.maintenance_fee_per_slot = U128::new(100);
-    let mut engine = RiskEngine::new(params);
-
-    let a = engine.add_user(0).unwrap();
-    engine.deposit(a, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
-    engine.last_oracle_price = DEFAULT_ORACLE;
-    engine.last_market_slot = DEFAULT_SLOT;
-    // Align last_fee_slot with DEFAULT_SLOT so dt_fee = dt exactly
-    engine.accounts[a as usize].last_fee_slot = DEFAULT_SLOT;
-
-    let cap_before = engine.accounts[a as usize].capital.get();
-
-    let dt: u16 = kani::any();
-    kani::assume(dt >= 1 && dt <= 1000);
-
-    let slot2 = DEFAULT_SLOT + (dt as u64);
-    let result = engine.touch_account_full_not_atomic(a as usize, DEFAULT_ORACLE, slot2);
-    assert!(result.is_ok());
-
-    // Fee = dt * 100, fully covered by 500k capital
-    let expected_fee = (dt as u128) * 100;
-    assert_eq!(cap_before - engine.accounts[a as usize].capital.get(), expected_fee,
-        "capital must decrease by dt * fee_per_slot");
-    assert!(engine.check_conservation());
-}
-
-/// Liveness: maintenance fee realization must NOT revert for large dt
-/// with max fee_per_slot. With MAX_MAINTENANCE_FEE_PER_SLOT = 10^16 and
-/// dt up to ~10^20 slots, fee_due can reach ~10^36 which must stay under
-/// MAX_PROTOCOL_FEE_ABS = 10^36.
-#[kani::proof]
-#[kani::unwind(34)]
-#[kani::solver(cadical)]
-fn proof_maintenance_fee_large_dt_no_revert() {
-    let mut params = zero_fee_params();
-    params.maintenance_fee_per_slot = U128::new(MAX_MAINTENANCE_FEE_PER_SLOT);
-    let mut engine = RiskEngine::new(params);
-
-    let a = engine.add_user(0).unwrap();
-    engine.deposit(a, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
-    engine.last_oracle_price = DEFAULT_ORACLE;
-    engine.last_market_slot = DEFAULT_SLOT;
-
-    // 100_000 slots of inactivity — would have bricked under old 10^20 cap
-    let large_dt = 100_000u64;
-    let slot2 = DEFAULT_SLOT + large_dt;
-    let result = engine.touch_account_full_not_atomic(a as usize, DEFAULT_ORACLE, slot2);
-    assert!(result.is_ok(), "large dt must not revert with correct MAX_PROTOCOL_FEE_ABS");
-    assert!(engine.check_conservation());
-}
+// (Maintenance fee proofs removed — maintenance_fee_per_slot feature was deleted)

@@ -95,7 +95,7 @@ fn assert_global_invariants(engine: &RiskEngine, context: &str) {
     let mut sum_pnl_pos = 0u128;
     let n = account_count(engine);
     for i in 0..n {
-        if is_account_used(engine, i as u32) {
+        if is_account_used(engine, i as u16) {
             let acc = &engine.accounts[i];
             sum_capital += acc.capital.get();
             let pnl = acc.pnl;
@@ -123,7 +123,7 @@ fn assert_global_invariants(engine: &RiskEngine, context: &str) {
 
     // 3. Account local sanity (for each used account)
     for i in 0..n {
-        if is_account_used(engine, i as u32) {
+        if is_account_used(engine, i as u16) {
             let acc = &engine.accounts[i];
 
             // reserved_pnl <= max(0, pnl)
@@ -148,13 +148,11 @@ fn assert_global_invariants(engine: &RiskEngine, context: &str) {
 /// Regime A: Normal mode (small floors)
 fn params_regime_a() -> RiskParams {
     RiskParams {
-        warmup_period_slots: 100,
         maintenance_margin_bps: 500,
         initial_margin_bps: 1000,
         trading_fee_bps: 10,
         max_accounts: 32, // Small for speed
         new_account_fee: U128::new(0),
-        maintenance_fee_per_slot: U128::new(0),
         max_crank_staleness_slots: u64::MAX,
         liquidation_fee_bps: 50,
         liquidation_fee_cap: U128::new(100_000),
@@ -172,13 +170,11 @@ fn params_regime_a() -> RiskParams {
 /// Regime B: Floor + risk mode sensitivity (floor = 1000)
 fn params_regime_b() -> RiskParams {
     RiskParams {
-        warmup_period_slots: 100,
         maintenance_margin_bps: 500,
         initial_margin_bps: 1000,
         trading_fee_bps: 10,
         max_accounts: 32, // Small for speed
         new_account_fee: U128::new(0),
-        maintenance_fee_per_slot: U128::new(0),
         max_crank_staleness_slots: u64::MAX,
         liquidation_fee_bps: 50,
         liquidation_fee_cap: U128::new(100_000),
@@ -544,7 +540,7 @@ impl FuzzState {
             } => {
                 let before = (*self.engine).clone();
                 // Set funding rate for next accrue_market_to call
-                self.engine.funding_rate_e9_per_slot_last = *rate_bps;
+                self.engine.funding_rate_e9_per_slot_last = *rate_bps as i128;
                 let now_slot = self.engine.current_slot.saturating_add(*dt);
 
                 let result = self
@@ -568,7 +564,14 @@ impl FuzzState {
                 let before = (*self.engine).clone();
                 let now_slot = self.engine.current_slot;
 
-                let result = self.engine.touch_account_full_not_atomic(idx as usize, oracle, now_slot);
+                let result = (|| -> Result<()> {
+                    let mut ctx = InstructionContext::new_with_h_lock(0);
+                    self.engine.accrue_market_to(now_slot, oracle)?;
+                    self.engine.current_slot = now_slot;
+                    self.engine.touch_account_live_local(idx as usize, &mut ctx)?;
+                    self.engine.finalize_touched_accounts_post_live(&ctx);
+                    Ok(())
+                })();
 
                 match result {
                     Ok(()) => {
@@ -646,7 +649,7 @@ impl FuzzState {
         let mut count = 0;
         let n = account_count(&self.engine);
         for i in 0..n {
-            if is_account_used(&self.engine, i as u32) {
+            if is_account_used(&self.engine, i as u16) {
                 count += 1;
             }
         }
@@ -839,7 +842,7 @@ fn random_selector(rng: &mut Rng) -> IdxSel {
         0 => IdxSel::Existing,
         1 => IdxSel::ExistingNonLp,
         2 => IdxSel::Lp,
-        _ => IdxSel::Random(rng.u64(0, 63) as u32),
+        _ => IdxSel::Random(rng.u64(0, 63) as u16),
     }
 }
 

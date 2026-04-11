@@ -9,13 +9,11 @@ use percolator::i128::U128;
 #[cfg(feature = "test")]
 fn default_params() -> RiskParams {
     RiskParams {
-        warmup_period_slots: 100,
         maintenance_margin_bps: 500, // 5%
         initial_margin_bps: 1000,    // 10%
         trading_fee_bps: 10,         // 0.1%
         max_accounts: 64,
         new_account_fee: U128::new(0),
-        maintenance_fee_per_slot: U128::new(0),
         max_crank_staleness_slots: u64::MAX,
         liquidation_fee_bps: 50,
         liquidation_fee_cap: U128::new(100_000),
@@ -101,7 +99,7 @@ fn test_e2e_complete_user_journey() {
     engine.accrue_market_to(slot, new_price).unwrap();
 
     // Settle side effects for Alice (should have positive PnL from long)
-    engine.settle_side_effects(alice as usize).unwrap();
+    engine.settle_side_effects_with_h_lock(alice as usize, 0).unwrap();
 
     let alice_pnl = engine.accounts[alice as usize].pnl;
     // Long position + price up = positive PnL
@@ -114,7 +112,13 @@ fn test_e2e_complete_user_journey() {
 
     // Touch to settle and convert warmup
     let slot = engine.current_slot;
-    engine.touch_account_full_not_atomic(alice as usize, new_price, slot).unwrap();
+    {
+        let mut ctx = InstructionContext::new_with_h_lock(0);
+        engine.accrue_market_to(slot, new_price).unwrap();
+        engine.current_slot = slot;
+        engine.touch_account_live_local(alice as usize, &mut ctx).unwrap();
+        engine.finalize_touched_accounts_post_live(&ctx);
+    }
 
     // The key invariant is conservation
     assert!(engine.check_conservation(), "Conservation after warmup");
@@ -138,7 +142,13 @@ fn test_e2e_complete_user_journey() {
     // Advance for full warmup
     engine.advance_slot(200);
     let slot = engine.current_slot;
-    engine.touch_account_full_not_atomic(alice as usize, new_price, slot).unwrap();
+    {
+        let mut ctx = InstructionContext::new_with_h_lock(0);
+        engine.accrue_market_to(slot, new_price).unwrap();
+        engine.current_slot = slot;
+        engine.touch_account_live_local(alice as usize, &mut ctx).unwrap();
+        engine.finalize_touched_accounts_post_live(&ctx);
+    }
 
     // Alice withdraws some capital
     let slot = engine.current_slot;

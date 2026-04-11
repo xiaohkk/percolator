@@ -9,13 +9,11 @@ use percolator::wide_math::U256;
 
 fn default_params() -> RiskParams {
     RiskParams {
-        warmup_period_slots: 100,
         maintenance_margin_bps: 500,    // 5%
         initial_margin_bps: 1000,       // 10% — MUST be > maintenance
         trading_fee_bps: 10,
         max_accounts: 64,
         new_account_fee: U128::new(1000),
-        maintenance_fee_per_slot: U128::new(1),
         max_crank_staleness_slots: 1000,
         liquidation_fee_bps: 100,
         liquidation_fee_cap: U128::new(1_000_000),
@@ -354,8 +352,13 @@ fn test_haircut_ratio_with_surplus() {
     // Now accrue market with a higher price
     engine.accrue_market_to(2, 1100).expect("accrue");
     // Touch accounts to realize PnL
-    engine.touch_account_full_not_atomic(a as usize, 1100, 2).expect("touch a");
-    engine.touch_account_full_not_atomic(b as usize, 1100, 2).expect("touch b");
+    {
+        let mut ctx = InstructionContext::new_with_h_lock(0);
+        engine.current_slot = 2;
+        engine.touch_account_live_local(a as usize, &mut ctx).unwrap();
+        engine.touch_account_live_local(b as usize, &mut ctx).unwrap();
+        engine.finalize_touched_accounts_post_live(&ctx);
+    }
 
     let (h_num, h_den) = engine.haircut_ratio();
     // h_num <= h_den always
@@ -428,24 +431,30 @@ fn test_liquidation_flat_account() {
 // ============================================================================
 
 #[test]
-fn test_warmup_slope_set_on_new_profit() {
+fn test_cohort_reserve_set_on_new_profit() {
     let (mut engine, a, b) = setup_two_users(100_000, 100_000);
     let oracle = 1000u64;
     let slot = 1u64;
+    let h_lock = 10u64; // non-zero h_lock for cohort-based warmup
 
     let size_q = make_size_q(50);
-    engine.execute_trade_not_atomic(a, b, oracle, slot, size_q, oracle, 0i128, 0).expect("trade");
+    engine.execute_trade_not_atomic(a, b, oracle, slot, size_q, oracle, 0i128, h_lock).expect("trade");
 
     // Advance and accrue at higher price so long (a) gets positive PnL
     let slot2 = 10u64;
     let new_oracle = 1100u64;
-    engine.keeper_crank_not_atomic(slot2, new_oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64, 0i128, 0).expect("crank");
-    engine.touch_account_full_not_atomic(a as usize, new_oracle, slot2).expect("touch");
+    engine.keeper_crank_not_atomic(slot2, new_oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64, 0i128, h_lock).expect("crank");
+    {
+        let mut ctx = InstructionContext::new_with_h_lock(h_lock);
+        engine.current_slot = slot2;
+        engine.touch_account_live_local(a as usize, &mut ctx).unwrap();
+        engine.finalize_touched_accounts_post_live(&ctx);
+    }
 
-    // If PnL is positive and warmup_period > 0, slope should be set
+    // If PnL is positive, reserved_pnl should be nonzero (cohort-based warmup with h_lock>0)
     if engine.accounts[a as usize].pnl > 0 {
-        assert!(engine.accounts[a as usize].warmup_slope_per_step != 0,
-            "warmup slope should be nonzero for positive PnL");
+        assert!(engine.accounts[a as usize].reserved_pnl > 0,
+            "reserved_pnl should be nonzero for positive PnL (cohort warmup with h_lock>0)");
     }
 }
 
@@ -454,29 +463,42 @@ fn test_warmup_full_conversion_after_period() {
     let (mut engine, a, b) = setup_two_users(100_000, 100_000);
     let oracle = 1000u64;
     let slot = 1u64;
+    let h_lock = 10u64; // non-zero h_lock so PnL goes through cohort queue
 
     let size_q = make_size_q(50);
-    engine.execute_trade_not_atomic(a, b, oracle, slot, size_q, oracle, 0i128, 0).expect("trade");
+    engine.execute_trade_not_atomic(a, b, oracle, slot, size_q, oracle, 0i128, h_lock).expect("trade");
 
     // Move price up to give account a profit
     let slot2 = 10u64;
     let new_oracle = 1200u64;
-    engine.keeper_crank_not_atomic(slot2, new_oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64, 0i128, 0).expect("crank");
-    engine.touch_account_full_not_atomic(a as usize, new_oracle, slot2).expect("touch");
+    engine.keeper_crank_not_atomic(slot2, new_oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64, 0i128, h_lock).expect("crank");
+    {
+        let mut ctx = InstructionContext::new_with_h_lock(h_lock);
+        engine.accrue_market_to(slot2, new_oracle).unwrap();
+        engine.current_slot = slot2;
+        engine.touch_account_live_local(a as usize, &mut ctx).unwrap();
+        engine.finalize_touched_accounts_post_live(&ctx);
+    }
 
     // Close position so profit conversion can happen (only for flat accounts)
     let close_q = make_size_q(50);
-    engine.execute_trade_not_atomic(b, a, new_oracle, slot2, close_q, new_oracle, 0i128, 0).expect("close");
+    engine.execute_trade_not_atomic(b, a, new_oracle, slot2, close_q, new_oracle, 0i128, h_lock).expect("close");
 
     let capital_before = engine.accounts[a as usize].capital.get();
 
-    // Wait beyond warmup period (100 slots) and touch again
-    let slot3 = slot2 + 200;
-    engine.keeper_crank_not_atomic(slot3, new_oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64, 0i128, 0).expect("crank2");
-    engine.touch_account_full_not_atomic(a as usize, new_oracle, slot3).expect("touch2");
+    // Wait beyond cohort horizon and touch — cohort matures, releasing PnL
+    let slot3 = slot2 + 200; // well beyond h_lock=10
+    engine.keeper_crank_not_atomic(slot3, new_oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64, 0i128, h_lock).expect("crank2");
+    {
+        let mut ctx = InstructionContext::new_with_h_lock(h_lock);
+        engine.accrue_market_to(slot3, new_oracle).unwrap();
+        engine.current_slot = slot3;
+        engine.touch_account_live_local(a as usize, &mut ctx).unwrap();
+        engine.finalize_touched_accounts_post_live(&ctx);
+    }
 
     let capital_after = engine.accounts[a as usize].capital.get();
-    // Capital should increase after warmup conversion (position is flat now)
+    // Capital should increase after cohort maturity (position is flat, whole-only conversion)
     assert!(capital_after > capital_before,
         "after full warmup period, profit must be converted to capital");
     assert!(engine.check_conservation());
@@ -947,7 +969,13 @@ fn test_close_account_after_trade_and_unwind() {
     // Wait beyond warmup to let PnL settle
     let slot2 = slot + 200;
     engine.keeper_crank_not_atomic(slot2, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64, 0i128, 0).expect("crank");
-    engine.touch_account_full_not_atomic(a as usize, oracle, slot2).expect("touch");
+    {
+        let mut ctx = InstructionContext::new_with_h_lock(0);
+        engine.accrue_market_to(slot2, oracle).unwrap();
+        engine.current_slot = slot2;
+        engine.touch_account_live_local(a as usize, &mut ctx).unwrap();
+        engine.finalize_touched_accounts_post_live(&ctx);
+    }
 
     // PnL should be zero or converted by now
     let pnl = engine.accounts[a as usize].pnl;
@@ -991,54 +1019,7 @@ fn test_insurance_absorbs_loss_on_liquidation() {
     assert!(engine.check_conservation());
 }
 
-#[test]
-fn test_maintenance_fee_charges_on_touch() {
-    // Spec §8.2: maintenance fees enabled — touch charges dt * fee_per_slot.
-    let mut engine = RiskEngine::new(default_params()); // fee_per_slot = 1
-    let oracle = 1000u64;
-    let slot = 1u64;
-    engine.current_slot = slot;
 
-    let idx = engine.add_user(1000).expect("add_user");
-    engine.deposit(idx, 10_000, oracle, slot).expect("deposit");
-
-    let capital_before = engine.accounts[idx as usize].capital.get();
-
-    // Advance 500 slots: crank accrues market, then touch charges fee
-    // keeper_crank_not_atomic at 501 with empty candidates doesn't touch the account.
-    // Then touch_account_full_not_atomic charges fee: dt from last_fee_slot to 501.
-    let slot2 = 501u64;
-    engine.keeper_crank_not_atomic(slot2, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64, 0i128, 0).expect("crank");
-    engine.touch_account_full_not_atomic(idx as usize, oracle, slot2).expect("touch");
-
-    let capital_after = engine.accounts[idx as usize].capital.get();
-    assert!(capital_after < capital_before,
-        "maintenance fee must reduce capital on touch");
-    assert!(engine.check_conservation());
-}
-
-#[test]
-fn test_maintenance_fee_zero_rate_no_charge() {
-    // maintenance_fee_per_slot = 0 means no fee is charged
-    let mut params = default_params();
-    params.maintenance_fee_per_slot = U128::ZERO;
-    let mut engine = RiskEngine::new(params);
-    let oracle = 1000u64;
-    let slot = 1u64;
-    engine.current_slot = slot;
-
-    let idx = engine.add_user(1000).expect("add_user");
-    engine.deposit(idx, 10_000, oracle, slot).expect("deposit");
-
-    let capital_before = engine.accounts[idx as usize].capital.get();
-
-    let slot2 = 501u64;
-    engine.keeper_crank_not_atomic(slot2, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64, 0i128, 0).expect("crank");
-    engine.touch_account_full_not_atomic(idx as usize, oracle, slot2).expect("touch");
-
-    assert_eq!(engine.accounts[idx as usize].capital.get(), capital_before,
-        "zero fee rate must not charge fees");
-}
 
 #[test]
 fn test_keeper_crank_liquidates_underwater_accounts() {
@@ -1181,9 +1162,6 @@ fn test_fee_seniority_after_restart_on_new_profit_in_trade() {
     // Use zero-fee params to isolate the restart-on-new-profit / fee-sweep interaction
     let mut params = default_params();
     params.trading_fee_bps = 0;
-    params.maintenance_fee_per_slot = U128::new(0);
-    // Use zero warmup so all positive PnL is immediately warmable
-    params.warmup_period_slots = 0;
 
     let mut engine = RiskEngine::new(params);
     let oracle = 1000u64;
@@ -1239,17 +1217,6 @@ fn test_fee_seniority_after_restart_on_new_profit_in_trade() {
     assert!(engine.check_conservation());
 }
 
-// ============================================================================
-// Issue #4: Maintenance fee settle must not clamp fee_credits to i128::MIN
-// ============================================================================
-
-#[test]
-#[should_panic(expected = "maintenance_fee_per_slot must be <= MAX_MAINTENANCE_FEE_PER_SLOT")]
-fn test_validate_params_rejects_extreme_fee_per_slot() {
-    let mut params = default_params();
-    params.maintenance_fee_per_slot = U128::new(MAX_MAINTENANCE_FEE_PER_SLOT + 1);
-    let _ = RiskEngine::new(params);
-}
 
 // ============================================================================
 // Issue #5: charge_fee_safe must not panic on PnL underflow
@@ -1716,37 +1683,6 @@ fn test_trade_at_reasonable_size_succeeds() {
     assert!(engine.check_conservation());
 }
 
-// ============================================================================
-// Maintenance fee: overflow on large dt
-// ============================================================================
-
-#[test]
-fn test_maintenance_fee_large_dt_charges_correctly() {
-    // Large dt with max fee_per_slot: fee = dt * fee_per_slot
-    let mut params = default_params();
-    params.maintenance_fee_per_slot = U128::new(MAX_MAINTENANCE_FEE_PER_SLOT);
-    let mut engine = RiskEngine::new(params);
-    let oracle = 1000u64;
-    let slot = 1u64;
-    engine.current_slot = slot;
-
-    let a = engine.add_user(1000).unwrap();
-    engine.deposit(a, 10_000_000, oracle, slot).unwrap();
-    engine.keeper_crank_not_atomic(slot, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64, 0i128, 0).unwrap();
-
-    let far_slot = slot + 10;
-    engine.last_market_slot = far_slot - 1;
-    engine.last_oracle_price = oracle;
-    engine.funding_price_sample_last = oracle;
-
-    // fee = 10 * MAX_MAINTENANCE_FEE_PER_SLOT. If this exceeds MAX_PROTOCOL_FEE_ABS,
-    // the crank will fail with Overflow — which is the correct behavior.
-    let result = engine.keeper_crank_not_atomic(far_slot, oracle, &[(a, None)], 64, 0i128, 0);
-    // Either succeeds (fee within bounds) or fails (overflow) — both are correct
-    if result.is_ok() {
-        assert!(engine.check_conservation());
-    }
-}
 
 // ============================================================================
 // charge_fee_safe: PnL near i128::MIN boundary
@@ -1986,11 +1922,8 @@ fn test_gc_dust_preserves_fee_credits() {
 
 #[test]
 fn test_gc_collects_dead_account_with_negative_fee_credits() {
-    // Before the fix: settle_maintenance_fee pushes fee_credits negative,
-    // then !fee_credits.is_zero() causes GC to skip the dead account forever.
-    let mut params = default_params();
-    params.maintenance_fee_per_slot = U128::new(100); // high fee
-    let mut engine = RiskEngine::new(params);
+    // Before the fix: fee_credits negative causes GC to skip the dead account forever.
+    let mut engine = RiskEngine::new(default_params());
     let oracle = 1000u64;
     let slot = 1u64;
     engine.current_slot = slot;
@@ -1999,16 +1932,11 @@ fn test_gc_collects_dead_account_with_negative_fee_credits() {
     engine.deposit(a, 10_000, oracle, slot).unwrap();
     engine.keeper_crank_not_atomic(slot, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64, 0i128, 0).unwrap();
 
-    // Simulate abandoned account: zero everything
+    // Simulate abandoned account: zero everything, inject negative fee_credits
     engine.set_capital(a as usize, 0);
     engine.accounts[a as usize].position_basis_q = 0i128;
     engine.set_pnl(a as usize, 0i128);
-    engine.accounts[a as usize].fee_credits = I128::new(0);
-    engine.accounts[a as usize].last_fee_slot = slot;
-
-    // Advance time so maintenance fee accrues → pushes fee_credits negative
-    let gc_slot = slot + 100;
-    engine.current_slot = gc_slot;
+    engine.accounts[a as usize].fee_credits = I128::new(-500);
 
     let num_used_before = engine.num_used_accounts;
     engine.garbage_collect_dust();
@@ -2044,36 +1972,6 @@ fn test_gc_still_protects_positive_fee_credits() {
         "GC must protect accounts with positive (prepaid) fee_credits");
 }
 
-// ============================================================================
-// Bug fix #2: Maintenance fee must NOT eagerly sweep capital
-// (trading loss seniority over fee debt)
-// ============================================================================
-
-#[test]
-fn test_maintenance_fee_sweeps_capital() {
-    // Spec §8.2: maintenance fees enabled. fee_per_slot=100, dt=50 → fee=5000
-    let mut params = default_params();
-    params.maintenance_fee_per_slot = U128::new(100);
-    params.new_account_fee = U128::ZERO;
-    params.trading_fee_bps = 0;
-    let mut engine = RiskEngine::new(params);
-    let oracle = 1000u64;
-    let slot = 1u64;
-
-    let a = engine.add_user(0).unwrap();
-    engine.deposit(a, 10_000, oracle, slot).unwrap();
-    engine.last_oracle_price = oracle;
-    engine.last_market_slot = slot;
-    engine.accounts[a as usize].last_fee_slot = slot;
-
-    let touch_slot = slot + 50;
-    let result = engine.touch_account_full_not_atomic(a as usize, oracle, touch_slot);
-    assert!(result.is_ok());
-
-    let cap_after = engine.accounts[a as usize].capital.get();
-    assert_eq!(cap_after, 5_000, "capital must decrease by fee (10000 - 50*100 = 5000)");
-    assert!(engine.check_conservation());
-}
 
 // ============================================================================
 // Bug fix #3: Minimum absolute liquidation fee must be enforced
@@ -2088,7 +1986,6 @@ fn test_min_liquidation_fee_enforced() {
     params.min_liquidation_abs = U128::new(500);
     params.liquidation_fee_bps = 100; // 1%
     params.liquidation_fee_cap = U128::new(1_000_000);
-    params.maintenance_fee_per_slot = U128::ZERO;
     let mut engine = RiskEngine::new(params);
     let oracle = 1000u64;
     let slot = 1u64;
@@ -2141,7 +2038,6 @@ fn test_min_liquidation_fee_does_not_exceed_cap() {
     params.liquidation_fee_cap = U128::new(200);     // low cap
     params.min_liquidation_abs = U128::new(150);     // below cap (valid per §1.4)
     params.liquidation_fee_bps = 100;
-    params.maintenance_fee_per_slot = U128::ZERO;
     let mut engine = RiskEngine::new(params);
     let oracle = 1000u64;
     let slot = 1u64;
@@ -2194,7 +2090,11 @@ fn test_property_49_consume_released_pnl_preserves_reserve() {
     let idx = a as usize;
     engine.set_pnl(idx, 5_000);
     // After set_pnl, the increase goes to reserved_pnl; simulate warmup completion
-    engine.set_reserved_pnl(idx, 0); // all matured
+    {
+        let old_r = engine.accounts[idx].reserved_pnl;
+        engine.accounts[idx].reserved_pnl = 0;
+        engine.pnl_matured_pos_tot += old_r;
+    }
 
     let r_before = engine.accounts[idx].reserved_pnl;
     let ppt_before = engine.pnl_pos_tot;
@@ -2217,8 +2117,8 @@ fn test_property_49_consume_released_pnl_preserves_reserve() {
 
 // ============================================================================
 // Property 50: Flat-only automatic conversion
-// touch_account_full_not_atomic on a flat account converts matured released profit;
-// touch_account_full_not_atomic on an open-position account does NOT auto-convert.
+// touch_account_live_local + finalize on a flat account converts matured released profit;
+// touch on an open-position account does NOT auto-convert.
 // ============================================================================
 
 #[test]
@@ -2226,7 +2126,6 @@ fn test_property_50_flat_only_auto_conversion() {
     let oracle = 1_000u64;
     let slot = 1u64;
     let mut params = default_params();
-    params.maintenance_fee_per_slot = U128::ZERO;
     params.trading_fee_bps = 0;
     params.new_account_fee = U128::ZERO;
     let mut engine = RiskEngine::new(params);
@@ -2244,11 +2143,21 @@ fn test_property_50_flat_only_auto_conversion() {
     // Manually give 'a' released matured profit and fund vault to cover it
     let idx_a = a as usize;
     engine.set_pnl(idx_a, 10_000);
-    engine.set_reserved_pnl(idx_a, 0); // all matured
+    {
+        let old_r = engine.accounts[idx_a].reserved_pnl;
+        engine.accounts[idx_a].reserved_pnl = 0;
+        engine.pnl_matured_pos_tot += old_r;
+    }
     engine.vault = U128::new(engine.vault.get() + 10_000); // fund the PnL
 
     // Touch with open position — should NOT auto-convert
-    engine.touch_account_full_not_atomic(idx_a, oracle, slot + 1).unwrap();
+    {
+        let mut ctx = InstructionContext::new_with_h_lock(0);
+        engine.accrue_market_to(slot + 1, oracle).unwrap();
+        engine.current_slot = slot + 1;
+        engine.touch_account_live_local(idx_a, &mut ctx).unwrap();
+        engine.finalize_touched_accounts_post_live(&ctx);
+    }
 
     let pnl_after = engine.accounts[idx_a].pnl;
     assert!(pnl_after > 0, "open-position touch must not zero out released profit via auto-convert");
@@ -2258,11 +2167,21 @@ fn test_property_50_flat_only_auto_conversion() {
     // Give released profit and fund vault
     let idx_a = a as usize;
     engine.set_pnl(idx_a, 5_000);
-    engine.set_reserved_pnl(idx_a, 0);
+    {
+        let old_r = engine.accounts[idx_a].reserved_pnl;
+        engine.accounts[idx_a].reserved_pnl = 0;
+        engine.pnl_matured_pos_tot += old_r;
+    }
     engine.vault = U128::new(engine.vault.get() + 5_000);
 
     let cap_before_flat = engine.accounts[idx_a].capital.get();
-    engine.touch_account_full_not_atomic(idx_a, oracle, slot + 2).unwrap();
+    {
+        let mut ctx = InstructionContext::new_with_h_lock(0);
+        engine.accrue_market_to(slot + 2, oracle).unwrap();
+        engine.current_slot = slot + 2;
+        engine.touch_account_live_local(idx_a, &mut ctx).unwrap();
+        engine.finalize_touched_accounts_post_live(&ctx);
+    }
 
     // After flat touch, released profit should have been converted to capital
     let pnl_after_flat = engine.accounts[idx_a].pnl;
@@ -2284,7 +2203,6 @@ fn test_property_51_universal_withdrawal_dust_guard() {
 
     let mut params = default_params();
     params.min_initial_deposit = U128::new(min_deposit);
-    params.maintenance_fee_per_slot = U128::ZERO;
     params.new_account_fee = U128::ZERO;
     let mut engine = RiskEngine::new(params);
 
@@ -2336,7 +2254,10 @@ fn test_property_52_convert_released_pnl_explicit() {
     // Set released matured profit
     let idx = a as usize;
     engine.set_pnl(idx, 10_000);
-    engine.set_reserved_pnl(idx, 3_000); // 7000 released
+    // set_pnl sets reserved_pnl = 10000 (all reserved). Reduce to 3000 to release 7000.
+    let old_r = engine.accounts[idx].reserved_pnl; // 10000
+    engine.accounts[idx].reserved_pnl = 3_000;
+    engine.pnl_matured_pos_tot += old_r - 3_000; // 7000 now matured/released
 
     let r_before = engine.accounts[idx].reserved_pnl;
 
@@ -2370,7 +2291,7 @@ fn test_property_53_phantom_dust_adl_ordering() {
     let slot = 1u64;
     let mut params = default_params();
     params.trading_fee_bps = 0;
-    params.maintenance_fee_per_slot = U128::ZERO;
+
     params.new_account_fee = U128::ZERO;
     let mut engine = RiskEngine::new(params);
 
@@ -2421,7 +2342,7 @@ fn test_property_54_unilateral_exact_drain_reset() {
     let slot = 1u64;
     let mut params = default_params();
     params.trading_fee_bps = 0;
-    params.maintenance_fee_per_slot = U128::ZERO;
+
     params.new_account_fee = U128::ZERO;
     let mut engine = RiskEngine::new(params);
 
@@ -2466,8 +2387,7 @@ fn test_force_close_resolved_flat_no_pnl() {
     let mut engine = RiskEngine::new(default_params());
     let idx = engine.add_user(1000).unwrap();
     engine.deposit(idx, 50_000, 1000, 100).unwrap();
-    // Align last_fee_slot so force_close doesn't charge accrued fee
-    engine.accounts[idx as usize].last_fee_slot = 100;
+
 
     let returned = engine.force_close_resolved_not_atomic(idx, 100).unwrap();
     assert_eq!(returned, 50_000);
@@ -2520,7 +2440,7 @@ fn test_force_close_resolved_with_positive_pnl() {
     let mut engine = RiskEngine::new(default_params());
     let idx = engine.add_user(1000).unwrap();
     engine.deposit(idx, 50_000, 1000, 100).unwrap();
-    engine.accounts[idx as usize].last_fee_slot = 100;
+
 
     // Inject positive PnL on flat account
     engine.set_pnl(idx as usize, 10_000i128);
@@ -2537,7 +2457,7 @@ fn test_force_close_resolved_with_fee_debt() {
     let mut engine = RiskEngine::new(default_params());
     let idx = engine.add_user(1000).unwrap();
     engine.deposit(idx, 50_000, 1000, 100).unwrap();
-    engine.accounts[idx as usize].last_fee_slot = 100;
+
 
     // Inject fee debt of 5000
     engine.accounts[idx as usize].fee_credits = I128::new(-5000);
@@ -2568,8 +2488,8 @@ fn test_force_close_same_epoch_positive_k_pair_pnl() {
 
     engine.execute_trade_not_atomic(a, b, 1000, 100, (100 * POS_SCALE) as i128, 1000, 0i128, 0).unwrap();
     // Align fee slots
-    engine.accounts[a as usize].last_fee_slot = 100;
-    engine.accounts[b as usize].last_fee_slot = 100;
+
+
     let cap_after_trade = engine.accounts[a as usize].capital.get();
 
     // Advance K via price movement (mark-to-market) — NOT touching a or b as candidates
@@ -2577,7 +2497,7 @@ fn test_force_close_same_epoch_positive_k_pair_pnl() {
     engine.accrue_market_to(200, 1500).unwrap();
     engine.current_slot = 200;
     // Align fee slots to 200 to prevent fee on force_close
-    engine.accounts[a as usize].last_fee_slot = 200;
+
 
     // a (long) has unrealized profit from K-pair (K_long increased)
     let returned = engine.force_close_resolved_not_atomic(a, 200).unwrap();
@@ -2649,9 +2569,9 @@ fn test_force_close_c_tot_tracks_exactly() {
     engine.deposit(b, 200_000, 1000, 100).unwrap();
     engine.deposit(c, 300_000, 1000, 100).unwrap();
     // Align fee slots to prevent maintenance fee interference
-    engine.accounts[a as usize].last_fee_slot = 100;
-    engine.accounts[b as usize].last_fee_slot = 100;
-    engine.accounts[c as usize].last_fee_slot = 100;
+
+
+
 
     let c_tot_before = engine.c_tot.get();
 
@@ -2749,8 +2669,8 @@ fn test_force_close_oi_symmetry_after_one_side() {
     let b = engine.add_user(1000).unwrap();
     engine.deposit(a, 500_000, 1000, 100).unwrap();
     engine.deposit(b, 500_000, 1000, 100).unwrap();
-    engine.accounts[a as usize].last_fee_slot = 100;
-    engine.accounts[b as usize].last_fee_slot = 100;
+
+
 
     engine.execute_trade_not_atomic(a, b, 1000, 100, (100 * POS_SCALE) as i128, 1000, 0i128, 0).unwrap();
     assert!(engine.oi_eff_long_q > 0);
@@ -2798,8 +2718,8 @@ fn test_property_31_fullclose_liquidation_zeros_position() {
     let b = engine.add_user(1000).unwrap();
     engine.deposit(a, 50_000, 1000, 100).unwrap();
     engine.deposit(b, 500_000, 1000, 100).unwrap();
-    engine.accounts[a as usize].last_fee_slot = 100;
-    engine.accounts[b as usize].last_fee_slot = 100;
+
+
 
     // a opens leveraged long
     let size = (450 * POS_SCALE) as i128;
@@ -3040,7 +2960,7 @@ fn test_touch_live_local_does_not_auto_convert() {
     let mut engine = RiskEngine::new(default_params());
     let idx = engine.add_user(1000).unwrap();
     engine.deposit(idx, 100_000, 1000, 100).unwrap();
-    engine.accounts[idx as usize].last_fee_slot = 100;
+
 
     // Give account positive PnL (flat, released)
     engine.set_pnl(idx as usize, 10_000);

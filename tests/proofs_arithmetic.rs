@@ -260,7 +260,7 @@ fn proof_notional_scales_with_price() {
     assert!(n2 >= n1, "notional must be monotone in price");
 }
 
-/// advance_profit_warmup releases at most reserved_pnl (§4.9)
+/// advance_profit_warmup_cohort releases at most reserved_pnl (§4.9)
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
@@ -274,44 +274,12 @@ fn proof_warmup_release_bounded_by_reserved() {
     engine.set_pnl(idx as usize, pnl_val as i128);
     // After set_pnl, reserved_pnl tracks the positive PnL increase
     let r_before = engine.accounts[idx as usize].reserved_pnl;
-    engine.restart_warmup_after_reserve_increase(idx as usize);
 
-    let elapsed: u16 = kani::any();
-    kani::assume(elapsed <= 500);
-    engine.current_slot = DEFAULT_SLOT + elapsed as u64;
-
-    engine.advance_profit_warmup(idx as usize);
+    engine.advance_profit_warmup_cohort(idx as usize);
     let r_after = engine.accounts[idx as usize].reserved_pnl;
 
     // reserved can only decrease or stay the same
-    assert!(r_after <= r_before, "advance_profit_warmup must not increase reserve");
-}
-
-/// advance_profit_warmup releases at most slope * elapsed (§4.9)
-#[kani::proof]
-#[kani::unwind(34)]
-#[kani::solver(cadical)]
-fn proof_warmup_release_bounded_by_slope() {
-    let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap();
-    engine.deposit(idx, 100_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
-
-    engine.set_pnl(idx as usize, 50_000i128);
-    engine.restart_warmup_after_reserve_increase(idx as usize);
-
-    let slope = engine.accounts[idx as usize].warmup_slope_per_step;
-    let r_before = engine.accounts[idx as usize].reserved_pnl;
-
-    let elapsed: u16 = kani::any();
-    kani::assume(elapsed <= 500);
-    engine.current_slot = engine.accounts[idx as usize].warmup_started_at_slot + elapsed as u64;
-
-    engine.advance_profit_warmup(idx as usize);
-    let r_after = engine.accounts[idx as usize].reserved_pnl;
-    let released = r_before - r_after;
-
-    let cap = saturating_mul_u128_u64(slope, elapsed as u64);
-    assert!(released <= cap, "release must not exceed slope * elapsed");
+    assert!(r_after <= r_before, "advance_profit_warmup_cohort must not increase reserve");
 }
 
 // ============================================================================

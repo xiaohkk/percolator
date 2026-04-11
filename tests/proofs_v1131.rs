@@ -360,43 +360,6 @@ fn proof_accrue_mark_still_works() {
 }
 
 // ############################################################################
-// PROPERTY: maintenance fees disabled (spec §8.2)
-// ############################################################################
-
-/// Spec §8.2: maintenance fees enabled — touch charges dt * fee_per_slot.
-/// Symbolic fee and dt prove conservation holds with fee charges.
-#[kani::proof]
-#[kani::unwind(34)]
-#[kani::solver(cadical)]
-fn proof_touch_maintenance_fee_conservation() {
-    let mut params = zero_fee_params();
-    let fee_per_slot: u32 = kani::any();
-    kani::assume(fee_per_slot >= 1 && fee_per_slot <= 1000);
-    params.maintenance_fee_per_slot = U128::new(fee_per_slot as u128);
-    let mut engine = RiskEngine::new(params);
-
-    let idx = engine.add_user(0).unwrap();
-    engine.deposit(idx, 1_000_000, DEFAULT_ORACLE, 0).unwrap();
-    engine.last_oracle_price = DEFAULT_ORACLE;
-    engine.last_market_slot = 0;
-
-    let cap_before = engine.accounts[idx as usize].capital.get();
-
-    let dt: u16 = kani::any();
-    kani::assume(dt >= 1 && dt <= 1000);
-
-    let result = engine.touch_account_full_not_atomic(idx as usize, DEFAULT_ORACLE, dt as u64);
-    assert!(result.is_ok());
-
-    // Capital must decrease by exactly the fee
-    let expected_fee = (dt as u128) * (fee_per_slot as u128);
-    let cap_after = engine.accounts[idx as usize].capital.get();
-    assert_eq!(cap_before - cap_after, expected_fee,
-        "capital must decrease by exactly dt * fee_per_slot");
-    assert!(engine.check_conservation());
-}
-
-// ############################################################################
 // PROPERTY 62: Pure deposit no-insurance-draw
 // ############################################################################
 

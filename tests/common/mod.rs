@@ -104,13 +104,11 @@ pub fn a_after_adl(a_old: u16, oi_post: u16, oi: u16) -> u16 {
 
 pub fn zero_fee_params() -> RiskParams {
     RiskParams {
-        warmup_period_slots: 100,
         maintenance_margin_bps: 500,
         initial_margin_bps: 1000,
         trading_fee_bps: 0,
         max_accounts: MAX_ACCOUNTS as u64,
         new_account_fee: U128::ZERO,
-        maintenance_fee_per_slot: U128::ZERO,
         max_crank_staleness_slots: u64::MAX,
         liquidation_fee_bps: 0,
         liquidation_fee_cap: U128::ZERO,
@@ -127,13 +125,11 @@ pub fn zero_fee_params() -> RiskParams {
 
 pub fn default_params() -> RiskParams {
     RiskParams {
-        warmup_period_slots: 100,
         maintenance_margin_bps: 500,
         initial_margin_bps: 1000,
         trading_fee_bps: 10,
         max_accounts: MAX_ACCOUNTS as u64,
         new_account_fee: U128::new(1000),
-        maintenance_fee_per_slot: U128::new(1),
         max_crank_staleness_slots: 1000,
         liquidation_fee_bps: 100,
         liquidation_fee_cap: U128::new(1_000_000),
