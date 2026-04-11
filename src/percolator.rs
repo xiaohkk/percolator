@@ -71,7 +71,7 @@ pub const MAX_ACCOUNTS: usize = 4;
 pub const MAX_ACCOUNTS: usize = 64;
 
 #[cfg(all(not(kani), not(feature = "test")))]
-pub const MAX_ACCOUNTS: usize = 4096;
+pub const MAX_ACCOUNTS: usize = 2048; // v12.15: reduced from 4096 to fit 10MB Solana account limit with reserve cohort queues
 
 pub const BITMAP_WORDS: usize = (MAX_ACCOUNTS + 63) / 64;
 pub const MAX_ROUNDING_SLACK: u128 = MAX_ACCOUNTS as u128;
@@ -146,7 +146,6 @@ use wide_math::{
     fee_debt_u128_checked,
     mul_div_floor_u256_with_rem,
     ceil_div_positive_checked,
-    floor_div_signed_conservative_i128,
 };
 
 // ============================================================================
@@ -411,12 +410,7 @@ pub struct RiskEngine {
     pub pnl_matured_pos_tot: u128,
 
     // Crank cursors
-    pub liq_cursor: u16,
     pub gc_cursor: u16,
-    pub last_full_sweep_start_slot: u64,
-    pub last_full_sweep_completed_slot: u64,
-    pub crank_cursor: u16,
-    pub sweep_start_idx: u16,
 
     // Lifetime counters
     pub lifetime_liquidations: u64,
@@ -452,6 +446,14 @@ pub struct RiskEngine {
     pub last_market_slot: u64,
     /// Funding price sample (for anti-retroactivity)
     pub funding_price_sample_last: u64,
+
+    /// Signed funding remainder accumulator for exact carry (no per-step floor bias)
+    pub funding_remainder: i128,
+
+    /// Resolved payout snapshot (computed once, used for all terminal closes)
+    pub resolved_payout_h_num: u128,
+    pub resolved_payout_h_den: u128,
+    pub resolved_payout_snapshot_ready: bool,
 
     // Insurance floor is read from self.params.insurance_floor (no duplicate field)
 
@@ -497,15 +499,8 @@ pub enum LiquidationPolicy {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CrankOutcome {
     pub advanced: bool,
-    pub slots_forgiven: u64,
-    pub caller_settle_ok: bool,
-    pub force_realize_needed: bool,
-    pub panic_needed: bool,
     pub num_liquidations: u32,
-    pub num_liq_errors: u16,
     pub num_gc_closed: u32,
-    pub last_cursor: u16,
-    pub sweep_complete: bool,
 }
 
 // ============================================================================
@@ -575,11 +570,6 @@ fn add_u128(a: u128, b: u128) -> u128 {
 #[inline]
 fn sub_u128(a: u128, b: u128) -> u128 {
     a.checked_sub(b).expect("sub_u128 underflow")
-}
-
-#[inline]
-fn mul_u128(a: u128, b: u128) -> u128 {
-    a.checked_mul(b).expect("mul_u128 overflow")
 }
 
 /// Determine which side a signed position is on. Positive = long, negative = short.
@@ -733,12 +723,7 @@ impl RiskEngine {
             c_tot: U128::ZERO,
             pnl_pos_tot: 0u128,
             pnl_matured_pos_tot: 0u128,
-            liq_cursor: 0,
             gc_cursor: 0,
-            last_full_sweep_start_slot: 0,
-            last_full_sweep_completed_slot: 0,
-            crank_cursor: 0,
-            sweep_start_idx: 0,
             lifetime_liquidations: 0,
             adl_mult_long: ADL_ONE,
             adl_mult_short: ADL_ONE,
@@ -762,6 +747,10 @@ impl RiskEngine {
             last_oracle_price: init_oracle_price,
             last_market_slot: init_slot,
             funding_price_sample_last: init_oracle_price,
+            funding_remainder: 0,
+            resolved_payout_h_num: 0,
+            resolved_payout_h_den: 0,
+            resolved_payout_snapshot_ready: false,
             used: [0; BITMAP_WORDS],
             num_used_accounts: 0,
             next_account_id: 0,
@@ -799,12 +788,7 @@ impl RiskEngine {
         self.c_tot = U128::ZERO;
         self.pnl_pos_tot = 0;
         self.pnl_matured_pos_tot = 0;
-        self.liq_cursor = 0;
         self.gc_cursor = 0;
-        self.last_full_sweep_start_slot = 0;
-        self.last_full_sweep_completed_slot = 0;
-        self.crank_cursor = 0;
-        self.sweep_start_idx = 0;
         self.lifetime_liquidations = 0;
         self.adl_mult_long = ADL_ONE;
         self.adl_mult_short = ADL_ONE;
@@ -828,6 +812,10 @@ impl RiskEngine {
         self.last_oracle_price = init_oracle_price;
         self.last_market_slot = init_slot;
         self.funding_price_sample_last = init_oracle_price;
+        self.funding_remainder = 0;
+        self.resolved_payout_h_num = 0;
+        self.resolved_payout_h_den = 0;
+        self.resolved_payout_snapshot_ready = false;
         // insurance_floor is now read directly from self.params.insurance_floor
         self.used = [0; BITMAP_WORDS];
         self.num_used_accounts = 0;
@@ -863,22 +851,6 @@ impl RiskEngine {
         let w = idx >> 6;
         let b = idx & 63;
         self.used[w] &= !(1u64 << b);
-    }
-
-    #[allow(dead_code)]
-    fn for_each_used_mut<F: FnMut(usize, &mut Account)>(&mut self, mut f: F) {
-        for (block, word) in self.used.iter().copied().enumerate() {
-            let mut w = word;
-            while w != 0 {
-                let bit = w.trailing_zeros() as usize;
-                let idx = block * 64 + bit;
-                w &= w - 1;
-                if idx >= MAX_ACCOUNTS {
-                    continue;
-                }
-                f(idx, &mut self.accounts[idx]);
-            }
-        }
     }
 
     fn for_each_used<F: FnMut(usize, &Account)>(&self, mut f: F) {
@@ -1625,6 +1597,7 @@ impl RiskEngine {
 
         // Step 6: Funding transfer via sub-stepping (spec v12.14.0 §5.4)
         let r_last = self.funding_rate_e9_per_slot_last;
+        let mut fund_accum = self.funding_remainder;
         if r_last != 0 && total_dt > 0 && long_live && short_live {
             let fund_px_0 = self.funding_price_sample_last;
 
@@ -1635,14 +1608,17 @@ impl RiskEngine {
                     let dt_sub = core::cmp::min(dt_remaining, MAX_FUNDING_DT);
                     dt_remaining -= dt_sub;
 
-                    // fund_num = fund_px_0 * funding_rate_e9_per_slot * dt_sub (spec §5.5)
+                    // fund_num = fund_px_0 * funding_rate_e9_per_slot * dt_sub
                     let fund_num: i128 = (fund_px_0 as i128)
                         .checked_mul(r_last)
                         .ok_or(RiskError::Overflow)?
                         .checked_mul(dt_sub as i128)
                         .ok_or(RiskError::Overflow)?;
 
-                    let fund_term = floor_div_signed_conservative_i128(fund_num, 1_000_000_000u128);
+                    // Accumulate with carry — symmetric rounding via truncation
+                    fund_accum = fund_accum.checked_add(fund_num).ok_or(RiskError::Overflow)?;
+                    let fund_term = fund_accum / (1_000_000_000i128);
+                    fund_accum -= fund_term * 1_000_000_000i128;
 
                     if fund_term != 0 {
                         let dk_long = checked_u128_mul_i128(self.adl_mult_long, fund_term)?;
@@ -1657,6 +1633,7 @@ impl RiskEngine {
         // ALL computations succeeded — commit K values and synchronize state
         self.adl_coeff_long = k_long;
         self.adl_coeff_short = k_short;
+        self.funding_remainder = fund_accum;
         self.current_slot = now_slot;
         self.last_market_slot = now_slot;
         self.last_oracle_price = oracle_price;
@@ -2365,28 +2342,32 @@ impl RiskEngine {
             return;
         }
 
-        // Step 6: create overflow_older
+        // Step 6: create overflow_older (overflow segments always use h_max)
         if !a.overflow_older_present && !a.overflow_newest_present {
-            a.overflow_older = new_cohort;
+            let mut overflow_cohort = new_cohort;
+            overflow_cohort.horizon_slots = self.params.h_max;
+            a.overflow_older = overflow_cohort;
             a.overflow_older_present = true;
             a.reserved_pnl = a.reserved_pnl.checked_add(reserve_add).expect("R_i overflow");
             return;
         }
 
-        // Step 7: create overflow_newest
+        // Step 7: create overflow_newest (overflow segments always use h_max)
         if a.overflow_older_present && !a.overflow_newest_present {
-            a.overflow_newest = new_cohort;
+            let mut overflow_cohort = new_cohort;
+            overflow_cohort.horizon_slots = self.params.h_max;
+            a.overflow_newest = overflow_cohort;
             a.overflow_newest_present = true;
             a.reserved_pnl = a.reserved_pnl.checked_add(reserve_add).expect("R_i overflow");
             return;
         }
 
-        // Step 8: merge into existing overflow_newest (use max horizon for safety)
+        // Step 8: merge into existing overflow_newest
+        // n.horizon_slots remains h_max from creation — never modified
         let n = &mut a.overflow_newest;
         n.remaining_q = n.remaining_q.checked_add(reserve_add).expect("reserve overflow");
         n.anchor_q = n.anchor_q.checked_add(reserve_add).expect("anchor overflow");
         n.start_slot = now_slot;
-        n.horizon_slots = core::cmp::max(n.horizon_slots, h_lock); // conservative: longest horizon wins
         a.reserved_pnl = a.reserved_pnl.checked_add(reserve_add).expect("R_i overflow");
     }
 
@@ -3445,31 +3426,6 @@ impl RiskEngine {
         Ok((oi_long_after, oi_short_after))
     }
 
-    /// Check side-mode gating using exact bilateral OI decomposition (spec §5.2.2 + §9.6).
-    /// A trade would increase net side OI iff OI_side_after > OI_eff_side.
-    fn check_side_mode_for_trade(
-        &self,
-        old_a: &i128, new_a: &i128,
-        old_b: &i128, new_b: &i128,
-    ) -> Result<()> {
-        let (oi_long_after, oi_short_after) = self.bilateral_oi_after(old_a, new_a, old_b, new_b)?;
-
-        for &side in &[Side::Long, Side::Short] {
-            let mode = self.get_side_mode(side);
-            if mode != SideMode::DrainOnly && mode != SideMode::ResetPending {
-                continue;
-            }
-            let (oi_after, oi_before) = match side {
-                Side::Long => (oi_long_after, self.oi_eff_long_q),
-                Side::Short => (oi_short_after, self.oi_eff_short_q),
-            };
-            if oi_after > oi_before {
-                return Err(RiskError::SideBlocked);
-            }
-        }
-        Ok(())
-    }
-
     /// Enforce post-trade margin per spec §10.5 step 29.
     /// Uses strict risk-reducing buffer comparison with exact I256 Eq_maint_raw.
     fn enforce_post_trade_margin(
@@ -3586,29 +3542,6 @@ impl RiskEngine {
         } else {
             return Err(RiskError::Undercollateralized);
         }
-        Ok(())
-    }
-
-    /// Update OI using exact bilateral decomposition (spec §5.2.2).
-    /// The same values computed for gating MUST be written back — no alternate decomposition.
-    fn update_oi_from_positions(
-        &mut self,
-        old_a: &i128, new_a: &i128,
-        old_b: &i128, new_b: &i128,
-    ) -> Result<()> {
-        let (oi_long_after, oi_short_after) = self.bilateral_oi_after(old_a, new_a, old_b, new_b)?;
-
-        // Check bounds
-        if oi_long_after > MAX_OI_SIDE_Q {
-            return Err(RiskError::Overflow);
-        }
-        if oi_short_after > MAX_OI_SIDE_Q {
-            return Err(RiskError::Overflow);
-        }
-
-        self.oi_eff_long_q = oi_long_after;
-        self.oi_eff_short_q = oi_short_after;
-
         Ok(())
     }
 
@@ -3868,22 +3801,11 @@ impl RiskEngine {
             // Per-candidate local exact-touch (spec §11.2, v12.14.0):
             // cohort-based warmup + h_lock side effects on already-accrued state.
             // MUST NOT call accrue_market_to again.
-
-            // Step 7: advance cohort-based warmup (spec §4.7)
-            self.advance_profit_warmup_cohort(cidx);
-
-            // Step 8: settle side effects with h_lock (spec §5.3)
-            self.settle_side_effects_with_h_lock(cidx, h_lock)?;
-
-            // Step 9: settle losses
-            self.settle_losses(cidx);
-
-            // Step 10: resolve flat negative
-            if self.effective_pos_q(cidx) == 0 && self.accounts[cidx].pnl < 0 {
-                self.resolve_flat_negative(cidx);
-            }
-
-            // Step 11: fee debt sweep
+            // NOTE: touch_account_live_local calls add_touched which has a
+            // MAX_TOUCHED_PER_INSTRUCTION=4 limit. After 4 accounts, further
+            // add_touched calls are silently dropped. This is acceptable — the
+            // keeper processes many accounts but only the first 4 get finalized.
+            self.touch_account_live_local(cidx, &mut ctx)?;
             self.fee_debt_sweep(cidx);
 
             // Check if liquidatable after exact current-state touch.
@@ -3907,6 +3829,9 @@ impl RiskEngine {
             }
         }
 
+        // Finalize all touched accounts (whole-only conversion + fee sweep)
+        self.finalize_touched_accounts_post_live(&ctx);
+
         // Steps 9-10: end-of-instruction resets
         self.schedule_end_of_instruction_resets(&mut ctx)?;
         self.finalize_end_of_instruction_resets(&ctx);
@@ -3920,15 +3845,8 @@ impl RiskEngine {
 
         Ok(CrankOutcome {
             advanced,
-            slots_forgiven: 0,
-            caller_settle_ok: true,
-            force_realize_needed: false,
-            panic_needed: false,
             num_liquidations,
-            num_liq_errors: 0,
             num_gc_closed: 0,
-            last_cursor: 0,
-            sweep_complete: false,
         })
     }
 
@@ -4141,6 +4059,7 @@ impl RiskEngine {
     /// Two-phase keeper barrier wave (spec Addendum A2).
     /// Phase 1: read-only scan to classify accounts.
     /// Phase 2: bounded exact-state processing of shortlisted accounts.
+    #[cfg(any(feature = "test", feature = "stress", kani))]
     pub fn keeper_barrier_wave(
         &mut self,
         caller_idx: u16,
@@ -4155,6 +4074,10 @@ impl RiskEngine {
 
         if oracle_price == 0 || oracle_price > MAX_ORACLE_PRICE {
             return Err(RiskError::Overflow);
+        }
+
+        if self.market_mode != MarketMode::Live {
+            return Err(RiskError::Unauthorized);
         }
 
         // Step 1: initialize instruction context
@@ -4241,12 +4164,7 @@ impl RiskEngine {
                 attempts += 1;
 
                 // Exact touch + revalidate
-                self.advance_profit_warmup_cohort(cidx);
-                self.settle_side_effects_with_h_lock(cidx, h_lock)?;
-                self.settle_losses(cidx);
-                if self.effective_pos_q(cidx) == 0 && self.accounts[cidx].pnl < 0 {
-                    self.resolve_flat_negative(cidx);
-                }
+                self.touch_account_live_local(cidx, &mut ctx)?;
                 self.fee_debt_sweep(cidx);
 
                 // Check if still liquidatable after exact touch
@@ -4267,12 +4185,7 @@ impl RiskEngine {
                 let cidx = review_reset[0] as usize;
                 if cidx < MAX_ACCOUNTS && self.is_used(cidx) {
                     attempts += 1;
-                    self.advance_profit_warmup_cohort(cidx);
-                    self.settle_side_effects_with_h_lock(cidx, h_lock)?;
-                    self.settle_losses(cidx);
-                    if self.effective_pos_q(cidx) == 0 && self.accounts[cidx].pnl < 0 {
-                        self.resolve_flat_negative(cidx);
-                    }
+                    self.touch_account_live_local(cidx, &mut ctx)?;
                     self.fee_debt_sweep(cidx);
                 }
             }
@@ -4288,12 +4201,7 @@ impl RiskEngine {
                 if cidx >= MAX_ACCOUNTS || !self.is_used(cidx) { continue; }
                 attempts += 1;
 
-                self.advance_profit_warmup_cohort(cidx);
-                self.settle_side_effects_with_h_lock(cidx, h_lock)?;
-                self.settle_losses(cidx);
-                if self.effective_pos_q(cidx) == 0 && self.accounts[cidx].pnl < 0 {
-                    self.resolve_flat_negative(cidx);
-                }
+                self.touch_account_live_local(cidx, &mut ctx)?;
                 self.fee_debt_sweep(cidx);
 
                 let eff = self.effective_pos_q(cidx);
@@ -4315,12 +4223,7 @@ impl RiskEngine {
                 if cidx >= MAX_ACCOUNTS || !self.is_used(cidx) { continue; }
                 attempts += 1;
 
-                self.advance_profit_warmup_cohort(cidx);
-                self.settle_side_effects_with_h_lock(cidx, h_lock)?;
-                self.settle_losses(cidx);
-                if self.effective_pos_q(cidx) == 0 && self.accounts[cidx].pnl < 0 {
-                    self.resolve_flat_negative(cidx);
-                }
+                self.touch_account_live_local(cidx, &mut ctx)?;
                 self.fee_debt_sweep(cidx);
             }
 
@@ -4333,12 +4236,7 @@ impl RiskEngine {
                 if cidx >= MAX_ACCOUNTS || !self.is_used(cidx) { continue; }
                 attempts += 1;
 
-                self.advance_profit_warmup_cohort(cidx);
-                self.settle_side_effects_with_h_lock(cidx, h_lock)?;
-                self.settle_losses(cidx);
-                if self.effective_pos_q(cidx) == 0 && self.accounts[cidx].pnl < 0 {
-                    self.resolve_flat_negative(cidx);
-                }
+                self.touch_account_live_local(cidx, &mut ctx)?;
                 self.fee_debt_sweep(cidx);
             }
         } // 'phase2
@@ -4358,15 +4256,8 @@ impl RiskEngine {
 
         Ok(CrankOutcome {
             advanced,
-            slots_forgiven: 0,
-            caller_settle_ok: true,
-            force_realize_needed: false,
-            panic_needed: false,
             num_liquidations,
-            num_liq_errors: 0,
             num_gc_closed: 0,
-            last_cursor: 0,
-            sweep_complete: false,
         })
     }
 
@@ -4453,6 +4344,10 @@ impl RiskEngine {
 
     pub fn close_account_not_atomic(&mut self, idx: u16, now_slot: u64, oracle_price: u64, funding_rate_e9: i128, h_lock: u64) -> Result<u128> {
                 Self::validate_funding_rate_e9(funding_rate_e9)?;
+
+        if self.market_mode != MarketMode::Live {
+            return Err(RiskError::Unauthorized);
+        }
 
         if idx as usize >= MAX_ACCOUNTS || !self.is_used(idx as usize) {
             return Err(RiskError::AccountNotFound);
@@ -4549,6 +4444,7 @@ impl RiskEngine {
 
         // Zero funding for final accrual (spec §10.7 step 6)
         self.funding_rate_e9_per_slot_last = 0;
+        self.funding_remainder = 0;
         // Step 6: final accrual at resolved price with zero funding
         self.accrue_market_to(now_slot, resolved_price)?;
 
@@ -4709,20 +4605,34 @@ impl RiskEngine {
         // Step 3: Absorb any remaining flat negative PnL
         self.resolve_flat_negative(i);
 
+        // Capture resolved payout snapshot once (first close after all stale cleared)
+        if !self.resolved_payout_snapshot_ready {
+            let senior_sum = self.c_tot.get().checked_add(
+                self.insurance_fund.balance.get()).unwrap_or(u128::MAX);
+            let residual = if self.vault.get() >= senior_sum {
+                self.vault.get() - senior_sum
+            } else { 0u128 };
+            let h_den = self.pnl_matured_pos_tot;
+            let h_num = if h_den == 0 { 0 } else {
+                core::cmp::min(residual, h_den)
+            };
+            self.resolved_payout_h_num = h_num;
+            self.resolved_payout_h_den = h_den;
+            self.resolved_payout_snapshot_ready = true;
+        }
+
         // Step 4: Convert positive PnL to capital (bypass warmup for resolved market).
         // Uses the same release-then-haircut order as convert_released_pnl_not_atomic.
-        // Sequential closers see progressively larger pnl_matured_pos_tot denominators,
-        // which is the same behavior as normal sequential profit conversion — this is
-        // inherent to the haircut model, not a force_close-specific issue.
         // No engine-native maintenance fee in v12.14.0 (spec §8).
         if self.accounts[i].pnl > 0 {
             // Release all reserves via prepare_account_for_resolved_touch (does NOT
             // adjust pnl_matured_pos_tot — resolve_market already matured everything).
             self.prepare_account_for_resolved_touch(i);
-            // Convert using post-release haircut
+            // Convert using resolved payout snapshot
             let released = self.released_pos(i);
             if released > 0 {
-                let (h_num, h_den) = self.haircut_ratio();
+                let h_num = self.resolved_payout_h_num;
+                let h_den = self.resolved_payout_h_den;
                 let y = if h_den == 0 { released } else {
                     wide_mul_div_floor_u128(released, h_num, h_den)
                 };

@@ -1902,12 +1902,7 @@ fn proof_audit4_init_in_place_canonical() {
     engine.current_slot = 42;
     engine.funding_rate_e9_per_slot_last = -99;
     engine.last_crank_slot = 77;
-    engine.liq_cursor = 3;
     engine.gc_cursor = 2;
-    engine.crank_cursor = 1;
-    engine.sweep_start_idx = 5;
-    engine.last_full_sweep_start_slot = 88;
-    engine.last_full_sweep_completed_slot = 77;
     engine.lifetime_liquidations = 100;
     engine.adl_mult_long = 42;
     engine.adl_mult_short = 43;
@@ -1932,6 +1927,10 @@ fn proof_audit4_init_in_place_canonical() {
     engine.last_oracle_price = 9999;
     engine.last_market_slot = 55;
     engine.funding_price_sample_last = 777;
+    engine.funding_remainder = 42;
+    engine.resolved_payout_h_num = 100;
+    engine.resolved_payout_h_den = 200;
+    engine.resolved_payout_snapshot_ready = true;
     engine.params.insurance_floor = U128::new(12345);
     engine.next_account_id = 99;
     engine.free_head = u16::MAX; // break the freelist
@@ -1952,13 +1951,12 @@ fn proof_audit4_init_in_place_canonical() {
     assert!(engine.current_slot == 0);
     assert!(engine.funding_rate_e9_per_slot_last == 0);
     assert!(engine.last_crank_slot == 0);
-    assert!(engine.liq_cursor == 0);
     assert!(engine.gc_cursor == 0);
-    assert!(engine.crank_cursor == 0);
-    assert!(engine.sweep_start_idx == 0);
-    assert!(engine.last_full_sweep_start_slot == 0);
-    assert!(engine.last_full_sweep_completed_slot == 0);
     assert!(engine.lifetime_liquidations == 0);
+    assert!(engine.funding_remainder == 0);
+    assert!(engine.resolved_payout_h_num == 0);
+    assert!(engine.resolved_payout_h_den == 0);
+    assert!(engine.resolved_payout_snapshot_ready == false);
 
     // ---- ADL / side state ----
     assert!(engine.adl_mult_long == ADL_ONE);
