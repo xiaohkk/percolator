@@ -4400,6 +4400,76 @@ impl RiskEngine {
     ///
     /// Skips accrue_market_to (market is frozen). Handles both same-epoch
     /// and epoch-mismatch accounts.
+    // ========================================================================
+    // resolve_market (spec §10.7, v12.14.0)
+    // ========================================================================
+
+    /// Transition market from Live to Resolved at a price-bounded settlement price.
+    pub fn resolve_market(&mut self, resolved_price: u64, now_slot: u64) -> Result<()> {
+        if self.market_mode != MarketMode::Live {
+            return Err(RiskError::Unauthorized);
+        }
+        if now_slot < self.current_slot {
+            return Err(RiskError::Overflow);
+        }
+        if resolved_price == 0 || resolved_price > MAX_ORACLE_PRICE {
+            return Err(RiskError::Overflow);
+        }
+
+        // Step 5: price deviation check (exact wide arithmetic)
+        let p_last = self.last_oracle_price as i128;
+        let p_res = resolved_price as i128;
+        let dev_bps = self.params.resolve_price_deviation_bps as i128;
+        // |resolved_price - P_last| * 10_000 <= dev_bps * P_last
+        let diff_abs = (p_res - p_last).unsigned_abs();
+        let lhs = (diff_abs as u128).checked_mul(10_000).ok_or(RiskError::Overflow)?;
+        let rhs = (dev_bps as u128).checked_mul(p_last as u128).ok_or(RiskError::Overflow)?;
+        if lhs > rhs {
+            return Err(RiskError::Overflow); // price outside settlement band
+        }
+
+        // Step 6: final accrual at resolved price with zero funding
+        self.accrue_market_to(now_slot, resolved_price)?;
+
+        // Steps 7-13: set resolved state
+        self.current_slot = now_slot;
+        self.market_mode = MarketMode::Resolved;
+        self.resolved_price = resolved_price;
+        self.resolved_slot = now_slot;
+
+        // Step 14: all positive PnL is now matured
+        self.pnl_matured_pos_tot = self.pnl_pos_tot;
+
+        // Steps 15-16: zero OI
+        self.oi_eff_long_q = 0;
+        self.oi_eff_short_q = 0;
+
+        // Steps 17-20: drain/finalize sides
+        if self.side_mode_long != SideMode::ResetPending {
+            self.begin_full_drain_reset(Side::Long);
+        }
+        if self.side_mode_short != SideMode::ResetPending {
+            self.begin_full_drain_reset(Side::Short);
+        }
+        if self.side_mode_long == SideMode::ResetPending
+            && self.stale_account_count_long == 0
+            && self.stored_pos_count_long == 0
+        {
+            let _ = self.finalize_side_reset(Side::Long);
+        }
+        if self.side_mode_short == SideMode::ResetPending
+            && self.stale_account_count_short == 0
+            && self.stored_pos_count_short == 0
+        {
+            let _ = self.finalize_side_reset(Side::Short);
+        }
+
+        // Step 21
+        assert!(self.oi_eff_long_q == 0 && self.oi_eff_short_q == 0);
+
+        Ok(())
+    }
+
     pub fn force_close_resolved_not_atomic(&mut self, idx: u16, resolved_slot: u64) -> Result<u128> {
         if idx as usize >= MAX_ACCOUNTS || !self.is_used(idx as usize) {
             return Err(RiskError::AccountNotFound);

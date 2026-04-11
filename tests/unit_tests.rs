@@ -3105,3 +3105,48 @@ fn test_finalize_no_conversion_under_haircut() {
     assert_eq!(engine.accounts[idx as usize].capital.get(), cap_before,
         "under haircut: must NOT auto-convert");
 }
+
+// ============================================================================
+// resolve_market (spec §10.7, v12.14.0)
+// ============================================================================
+
+#[test]
+fn test_resolve_market_basic() {
+    let mut engine = RiskEngine::new(default_params());
+    let a = engine.add_user(1000).unwrap();
+    let b = engine.add_user(1000).unwrap();
+    engine.deposit(a, 500_000, 1000, 100).unwrap();
+    engine.deposit(b, 500_000, 1000, 100).unwrap();
+    engine.execute_trade_not_atomic(a, b, 1000, 100, (100 * POS_SCALE) as i128, 1000, 0i128, 0).unwrap();
+
+    // Resolve at the same price
+    let result = engine.resolve_market(1000, 200);
+    assert!(result.is_ok());
+    assert!(engine.market_mode == MarketMode::Resolved);
+    assert_eq!(engine.resolved_price, 1000);
+    assert_eq!(engine.oi_eff_long_q, 0);
+    assert_eq!(engine.oi_eff_short_q, 0);
+    assert_eq!(engine.pnl_matured_pos_tot, engine.pnl_pos_tot);
+}
+
+#[test]
+fn test_resolve_market_rejects_out_of_band_price() {
+    let mut engine = RiskEngine::new(default_params());
+    let idx_tmp = engine.add_user(1000).unwrap(); engine.deposit(idx_tmp, 100_000, 1000, 100).unwrap();
+    engine.last_oracle_price = 1000;
+
+    // resolve_price_deviation_bps = 1000 (10%)
+    // Price must be within 10% of P_last=1000 → [900, 1100]
+    let result = engine.resolve_market(1200, 200); // 20% deviation
+    assert!(result.is_err(), "price outside settlement band must be rejected");
+}
+
+#[test]
+fn test_resolve_market_accepts_in_band_price() {
+    let mut engine = RiskEngine::new(default_params());
+    let idx_tmp = engine.add_user(1000).unwrap(); engine.deposit(idx_tmp, 100_000, 1000, 100).unwrap();
+    engine.last_oracle_price = 1000;
+
+    let result = engine.resolve_market(1050, 200); // 5% deviation, within 10% band
+    assert!(result.is_ok());
+}
