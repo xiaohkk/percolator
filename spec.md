@@ -1,15 +1,14 @@
-
-# Risk Engine Spec (Source of Truth) — v12.14.0
+# Risk Engine Spec (Source of Truth) — v12.15.0
 
 **Combined Single-Document Native 128-bit Revision  
-(Wrapper-Driven Warmup Horizon / Wrapper-Owned Account-Fee Policy / Wrapper-Supplied High-Precision Funding-Rate Input / Exact Reserve-Cohort Warmup With Bounded Exact Queue + Preserved/Pending Overflow / Exact Candidate-Trade Neutralization / Price-Bounded Resolved-Market Settlement / Whole-Only Automatic Flat Conversion / Full-Local-PnL Maintenance / Immutable Configuration / Unencumbered-Flat Deposit Sweep / Mandatory Post-Partial Local Health Check Edition)**
+(Wrapper-Driven Warmup Horizon / Wrapper-Owned Account-Fee Policy / Wrapper-Supplied High-Precision Funding Side-Index Input / Exact Reserve-Cohort Warmup With Bounded Exact Queue + Fixed-Horizon Overflow / Exact Candidate-Trade Neutralization / Price-Bounded Resolved-Market Settlement / Whole-Only Automatic Flat Conversion / Full-Local-PnL Maintenance / Immutable Configuration / Unencumbered-Flat Deposit Sweep / Mandatory Post-Partial Local Health Check Edition)**
 
 **Design:** Protected Principal + Junior Profit Claims + Lazy A/K Side Indices (Native 128-bit Base-10 Scaling)  
 **Status:** implementation source-of-truth (normative language: MUST / MUST NOT / SHOULD / MAY)  
 **Scope:** perpetual DEX risk engine for a single quote-token vault  
 **Goal:** preserve conservation, bounded insolvency handling, oracle-manipulation resistance, deterministic exact warmup-queue behavior, and liveness while supporting lazy ADL across the opposing open-interest side without global scans, canonical-order dependencies, or sequential prefix requirements for user settlement.
 
-This revision supersedes v12.13.0 and keeps the wrapper-driven core split while fixing the remaining non-minor issues found in adversarial review.
+This revision supersedes v12.14.0 and keeps the wrapper-driven core split while fixing the remaining non-minor issues found in adversarial review.
 
 The engine core keeps only:
 
@@ -32,16 +31,16 @@ The following policy inputs become wrapper-owned and are **not** computed by the
 
 The engine validates bounds on those wrapper inputs where applicable, but it does not derive them.
 
-## Change summary from v12.13.0
+## Change summary from v12.14.0
 
-1. **Pending-overflow horizon is now first-write fixed while pending.**  
-   Once `overflow_newest_i` is created, later pending additions MUST NOT extend or otherwise mutate its stored pending horizon. This closes the remaining attacker-controlled post-saturation horizon-extension surface.
+1. **Overflow segments now use one fixed conservative horizon.**  
+   Once exact reserve capacity is exhausted, any newly created `overflow_older_i` or `overflow_newest_i` segment uses the immutable overflow horizon `H_overflow = H_max`. Wrapper-supplied `H_lock` applies only to exact cohorts. This closes both the pending pre-seeding bypass and the post-saturation horizon-extension grief surface.
 
-2. **Funding input precision is increased.**  
-   Wrapper-supplied funding is no longer an integer basis-points-per-slot value. The engine now accepts `funding_rate_e9_per_slot`, a signed parts-per-billion-per-slot input, allowing realistic live funding rates on short-slot runtimes without scale-erasure.
+2. **Funding is now carried in an exact high-precision side index rather than rounded per call.**  
+   The engine adds cumulative side funding numerators `F_long_num` and `F_short_num` plus per-account snapshots `f_snap_i`. Wrapper-supplied `funding_rate_e9_per_slot` is applied into those numerator indices without per-call floor division, eliminating the positive-zero / negative-minus-one quantization asymmetry while keeping new entrants from inheriting prior fractional funding.
 
-3. **The v12.13 fixes are retained unchanged.**  
-   The exact-queue plus preserved/pending overflow design, unconditional ADL dust-bound accrual on every `A_side` decay, active-position side-cap enforcement, the capped flat-conversion helper, whole-only automatic flat conversion, explicit flat-account released-PnL conversion, aggregate-consistent withdrawal simulation, and price-bounded resolved settlement remain part of this revision.
+3. **The v12.14 fixes are retained unchanged.**  
+   The exact-queue plus overflow design, unconditional ADL dust-bound accrual on every `A_side` decay, active-position side-cap enforcement, the capped flat-conversion helper, whole-only automatic flat conversion, explicit flat-account released-PnL conversion, aggregate-consistent withdrawal simulation, and price-bounded resolved settlement remain part of this revision.
 ---
 
 ## 0. Security goals (normative)
@@ -53,14 +52,14 @@ The engine MUST provide the following properties.
 3. **Oracle-manipulation safety for extraction:** profits created by short-lived oracle distortion MUST NOT immediately dilute the matured-profit haircut denominator `h`, immediately become withdrawable principal, or immediately satisfy withdrawal / principal-conversion approval checks.
 4. **Bounded trade reuse of positive PnL:** fresh positive PnL MAY support the generating account's own risk-increasing trades only through the global trade haircut `g`. Aggregate positive PnL admitted through `g` MUST NOT exceed current `Residual`.
 5. **No same-trade bootstrap from positive slippage:** a candidate trade's own positive execution-slippage PnL MUST NOT be allowed to make that same trade pass a risk-increasing initial-margin check.
-6. **Bounded wrapper-chosen horizon:** when a live instruction creates new reserve, the engine MUST either (a) apply the wrapper-supplied instruction-shared `H_lock` exactly to a newly created scheduled or pending reserve segment, or (b) when bounded-storage approximation requires routing into an already-existing pending overflow segment, conservatively inherit that segment's already-stored pending horizon without extending it. The engine MUST reject out-of-range `H_lock`.
-7. **Exact incremental warmup away from saturated overflow:** a newer positive reserve addition MUST NOT reset, restart, compact, or otherwise destroy the maturity progress of older exact reserved-profit cohorts or of an older preserved overflow cohort. Any conservative bounded-storage approximation MUST be confined only to the newest **pending** overflow segment.
+6. **Bounded wrapper-chosen horizon for exact cohorts:** when a live instruction creates new reserve and exact cohort capacity is available, the engine MUST apply the wrapper-supplied instruction-shared `H_lock` exactly to the newly created exact cohort. The engine MUST reject out-of-range `H_lock`.
+7. **Fixed conservative horizon for overflow:** when exact cohort capacity is exhausted, any newly created or activated overflow segment MUST use the immutable overflow horizon `H_overflow = H_max`. Wrapper-supplied `H_lock` MUST NOT shorten, extend, or otherwise mutate any overflow segment horizon.
 8. **No practical warmup dust-griefing:** an attacker MUST NOT be able to destroy materially accrued maturity progress of a victim's older exact reserve or older preserved overflow reserve through dust-sized or otherwise tiny positive-PnL additions. If exact cohort capacity is exhausted, any conservative bounded-storage approximation MUST be confined only to the newest pending overflow segment while the currently scheduled overflow segment keeps its prior law.
 9. **Profit-first haircuts:** when the system is undercollateralized, haircuts MUST apply to junior profit claims before any protected principal of flat accounts is impacted.
 10. **Conservation:** the engine MUST NOT create withdrawable claims exceeding vault tokens, except for explicitly bounded rounding slack.
 11. **Liveness:** the engine MUST NOT require `OI == 0`, manual admin recovery, a global scan, or reconciliation of an unrelated prefix of accounts before a user can safely settle, deposit, withdraw, trade, liquidate, repay fee debt, reclaim, or resolved-close. Market resolution itself may be privileged by deployment policy.
 12. **No zombie poisoning of the withdrawal haircut:** non-interacting accounts MUST NOT indefinitely pin the matured-profit haircut denominator `h` with fresh unwarmed PnL. Touched accounts MUST make warmup progress.
-13. **Funding / mark / ADL exactness under laziness:** any economic quantity whose correct value depends on the position held over an interval MUST be represented through the A/K side-index mechanism or a formally equivalent event-segmented method. Integer rounding MUST NOT mint positive aggregate claims.
+13. **Funding / mark / ADL exactness under laziness:** any economic quantity whose correct value depends on the position held over an interval MUST be represented through the A/K side-index mechanism or a formally equivalent event-segmented method. In this revision, mark and ADL use integer `K_side`, while funding uses the high-precision cumulative numerator index `F_side_num`. Integer rounding at settlement MUST NOT mint positive aggregate claims.
 14. **No hidden protocol MM:** the protocol MUST NOT secretly internalize user flow against an undisclosed residual inventory.
 15. **Defined recovery from precision stress:** the engine MUST define deterministic recovery when side precision is exhausted. It MUST NOT rely on assertion failure, silent overflow, or permanent `DrainOnly` states.
 16. **No sequential quantity dependency:** same-epoch account settlement MUST be fully local. It MAY depend on the account's own stored basis and current global side state, but MUST NOT require a canonical-order prefix or global carry cursor.
@@ -106,11 +105,14 @@ The engine MUST provide the following properties.
 - Trade fees MUST use executed trade size, not account notional:
   - `trade_notional = mul_div_floor_u128(size_q, exec_price, POS_SCALE)`.
 
-### 1.3 A/K scale
+### 1.3 A/K and funding-index scale
 
 - `ADL_ONE = 1_000_000` (6 decimal places of fractional decay accuracy).
 - `A_side` is dimensionless and scaled by `ADL_ONE`.
-- `K_side` has units `(ADL scale) * (quote atomic units per 1 base)`.
+- `K_side` has units `(ADL scale) * (quote atomic units per 1 base)` and carries whole-unit mark / ADL index motion.
+- `FUNDING_DEN = 1_000_000_000`.
+- `F_side_num` has units `(ADL scale) * (quote atomic units per 1 base) * FUNDING_DEN` and carries exact cumulative funding numerator motion.
+
 
 ### 1.4 Concrete normative bounds
 
@@ -172,7 +174,7 @@ Dust accounting interpretation:
 
 The engine MUST satisfy all of the following.
 
-1. All products involving `A_side`, `K_side`, `k_snap_i`, `basis_pos_q_i`, `effective_pos_q(i)`, `price`, the raw funding numerator `fund_px_0 * funding_rate_e9_per_slot * dt_sub`, trade-haircut numerators, trade-open counterfactual positive-aggregate numerators, reserve-cohort release numerators, or ADL deltas MUST use checked arithmetic.
+1. All products involving `A_side`, `K_side`, `F_side_num`, `k_snap_i`, `f_snap_i`, `basis_pos_q_i`, `effective_pos_q(i)`, `price`, the raw funding numerator `fund_px_0 * funding_rate_e9_per_slot * dt_sub`, trade-haircut numerators, trade-open counterfactual positive-aggregate numerators, reserve-cohort release numerators, or ADL deltas MUST use checked arithmetic.
 2. When `funding_rate_e9_per_slot != 0` and the accrual interval `dt > 0`, `accrue_market_to` MUST split `dt` into consecutive sub-steps each of length `dt_sub <= MAX_FUNDING_DT`, with any shorter remainder last. Mark-to-market MUST be applied once before the funding sub-step loop.
 3. The conservation check `V >= C_tot + I` and any `Residual` computation MUST use checked addition for `C_tot + I`. Overflow is an invariant violation.
 4. Signed division with positive denominator MUST use exact conservative floor division.
@@ -180,9 +182,9 @@ The engine MUST satisfy all of the following.
 6. `PendingWarmupTot = PNL_pos_tot - PNL_matured_pos_tot` MUST use checked subtraction.
 7. Haircut paths `floor(ReleasedPos_i * h_num / h_den)`, `floor(PosPNL_i * g_num / g_den)`, and the exact candidate-open trade-haircut path of §3.5 MUST use exact multiply-divide helpers.
 8. `max_safe_flat_conversion_released` MUST use an exact capped multiply-divide or an equivalent exact wide comparison. If the uncapped mathematical quotient exceeds either `x_cap` or `u128::MAX`, the helper MUST return `x_cap` rather than revert.
-9. Funding sub-steps MUST use the same `fund_term` value for both sides' `K` deltas, and `fund_term` itself MUST be computed with `floor_div_signed_conservative`.
-10. `K_side` is cumulative across epochs. Implementations MUST still use checked arithmetic and revert on `i128` overflow.
-11. Same-epoch or epoch-mismatch `pnl_delta` MUST evaluate the signed numerator `(abs(basis_pos) * K_diff)` in an exact wide intermediate before division by `(a_basis * POS_SCALE)` and MUST use `wide_signed_mul_div_floor_from_k_pair`.
+9. Funding sub-steps MUST use the same exact `fund_num_step = fund_px_0 * funding_rate_e9_per_slot * dt_sub` value for both sides' `F_side_num` deltas. The engine MUST NOT floor-divide `fund_num_step` inside `accrue_market_to`.
+10. `K_side` and `F_side_num` are cumulative across epochs. Implementations MUST use checked arithmetic and revert on persistent `i128` overflow.
+11. Same-epoch or epoch-mismatch settlement MUST combine `K_side` and `F_side_num` through the exact helper `wide_signed_mul_div_floor_from_kf_pair`, evaluating the exact signed numerator `((K_diff * FUNDING_DEN) + F_diff_num)` in a transient wide signed type before division by `(a_basis * POS_SCALE * FUNDING_DEN)`.
 12. The ADL quote-deficit path MUST compute `delta_K_abs = ceil(D_rem * A_old * POS_SCALE / OI)` using exact wide arithmetic.
 13. If a K-space K-index delta is representable as a magnitude but the signed addition `K_opp + delta_K_exact` overflows `i128`, the engine MUST route `D_rem` through `record_uninsured_protocol_loss` while still continuing quantity socialization.
 14. `PNL_i` MUST be maintained in `[i128::MIN + 1, i128::MAX]`, and `fee_credits_i` MUST be maintained in `[i128::MIN + 1, 0]`. `i128::MIN` is forbidden.
@@ -196,8 +198,10 @@ The engine MUST satisfy all of the following.
 22. Any reserve-cohort mutation MUST preserve the invariants of §2.1 and MUST use checked arithmetic.
 23. The exact counterfactual trade-open computation MUST recompute the account's positive-PnL contribution and the global positive-PnL aggregate with the candidate trade's own positive slippage gain removed. Subtracting the raw gain from already haircutted trade equity is non-compliant.
 24. Any wrapper-owned fee amount routed through the canonical helper MUST satisfy `fee_abs <= MAX_PROTOCOL_FEE_ABS`.
-25. `append_or_route_new_reserve` MUST preserve `len(exact_reserve_cohorts_i) <= MAX_EXACT_RESERVE_COHORTS_PER_ACCOUNT`, at most one `overflow_older_i`, at most one `overflow_newest_i`, and total stored reserve segments per account `<= MAX_RESERVE_SEGMENTS_PER_ACCOUNT`. When exact capacity is exhausted, any conservative bounded-storage approximation MUST be routed only into `overflow_newest_i`, which remains economically pending until activated; older exact cohorts and `overflow_older_i` MUST remain unchanged.
+25. `append_or_route_new_reserve` MUST preserve `len(exact_reserve_cohorts_i) <= MAX_EXACT_RESERVE_COHORTS_PER_ACCOUNT`, at most one `overflow_older_i`, at most one `overflow_newest_i`, and total stored reserve segments per account `<= MAX_RESERVE_SEGMENTS_PER_ACCOUNT`. When exact capacity is exhausted, any conservative bounded-storage approximation MUST be routed only into overflow segments whose `horizon_slots` are fixed to `H_overflow = H_max`; older exact cohorts and `overflow_older_i` MUST remain unchanged.
 26. If `reserve_mode` does not create new reserve (`ImmediateRelease` or `UseHLock(0)`), `PNL_matured_pos_tot` MUST increase only by the true newly released increment; pre-existing reserve MUST NOT be double-counted.
+27. Funding exactness MUST NOT depend on cross-call quotient carry that can be inherited by newly attached positions. Any retained fractional funding precision across calls MUST be represented through snapshot-attached state such as `F_side_num` / `f_snap_i`, not through a bare global remainder with no per-account snapshot.
+
 ### 1.7 Reference numeric envelope
 
 The always-wide paths in this revision are:
@@ -206,6 +210,7 @@ The always-wide paths in this revision are:
 2. exact matured-haircut and trade-haircut multiply-divides
 3. exact counterfactual trade-open positive-aggregate and haircut computation
 4. exact ADL `delta_K_abs`
+5. exact combined `K_side` / `F_side_num` settlement via `wide_signed_mul_div_floor_from_kf_pair`
 
 All other arithmetic MAY still use wider temporaries whenever convenient.
 
@@ -222,7 +227,8 @@ For each materialized account `i`, the engine stores at least:
 - `R_i: u128` — aggregate reserved positive PnL, with `0 <= R_i <= max(PNL_i, 0)`
 - `basis_pos_q_i: i128` — signed fixed-point base basis at the last explicit position mutation or forced zeroing
 - `a_basis_i: u128` — side multiplier in effect when `basis_pos_q_i` was last explicitly attached
-- `k_snap_i: i128` — last realized `K_side` snapshot
+- `k_snap_i: i128` — last realized whole-unit `K_side` snapshot
+- `f_snap_i: i128` — last realized high-precision cumulative funding numerator snapshot
 - `epoch_snap_i: u64` — side epoch in which the basis is defined
 - `fee_credits_i: i128`
 
@@ -245,7 +251,7 @@ The newest pending overflow segment reuses the same fields with the following sp
 - `remaining_q: u128` — still-reserved pending amount
 - `anchor_q: u128` — cumulative pending amount added since this pending segment was created
 - `start_slot: u64` — inert metadata while pending; implementations SHOULD set it to the slot of the most recent pending mutation
-- `horizon_slots: u64` — the conservative horizon that will be used if the pending segment is later activated into a scheduled cohort
+- `horizon_slots: u64` — MUST equal the immutable overflow horizon `H_overflow = H_max` while pending and after later activation
 - `sched_release_q: u128` — MUST remain `0` while pending; pending reserve does not mature until activated
 
 Storage bounds:
@@ -266,24 +272,29 @@ Derived local quantities on a touched state:
 
 Reserve-segment invariants:
 
+- define `H_overflow = H_max`
 - if `market_mode == Live`, `R_i = Σ exact_cohort.remaining_q + overflow_older.remaining_q_if_present + overflow_newest.remaining_q_if_present`
-- if `market_mode == Live`, every exact cohort and `overflow_older_i` if present satisfy:
+- if `market_mode == Live`, every exact cohort satisfies:
   - `0 < cohort.anchor_q`
-  - `0 < cohort.horizon_slots <= H_max`
+  - `H_min <= cohort.horizon_slots <= H_max`
   - `0 <= cohort.sched_release_q <= cohort.anchor_q`
   - `0 < cohort.remaining_q <= cohort.anchor_q`
+- if `market_mode == Live` and `overflow_older_i` is present:
+  - `0 < overflow_older_i.anchor_q`
+  - `overflow_older_i.horizon_slots == H_overflow`
+  - `0 <= overflow_older_i.sched_release_q <= overflow_older_i.anchor_q`
+  - `0 < overflow_older_i.remaining_q <= overflow_older_i.anchor_q`
 - if `market_mode == Live` and `overflow_newest_i` is present:
   - `0 < overflow_newest_i.anchor_q`
-  - `H_min <= overflow_newest_i.horizon_slots <= H_max`
+  - `overflow_newest_i.horizon_slots == H_overflow`
   - `overflow_newest_i.sched_release_q == 0`
   - `0 < overflow_newest_i.remaining_q <= overflow_newest_i.anchor_q`
-  - `overflow_newest_i.horizon_slots` is fixed at pending-segment creation and MUST remain unchanged until activation
 - if `R_i == 0`, the exact reserve queue MUST be empty and both overflow segments MUST be absent
 - exact cohort order is chronological by `start_slot`; for equal `start_slot`, insertion order is preserved
 - if `overflow_older_i` is present, it is economically newer than every exact cohort
 - if `overflow_newest_i` is present, it is economically newer than every exact cohort and, if `overflow_older_i` is present, newer than `overflow_older_i`
 - when exact capacity is exhausted, new reserve MAY mutate `overflow_newest_i` but MUST NOT mutate older exact cohorts or `overflow_older_i`
-- while pending, `overflow_newest_i` does not auto-mature and does not consume schedule progress; when activated into a scheduled cohort, the activated cohort MUST start at `current_slot` with `anchor_q = remaining_q` and `sched_release_q = 0`
+- while pending, `overflow_newest_i` does not auto-mature and does not consume schedule progress; when activated into a scheduled cohort, the activated cohort MUST start at `current_slot` with `anchor_q = remaining_q`, `sched_release_q = 0`, and `horizon_slots = H_overflow`
 - if `market_mode == Resolved`, reserve storage is economically inert because all reserve is globally treated as mature; any resolved-account touch that will mutate `PNL_i` MUST first clear the exact reserve queue, `overflow_older_i`, and `overflow_newest_i` via `prepare_account_for_resolved_touch(i)`
 
 Fee-credit bounds:
@@ -308,10 +319,14 @@ The engine stores at least:
 - `A_short: u128`
 - `K_long: i128`
 - `K_short: i128`
+- `F_long_num: i128` — cumulative high-precision funding numerator index for the long side, in `FUNDING_DEN` units
+- `F_short_num: i128` — cumulative high-precision funding numerator index for the short side, in `FUNDING_DEN` units
 - `epoch_long: u64`
 - `epoch_short: u64`
 - `K_epoch_start_long: i128`
 - `K_epoch_start_short: i128`
+- `F_epoch_start_long_num: i128`
+- `F_epoch_start_short_num: i128`
 - `OI_eff_long: u128`
 - `OI_eff_short: u128`
 - `mode_long ∈ {Normal, DrainOnly, ResetPending}`
@@ -345,6 +360,7 @@ Global invariants:
 - `PNL_matured_pos_tot <= PNL_pos_tot <= MAX_PNL_POS_TOT`
 - `C_tot <= V <= MAX_VAULT_TVL`
 - `I <= V`
+- `F_long_num` and `F_short_num` MUST remain representable as `i128`
 - if `market_mode == Live`, `resolved_price` MAY be `0`
 - if `market_mode == Resolved`, then `resolved_price > 0` and `resolved_slot <= current_slot`
 - if `resolved_payout_snapshot_ready == false`, then `resolved_payout_h_num == 0` and `resolved_payout_h_den == 0`
@@ -397,6 +413,7 @@ The canonical zero-position account defaults are:
 - `basis_pos_q_i = 0`
 - `a_basis_i = ADL_ONE`
 - `k_snap_i = 0`
+- `f_snap_i = 0`
 - `epoch_snap_i = 0`
 
 ### 2.5 Account materialization
@@ -464,8 +481,10 @@ At market initialization, the engine MUST set:
 - `fund_px_last = init_oracle_price`
 - `A_long = ADL_ONE`, `A_short = ADL_ONE`
 - `K_long = 0`, `K_short = 0`
+- `F_long_num = 0`, `F_short_num = 0`
 - `epoch_long = 0`, `epoch_short = 0`
 - `K_epoch_start_long = 0`, `K_epoch_start_short = 0`
+- `F_epoch_start_long_num = 0`, `F_epoch_start_short_num = 0`
 - `OI_eff_long = 0`, `OI_eff_short = 0`
 - `mode_long = Normal`, `mode_short = Normal`
 - `stored_pos_count_long = 0`, `stored_pos_count_short = 0`
@@ -489,11 +508,12 @@ A side may be in one of three modes:
 `begin_full_drain_reset(side)` MAY succeed only if `OI_eff_side == 0`. It MUST:
 
 1. set `K_epoch_start_side = K_side`
-2. increment `epoch_side` by exactly `1`
-3. set `A_side = ADL_ONE`
-4. set `stale_account_count_side = stored_pos_count_side`
-5. set `phantom_dust_bound_side_q = 0`
-6. set `mode_side = ResetPending`
+2. set `F_epoch_start_side_num = F_side_num`
+3. increment `epoch_side` by exactly `1`
+4. set `A_side = ADL_ONE`
+5. set `stale_account_count_side = stored_pos_count_side`
+6. set `phantom_dust_bound_side_q = 0`
+7. set `mode_side = ResetPending`
 
 `finalize_side_reset(side)` MAY succeed only if all of the following hold:
 
@@ -686,7 +706,7 @@ This revision keeps exact account-local reserve cohorts up to a fixed exact-capa
 - `overflow_older_i`, a preserved **scheduled** overflow cohort whose already accrued maturity progress is never reset by newer additions, and
 - `overflow_newest_i`, an **unscheduled pending** overflow segment that absorbs any further post-saturation reserve conservatively without mutating older exact cohorts or `overflow_older_i`.
 
-The engine does **not** compute the horizon. It receives `H_lock` from the wrapper, validates it, and stores it on new live reserve.
+The engine does **not** compute the exact-cohort horizon. It receives `H_lock` from the wrapper, validates it, and stores it only on newly created exact cohorts. Overflow segments always use `H_overflow = H_max`.
 
 #### 4.4.1 `append_or_route_new_reserve(i, reserve_add, now_slot, H_lock)`
 
@@ -698,26 +718,27 @@ Preconditions:
 
 Effects:
 
+Define `H_overflow = H_max`.
+
 1. if `overflow_older_i` is present and `len(exact_reserve_cohorts_i) < MAX_EXACT_RESERVE_COHORTS_PER_ACCOUNT`:
    - promote `overflow_older_i` into the exact reserve queue as the newest exact cohort
    - clear `overflow_older_i`
 2. if `overflow_older_i` is absent and `overflow_newest_i` is present:
    - let `pending_q = overflow_newest_i.remaining_q`
-   - let `pending_h = overflow_newest_i.horizon_slots`
    - clear `overflow_newest_i`
    - if `len(exact_reserve_cohorts_i) < MAX_EXACT_RESERVE_COHORTS_PER_ACCOUNT`:
      - append one new exact cohort with:
        - `remaining_q = pending_q`
        - `anchor_q = pending_q`
        - `start_slot = now_slot`
-       - `horizon_slots = pending_h`
+       - `horizon_slots = H_overflow`
        - `sched_release_q = 0`
    - else:
      - set `overflow_older_i` to one new scheduled cohort with:
        - `remaining_q = pending_q`
        - `anchor_q = pending_q`
        - `start_slot = now_slot`
-       - `horizon_slots = pending_h`
+       - `horizon_slots = H_overflow`
        - `sched_release_q = 0`
 3. if `overflow_older_i` is absent and `overflow_newest_i` is absent and the newest exact cohort exists and all of the following hold:
    - `newest.start_slot == now_slot`
@@ -728,9 +749,8 @@ Effects:
    - `newest.anchor_q = checked_add_u128(newest.anchor_q, reserve_add)`
 4. else if `overflow_older_i` is present and `overflow_newest_i` is absent and all of the following hold:
    - `overflow_older_i.start_slot == now_slot`
-   - `overflow_older_i.horizon_slots == H_lock`
    - `overflow_older_i.sched_release_q == 0`
-   then exact merge into `overflow_older_i` is permitted:
+   then exact same-slot merge into `overflow_older_i` is permitted:
    - `overflow_older_i.remaining_q = checked_add_u128(overflow_older_i.remaining_q, reserve_add)`
    - `overflow_older_i.anchor_q = checked_add_u128(overflow_older_i.anchor_q, reserve_add)`
 5. else if `len(exact_reserve_cohorts_i) < MAX_EXACT_RESERVE_COHORTS_PER_ACCOUNT` and `overflow_older_i` is absent and `overflow_newest_i` is absent:
@@ -745,20 +765,20 @@ Effects:
      - `remaining_q = reserve_add`
      - `anchor_q = reserve_add`
      - `start_slot = now_slot`
-     - `horizon_slots = H_lock`
+     - `horizon_slots = H_overflow`
      - `sched_release_q = 0`
 7. else if `overflow_older_i` is present and `overflow_newest_i` is absent:
    - create one new `overflow_newest_i` pending segment with:
      - `remaining_q = reserve_add`
      - `anchor_q = reserve_add`
      - `start_slot = now_slot`
-     - `horizon_slots = H_lock`
+     - `horizon_slots = H_overflow`
      - `sched_release_q = 0`
 8. else:
    - `overflow_newest_i.remaining_q = checked_add_u128(overflow_newest_i.remaining_q, reserve_add)`
    - `overflow_newest_i.anchor_q = checked_add_u128(overflow_newest_i.anchor_q, reserve_add)`
    - `overflow_newest_i.start_slot = now_slot`
-   - `overflow_newest_i.horizon_slots` MUST remain unchanged
+   - `overflow_newest_i.horizon_slots` MUST remain equal to `H_overflow`
    - `overflow_newest_i.sched_release_q = 0`
 9. set `R_i = checked_add_u128(R_i, reserve_add)`
 
@@ -767,8 +787,8 @@ Normative consequences:
 - exact same-slot same-horizon merges remain exact
 - older exact cohorts are never compacted, restarted, or merged away merely because exact capacity is exhausted
 - `overflow_older_i` never has its schedule reset or extended by newer post-saturation additions
-- any conservative bounded-storage approximation is confined to `overflow_newest_i`, which remains unscheduled while pending
-- once created, `overflow_newest_i` keeps a first-write pending horizon until activation; later pending additions MUST NOT extend it
+- any conservative bounded-storage approximation is confined to overflow segments whose horizon is fixed to `H_overflow = H_max`
+- wrapper-supplied `H_lock` never mutates any overflow segment horizon
 - whenever present, `overflow_newest_i` always remains the economically newest reserve segment for LIFO-loss purposes
 
 #### 4.4.2 `apply_reserve_loss_lifo(i, reserve_loss)`
@@ -1019,6 +1039,7 @@ If `new_eff_pos_q != 0`, it MUST:
 - `set_position_basis_q(i, new_eff_pos_q)`
 - `a_basis_i = A_side(new_eff_pos_q)`
 - `k_snap_i = K_side(new_eff_pos_q)`
+- `f_snap_i = F_side_num(new_eff_pos_q)`
 - `epoch_snap_i = epoch_side(new_eff_pos_q)`
 
 ### 4.9 Phantom-dust helpers
@@ -1079,17 +1100,22 @@ The engine MUST use the following exact helpers.
 - require `q <= u128::MAX`
 - return `q`
 
-**Exact wide signed multiply-divide floor from K snapshots**
+**Exact wide signed multiply-divide floor from K/F snapshots**
 
-`wide_signed_mul_div_floor_from_k_pair(abs_basis_u128, k_then_i128, k_now_i128, den_u128)`:
+`wide_signed_mul_div_floor_from_kf_pair(abs_basis_u128, k_then_i128, k_now_i128, f_then_num_i128, f_now_num_i128, den_u128)`:
 
 - require `den_u128 > 0`
-- compute the exact signed wide difference `k_diff = k_now_i128 - k_then_i128` in a transient wide signed type
-- compute the exact wide magnitude `p = abs_basis_u128 * abs(k_diff)`
-- let `q = floor(p / den_u128)`
-- let `r = p mod den_u128`
-- if `k_diff >= 0`, return `q` as positive `i128` (require representable)
-- if `k_diff < 0`, return `-q` if `r == 0`, else return `-(q + 1)` to preserve mathematical floor semantics (require representable)
+- compute the exact signed wide differences:
+  - `k_diff = k_now_i128 - k_then_i128`
+  - `f_diff = f_now_num_i128 - f_then_num_i128`
+- compute the exact signed wide numerator component:
+  - `num = (k_diff * FUNDING_DEN) + f_diff`
+- compute the exact wide magnitude `p = abs_basis_u128 * abs(num)`
+- let `den_total = den_u128 * FUNDING_DEN`
+- let `q = floor(p / den_total)`
+- let `r = p mod den_total`
+- if `num >= 0`, return `q` as positive `i128` (require representable)
+- if `num < 0`, return `-q` if `r == 0`, else return `-(q + 1)` to preserve mathematical floor semantics (require representable)
 
 **Checked fee-debt conversion**
 
@@ -1224,10 +1250,12 @@ When touching account `i` on a live market:
 
 1. if `basis_pos_q_i == 0`, return immediately
 2. let `s = side(basis_pos_q_i)`
-3. let `den = checked_mul_u128(a_basis_i, POS_SCALE)`
-4. if `epoch_snap_i == epoch_s`:
+3. let `K_s = K_side(s)`
+4. let `F_s_num = F_side_num(s)`
+5. let `den = checked_mul_u128(a_basis_i, POS_SCALE)`
+6. if `epoch_snap_i == epoch_s`:
    - `q_eff_new = mul_div_floor_u128(abs(basis_pos_q_i) as u128, A_s, a_basis_i)`
-   - `pnl_delta = wide_signed_mul_div_floor_from_k_pair(abs(basis_pos_q_i) as u128, k_snap_i, K_s, den)`
+   - `pnl_delta = wide_signed_mul_div_floor_from_kf_pair(abs(basis_pos_q_i) as u128, k_snap_i, K_s, f_snap_i, F_s_num, den)`
    - `set_pnl(i, checked_add_i128(PNL_i, pnl_delta), UseHLock(H_lock))`
    - if `q_eff_new == 0`:
      - `inc_phantom_dust_bound(s)`
@@ -1236,11 +1264,14 @@ When touching account `i` on a live market:
    - else:
      - leave `basis_pos_q_i` and `a_basis_i` unchanged
      - set `k_snap_i = K_s`
+     - set `f_snap_i = F_s_num`
      - set `epoch_snap_i = epoch_s`
-5. else:
+7. else:
    - require `mode_s == ResetPending`
    - require `epoch_snap_i + 1 == epoch_s`
-   - `pnl_delta = wide_signed_mul_div_floor_from_k_pair(abs(basis_pos_q_i) as u128, k_snap_i, K_epoch_start_s, den)`
+   - let `K_epoch_start_s = K_epoch_start_side(s)`
+   - let `F_epoch_start_s_num = F_epoch_start_side_num(s)`
+   - `pnl_delta = wide_signed_mul_div_floor_from_kf_pair(abs(basis_pos_q_i) as u128, k_snap_i, K_epoch_start_s, f_snap_i, F_epoch_start_s_num, den)`
    - `set_pnl(i, checked_add_i128(PNL_i, pnl_delta), UseHLock(H_lock))`
    - `set_position_basis_q(i, 0)`
    - decrement `stale_account_count_s` using checked subtraction
@@ -1254,12 +1285,14 @@ When touching account `i` on a resolved market:
 2. let `s = side(basis_pos_q_i)`
 3. require `mode_s == ResetPending`
 4. require `epoch_snap_i + 1 == epoch_s`
-5. let `den = checked_mul_u128(a_basis_i, POS_SCALE)`
-6. `pnl_delta = wide_signed_mul_div_floor_from_k_pair(abs(basis_pos_q_i) as u128, k_snap_i, K_epoch_start_s, den)`
-7. `set_pnl(i, checked_add_i128(PNL_i, pnl_delta), ImmediateRelease)`
-8. `set_position_basis_q(i, 0)`
-9. decrement `stale_account_count_s` using checked subtraction
-10. reset snapshots to canonical zero-position defaults
+5. let `K_epoch_start_s = K_epoch_start_side(s)`
+6. let `F_epoch_start_s_num = F_epoch_start_side_num(s)`
+7. let `den = checked_mul_u128(a_basis_i, POS_SCALE)`
+8. `pnl_delta = wide_signed_mul_div_floor_from_kf_pair(abs(basis_pos_q_i) as u128, k_snap_i, K_epoch_start_s, f_snap_i, F_epoch_start_s_num, den)`
+9. `set_pnl(i, checked_add_i128(PNL_i, pnl_delta), ImmediateRelease)`
+10. `set_position_basis_q(i, 0)`
+11. decrement `stale_account_count_s` using checked subtraction
+12. reset snapshots to canonical zero-position defaults
 
 ### 5.5 `accrue_market_to(now_slot, oracle_price, funding_rate_e9_per_slot)`
 
@@ -1277,20 +1310,25 @@ This helper MUST:
    - compute signed `ΔP = (oracle_price as i128) - (P_last as i128)`
    - if `OI_long_0 > 0`, `K_long = checked_add_i128(K_long, checked_mul_i128(A_long as i128, ΔP))`
    - if `OI_short_0 > 0`, `K_short = checked_sub_i128(K_short, checked_mul_i128(A_short as i128, ΔP))`
-8. funding transfer, sub-stepped:
+8. funding transfer, sub-stepped into the high-precision cumulative funding numerator indices:
    - if `funding_rate_e9_per_slot != 0` and `dt > 0` and `OI_long_0 > 0` and `OI_short_0 > 0`:
      - let `remaining = dt`
      - while `remaining > 0`:
        - `dt_sub = min(remaining, MAX_FUNDING_DT)`
        - `fund_num_1 = checked_mul_i128(fund_px_0 as i128, funding_rate_e9_per_slot as i128)`
-       - `fund_num = checked_mul_i128(fund_num_1, dt_sub as i128)`
-       - `fund_term = floor_div_signed_conservative(fund_num, 1_000_000_000)`
-       - `K_long = checked_sub_i128(K_long, checked_mul_i128(A_long as i128, fund_term))`
-       - `K_short = checked_add_i128(K_short, checked_mul_i128(A_short as i128, fund_term))`
+       - `fund_num_step = checked_mul_i128(fund_num_1, dt_sub as i128)`
+       - `F_long_num = checked_sub_i128(F_long_num, checked_mul_i128(A_long as i128, fund_num_step))`
+       - `F_short_num = checked_add_i128(F_short_num, checked_mul_i128(A_short as i128, fund_num_step))`
        - `remaining = remaining - dt_sub`
 9. update `slot_last = now_slot`
 10. update `P_last = oracle_price`
 11. update `fund_px_last = oracle_price`
+
+Normative timing note:
+
+- `fund_px_0 = fund_px_last` is the start-of-call funding-price sample for the entire elapsed interval.
+- Funding exactness is represented through `F_side_num`; there is no per-call floor division inside `accrue_market_to`.
+- New entrants do not inherit prior fractional funding because they snapshot `f_snap_i = F_side_num` on attachment.
 
 ### 5.6 `enqueue_adl(ctx, liq_side, q_close_q, D)`
 
@@ -1438,7 +1476,7 @@ Each positive reserve increment is represented as its own exact reserve cohort u
 When exact storage is saturated, the engine may additionally use:
 
 - `overflow_older_i`, a preserved scheduled overflow cohort whose accrued progress continues exactly under its stored law, and
-- `overflow_newest_i`, a newest pending overflow segment that does not mature while pending and is activated later with a fresh scheduled law using its then-current `remaining_q` and stored pending horizon.
+- `overflow_newest_i`, a newest pending overflow segment that does not mature while pending and is activated later with a fresh scheduled law using its then-current `remaining_q` and the fixed conservative overflow horizon `H_overflow = H_max`.
 
 For any **scheduled** reserve segment with `(anchor_q, start_slot, horizon_slots, sched_release_q)`:
 
@@ -1451,7 +1489,8 @@ For the newest pending overflow segment:
 
 - `sched_release_q` remains `0` while pending
 - it does not auto-mature while pending
-- when it is activated, the activated scheduled cohort starts at `current_slot` with `anchor_q = remaining_q`, `sched_release_q = 0`, and the stored pending horizon that was fixed when the pending segment was first created
+- its stored `horizon_slots` is always `H_overflow = H_max`
+- when it is activated, the activated scheduled cohort starts at `current_slot` with `anchor_q = remaining_q`, `sched_release_q = 0`, and `horizon_slots = H_overflow = H_max`
 
 This exact cohort law plus pending-overflow law is the authoritative anti-grief warmup design in this revision.
 
@@ -2228,7 +2267,7 @@ An implementation MUST include tests that cover at least:
 10. **Trade equity unchanged by warmup release:** pure warmup release on unchanged `PNL_i` does not increase `Eq_trade_raw_i`.
 11. **Withdrawal equity increases with warmup release:** pure warmup release on unchanged `PNL_i` can increase `Eq_withdraw_raw_i`.
 12. **Incremental reserve no-restart:** adding a new positive reserve cohort does not change any older cohort's `start_slot`, `horizon_slots`, `anchor_q`, or already accrued maturity progress.
-13. **Dust-grief resistance:** repeated dust-sized positive reserve additions do not materially delay an older exact cohort's already accrued maturity progress. Once exact capacity is exhausted, any conservative bounded-storage delay is confined to `overflow_newest_i` while `overflow_older_i` and all exact cohorts remain unchanged.
+13. **Dust-grief resistance:** repeated dust-sized positive reserve additions do not materially delay an older exact cohort's already accrued maturity progress. Once exact capacity is exhausted, any conservative bounded-storage delay is confined to overflow segments that both use `H_overflow = H_max`, while `overflow_older_i` and all exact cohorts remain unchanged.
 14. **Exact cohort timing:** a scheduled reserve cohort with horizon `H_lock` does not release materially faster than `floor(anchor * elapsed / H_lock)` solely because of small-bucket rounding.
 15. **Bounded reserve storage:** the exact reserve queue length never exceeds `MAX_EXACT_RESERVE_COHORTS_PER_ACCOUNT`, at most one `overflow_older_i` and at most one `overflow_newest_i` exist, and total reserve segments never exceed `MAX_RESERVE_SEGMENTS_PER_ACCOUNT`.
 16. **Pending overflow locality:** when exact reserve capacity is exhausted, newer reserve beyond the preserved overflow cohort is routed only into `overflow_newest_i`, which remains pending until activated; exact cohorts and `overflow_older_i` remain unchanged.
@@ -2246,7 +2285,7 @@ An implementation MUST include tests that cover at least:
 28. **Precision-exhaustion terminal drain:** if `A_candidate == 0` with `OI_post > 0`, the engine force-drains both sides instead of reverting.
 29. **ADL representability fallback:** if `delta_K_abs` is non-representable or `K_opp + delta_K_exact` overflows, quantity socialization still proceeds and the remainder routes through `record_uninsured_protocol_loss`.
 30. **Insurance-first deficit coverage:** `enqueue_adl` spends `I` down to `I_floor` before any remaining bankruptcy loss is socialized or left as junior undercollateralization.
-31. **Funding transfer conservation under lazy settlement:** each funding sub-step applies the same `fund_term` to both sides' `K` updates.
+31. **Funding transfer conservation under lazy settlement:** each funding sub-step applies the same exact `fund_num_step` to both sides' `F_side_num` updates with opposite signs, so the theoretical side-aggregate funding transfer is zero-sum before settlement rounding.
 32. **Flat-account negative remainder:** a flat account with negative `PNL_i` after principal exhaustion resolves through `absorb_protocol_loss` only in the allowed already-authoritative flat-account paths.
 33. **Reset finalization:** after reconciling stale accounts, the side can leave `ResetPending` and accept fresh OI again.
 34. **Deposit loss seniority:** in `deposit`, realized losses are settled from newly deposited principal before any outstanding fee debt is swept.
@@ -2278,11 +2317,11 @@ An implementation MUST include tests that cover at least:
 60. **Withdrawal hypothetical aggregate consistency:** an open-position withdrawal simulation decreases both `V` and `C_tot` by the candidate withdrawal amount, so `Residual` and the current live haircut `h` are unchanged by the simulation.
 61. **Wrapper-owned live policy inputs:** public or permissionless wrappers do not expose arbitrary caller-chosen `H_lock` or live funding-rate inputs.
 62. **Price-bounded resolution:** `resolve_market` is a privileged deployment-owned transition, uses zero funding for the settlement transition, and rejects `resolved_price` outside the immutable deviation band around `P_last`.
-63. **Pending overflow activation:** when `overflow_older_i` is absent and `overflow_newest_i` is present, the next warmup-advance or reserve/loss helper that can activate it starts a new scheduled cohort at `current_slot` with `anchor_q = remaining_q`, `sched_release_q = 0`, and the stored pending horizon.
+63. **Pending overflow activation:** when `overflow_older_i` is absent and `overflow_newest_i` is present, the next warmup-advance or reserve/loss helper that can activate it starts a new scheduled cohort at `current_slot` with `anchor_q = remaining_q`, `sched_release_q = 0`, and `H_overflow = H_max`.
 64. **A-side-change dust bound:** when `enqueue_adl` performs quantity socialization with `OI_post < OI`, the conservative phantom-dust bound is added even if `A_prod_exact` divides `OI` exactly.
 65. **Active-position side cap:** any 0-to-nonzero basis attachment that would push the relevant side above `MAX_ACTIVE_POSITIONS_PER_SIDE` is rejected.
-66. **Pending overflow first-write horizon:** once `overflow_newest_i` is created, later pending additions do not mutate its stored horizon before activation.
-67. **High-precision funding expressiveness:** a nonzero wrapper-supplied `funding_rate_e9_per_slot` smaller than 1 basis point per slot can still be represented and produces proportionate cumulative funding over elapsed time without requiring shock-style wrapper injection.
+66. **Fixed overflow horizon:** `overflow_older_i` and `overflow_newest_i` always use `H_overflow = H_max`; wrapper-supplied `H_lock` never shortens or extends them.
+67. **High-precision funding exactness without sign bias:** a nonzero wrapper-supplied `funding_rate_e9_per_slot` smaller than 1 basis point per slot is accumulated exactly in `F_side_num` and therefore produces proportionate cumulative funding over elapsed time without positive-zero / negative-minus-one truncation asymmetry or shock-style wrapper injection.
 
 ## 13. Compatibility and upgrade notes
 
@@ -2309,18 +2348,21 @@ An implementation MUST include tests that cover at least:
    - whole snapshots may still auto-convert flat released profit for convenience
    - lossy conversion under `h < 1` is explicit user action through `convert_released_pnl`
 
-7. A deployment upgrading from v12.13.0 MUST update:
+7. A deployment upgrading from v12.14.0 MUST update:
+   - funding settlement to maintain `F_long_num`, `F_short_num`, `f_snap_i`, `F_epoch_start_long_num`, and `F_epoch_start_short_num`
+   - `settle_side_effects_live` and `settle_side_effects_resolved` to use the combined `K_side` / `F_side_num` helper
+   - overflow routing so both `overflow_older_i` and `overflow_newest_i` always use `H_overflow = H_max`
    - any implementation of `max_safe_flat_conversion_released` to use the capped exact helper or an equivalent exact wide comparison
-   - live flat auto-conversion to the new whole-only rule
+   - live flat auto-conversion to the whole-only rule
    - `convert_released_pnl` to support flat accounts subject to the exact safe-cap rule
    - withdrawal simulation to decrease both `V` and `C_tot` in the hypothetical state
-   - tests to include capped safe flat conversion, whole-only auto-conversion, no permissionless lossy crystallization, and aggregate-consistent withdrawal simulation
+   - tests to include exact high-precision funding settlement, fixed-horizon overflow semantics, capped safe flat conversion, whole-only auto-conversion, no permissionless lossy crystallization, and aggregate-consistent withdrawal simulation
 ## 14. Short wrapper note (deployment obligations, not engine-checked)
 
 The following requirements are obligations of a compliant deployment wrapper or enclosing runtime. They are **not** engine-checked arithmetic invariants except where §10 or §§1–2 explicitly say the engine validates a bound.
 
 1. **Do not expose caller-controlled live policy inputs.**  
-   The `H_lock` and `funding_rate_e9_per_slot` inputs appearing in live logical entrypoints of §10 are wrapper-owned internal policy inputs. Public or permissionless wrappers MUST derive them internally from trusted on-chain state or wrapper policy and MUST NOT accept arbitrary caller-chosen values.
+   The `H_lock` and `funding_rate_e9_per_slot` inputs appearing in live logical entrypoints of §10 are wrapper-owned internal policy inputs. Public or permissionless wrappers MUST derive them internally from trusted on-chain state or wrapper policy and MUST NOT accept arbitrary caller-chosen values. `H_lock` governs exact-cohort creation only; once exact reserve capacity is exhausted, overflow segments use the immutable conservative horizon `H_overflow = H_max`.
 
 2. **Authority-gate market resolution.**  
    `resolve_market` is a privileged deployment-owned transition. A compliant public wrapper MUST NOT expose it as a permissionless user path and MUST source `resolved_price` from the deployment's trusted settlement source or settlement policy. A compliant wrapper SHOULD refresh live market state immediately before invoking `resolve_market` when the deployment expects the immutable settlement band around `P_last` to reflect the latest live mark rather than an older stale mark.
@@ -2333,3 +2375,7 @@ The following requirements are obligations of a compliant deployment wrapper or 
 
 5. **Keep user-owned value-moving operations account-authorized.**  
    A compliant public wrapper MUST require the affected account's authorization for user-owned value-moving paths such as `deposit`, `withdraw`, `execute_trade`, and `convert_released_pnl`. The intended permissionless progress paths are `settle_account`, `liquidate`, `reclaim_empty_account`, `settle_flat_negative_pnl`, `force_close_resolved`, and `keeper_crank`.
+
+6. **Provide a post-snapshot resolved-close progress path.**  
+   Because `force_close_resolved` is intentionally multi-stage, a compliant deployment SHOULD provide either (a) an owner-facing self-service path that retries terminal close after stale reconciliation completes, or (b) a permissionless batch / incentive mechanism that sweeps resolved accounts once the shared resolved-payout snapshot is ready.
+
