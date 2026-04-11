@@ -3301,10 +3301,17 @@ impl RiskEngine {
             return Err(RiskError::AccountNotFound);
         }
 
-        let mut ctx = InstructionContext::new();
+        let mut ctx = InstructionContext::new_with_h_lock(h_lock);
 
-        // Step 3: touch_account_full_not_atomic
-        self.touch_account_full_not_atomic(idx as usize, oracle_price, now_slot)?;
+        // Step 2: accrue market
+        self.accrue_market_to(now_slot, oracle_price)?;
+        self.current_slot = now_slot;
+
+        // Step 3: live local touch
+        self.touch_account_live_local(idx as usize, &mut ctx)?;
+
+        // Finalize touched (whole-only conversion + fee sweep)
+        self.finalize_touched_accounts_post_live(&ctx);
 
         // Step 4: require amount <= C_i
         if self.accounts[idx as usize].capital.get() < amount {
@@ -3369,12 +3376,19 @@ impl RiskEngine {
             return Err(RiskError::AccountNotFound);
         }
 
-        let mut ctx = InstructionContext::new();
+        let mut ctx = InstructionContext::new_with_h_lock(h_lock);
 
-        // Step 3: touch_account_full_not_atomic
-        self.touch_account_full_not_atomic(idx as usize, oracle_price, now_slot)?;
+        // Step 2: accrue market
+        self.accrue_market_to(now_slot, oracle_price)?;
+        self.current_slot = now_slot;
 
-        // Steps 4-5: end-of-instruction resets
+        // Step 3: live local touch (no auto-convert, no fee-sweep)
+        self.touch_account_live_local(idx as usize, &mut ctx)?;
+
+        // Step 4: finalize (shared snapshot, whole-only conversion, fee-sweep)
+        self.finalize_touched_accounts_post_live(&ctx);
+
+        // Steps 5-6: end-of-instruction resets
         self.schedule_end_of_instruction_resets(&mut ctx)?;
         self.finalize_end_of_instruction_resets(&ctx);
         self.recompute_r_last_from_final_state(funding_rate_e9)?;
@@ -3433,11 +3447,15 @@ impl RiskEngine {
             return Err(RiskError::Overflow);
         }
 
-        let mut ctx = InstructionContext::new();
+        let mut ctx = InstructionContext::new_with_h_lock(h_lock);
 
-        // Steps 11-12: touch both
-        self.touch_account_full_not_atomic(a as usize, oracle_price, now_slot)?;
-        self.touch_account_full_not_atomic(b as usize, oracle_price, now_slot)?;
+        // Step 10: accrue market once
+        self.accrue_market_to(now_slot, oracle_price)?;
+        self.current_slot = now_slot;
+
+        // Steps 11-12: live local touch both (no auto-convert, no fee-sweep)
+        self.touch_account_live_local(a as usize, &mut ctx)?;
+        self.touch_account_live_local(b as usize, &mut ctx)?;
 
         // Step 13: capture old effective positions
         let old_eff_a = self.effective_pos_q(a as usize);
@@ -3612,6 +3630,9 @@ impl RiskEngine {
             buffer_pre_a, buffer_pre_b, fee_impact_a, fee_impact_b,
             trade_pnl_a, trade_pnl_b,
         )?;
+
+        // Finalize touched accounts (shared snapshot conversion + fee sweep)
+        self.finalize_touched_accounts_post_live(&ctx);
 
         // Steps 16-17: end-of-instruction resets
         self.schedule_end_of_instruction_resets(&mut ctx)?;
@@ -3886,15 +3907,21 @@ impl RiskEngine {
             return Ok(false);
         }
 
-        let mut ctx = InstructionContext::new();
+        let mut ctx = InstructionContext::new_with_h_lock(h_lock);
 
-        // Per spec §10.6 step 3: touch_account_full_not_atomic before the liquidation routine.
-        self.touch_account_full_not_atomic(idx as usize, oracle_price, now_slot)?;
+        // Step 2: accrue market
+        self.accrue_market_to(now_slot, oracle_price)?;
+        self.current_slot = now_slot;
+
+        // Step 3: live local touch
+        self.touch_account_live_local(idx as usize, &mut ctx)?;
+
+        // Finalize touched accounts
+        self.finalize_touched_accounts_post_live(&ctx);
 
         let result = self.liquidate_at_oracle_internal(idx, now_slot, oracle_price, policy, &mut ctx)?;
 
-        // End-of-instruction resets must run unconditionally because
-        // touch_account_full_not_atomic mutates state even when liquidation doesn't proceed.
+        // End-of-instruction resets
         self.schedule_end_of_instruction_resets(&mut ctx)?;
         self.finalize_end_of_instruction_resets(&ctx);
         self.recompute_r_last_from_final_state(funding_rate_e9)?;
@@ -4059,7 +4086,7 @@ impl RiskEngine {
         }
 
         // Step 1: initialize instruction context
-        let mut ctx = InstructionContext::new();
+        let mut ctx = InstructionContext::new_with_h_lock(h_lock);
 
         // Steps 2-4: validate inputs
         if now_slot < self.current_slot {
@@ -4281,13 +4308,18 @@ impl RiskEngine {
             return Err(RiskError::AccountNotFound);
         }
 
-        let mut ctx = InstructionContext::new();
+        let mut ctx = InstructionContext::new_with_h_lock(h_lock);
 
-        // Step 3: touch_account_full_not_atomic
-        self.touch_account_full_not_atomic(idx as usize, oracle_price, now_slot)?;
+        // Step 2: accrue market
+        self.accrue_market_to(now_slot, oracle_price)?;
+        self.current_slot = now_slot;
 
-        // Step 4: if flat, auto-conversion already happened in touch
+        // Step 3: live local touch (no auto-convert)
+        self.touch_account_live_local(idx as usize, &mut ctx)?;
+
+        // Step 4: if flat, finalize (which does whole-only conversion) and return
         if self.accounts[idx as usize].position_basis_q == 0 {
+            self.finalize_touched_accounts_post_live(&ctx);
             self.schedule_end_of_instruction_resets(&mut ctx)?;
             self.finalize_end_of_instruction_resets(&ctx);
             self.recompute_r_last_from_final_state(funding_rate_e9)?;
@@ -4343,9 +4375,13 @@ impl RiskEngine {
             return Err(RiskError::AccountNotFound);
         }
 
-        let mut ctx = InstructionContext::new();
+        let mut ctx = InstructionContext::new_with_h_lock(h_lock);
 
-        self.touch_account_full_not_atomic(idx as usize, oracle_price, now_slot)?;
+        // Accrue market + live local touch + finalize
+        self.accrue_market_to(now_slot, oracle_price)?;
+        self.current_slot = now_slot;
+        self.touch_account_live_local(idx as usize, &mut ctx)?;
+        self.finalize_touched_accounts_post_live(&ctx);
 
         // Position must be zero
         let eff = self.effective_pos_q(idx as usize);
