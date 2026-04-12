@@ -3890,28 +3890,52 @@ fn funding_new_entrant_must_not_inherit_old_fraction() {
 }
 
 #[test]
-#[ignore] // TODO: sign test needs different setup — setup_two_users init_oracle_price=1 causes large mark delta
 fn funding_basic_sign_convention() {
     // Positive rate: longs pay shorts.
-    let (mut engine, a, b) = setup_two_users(500_000, 500_000);
+    // Use new_with_market to set init_oracle_price = 1000 (no mark delta).
     let oracle = 1000u64;
-    let slot = 2u64;
+    let slot = 100u64;
+    let mut engine = RiskEngine::new_with_market(default_params(), slot, oracle);
+    let a = engine.add_user(1000).unwrap();
+    let b = engine.add_user(1000).unwrap();
+    engine.deposit(a, 500_000, oracle, slot).unwrap();
+    engine.deposit(b, 500_000, oracle, slot).unwrap();
+
     let size = make_size_q(100);
-    // Trade with the funding rate already set so recompute stores it
+    // Trade at oracle price — no slippage, no mark delta
     engine.execute_trade_not_atomic(a, b, oracle, slot, size, oracle, 50_000_000i128, 0).unwrap();
 
-    // Verify rate is stored
+    // Verify rate stored
     assert_eq!(engine.funding_rate_e9_per_slot_last, 50_000_000i128);
 
-    // Settle at a later slot to apply the stored rate
-    engine.settle_account_not_atomic(a, oracle, slot + 10, 50_000_000i128, 0).unwrap();
+    // Manually accrue to verify funding changes K
+    let k_before = engine.adl_coeff_long;
+    engine.accrue_market_to(slot + 10, oracle).unwrap();
+    let k_after = engine.adl_coeff_long;
+    assert!(k_after != k_before,
+        "K must change from funding: before={} after={} oi_long={} oi_short={} rate={} fund_px={}",
+        k_before, k_after, engine.oi_eff_long_q, engine.oi_eff_short_q,
+        engine.funding_rate_e9_per_slot_last, engine.funding_price_sample_last);
+
+    engine.current_slot = slot + 10;
+
+    // Now settle accounts to apply the K delta to PnL
+    let mut ctx = InstructionContext::new_with_h_lock(0);
+    engine.touch_account_live_local(a as usize, &mut ctx).unwrap();
+    engine.touch_account_live_local(b as usize, &mut ctx).unwrap();
+    engine.finalize_touched_accounts_post_live(&ctx);
+
     engine.settle_account_not_atomic(b, oracle, slot + 10, 50_000_000i128, 0).unwrap();
 
-    // a is long (pays), b is short (receives)
-    assert!(engine.accounts[a as usize].pnl < 0,
-        "positive rate: long must lose, got pnl={}", engine.accounts[a as usize].pnl);
-    assert!(engine.accounts[b as usize].pnl > 0,
-        "positive rate: short must gain, got pnl={}", engine.accounts[b as usize].pnl);
+    // Funding applied: long loses capital (PnL settled to principal), short gains.
+    // After settle_losses, negative PnL becomes a capital decrease and PnL resets to 0.
+    // So check capital change, not PnL directly.
+    let a_cap = engine.accounts[a as usize].capital.get();
+    let b_cap = engine.accounts[b as usize].capital.get();
+    assert!(a_cap < 500_000,
+        "positive rate: long must lose capital, got cap={}", a_cap);
+    assert!(b_cap > 500_000 || engine.accounts[b as usize].pnl > 0,
+        "positive rate: short must gain, cap={} pnl={}", b_cap, engine.accounts[b as usize].pnl);
     assert!(engine.check_conservation());
 }
 
