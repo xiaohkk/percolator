@@ -4964,6 +4964,46 @@ impl RiskEngine {
     // Insurance floor is fixed at initialization and cannot be changed at runtime.
 
     // ========================================================================
+    // Account fees (wrapper-owned)
+    // ========================================================================
+
+    /// charge_account_fee_not_atomic: public pure fee instruction for
+    /// wrapper-owned account fees (recurring, inactivity, subscription, etc.).
+    ///
+    /// Only mutates: C_i, fee_credits_i, I, C_tot, current_slot.
+    /// Never calls accrue_market_to or touches PNL, reserves, A/K, OI,
+    /// side modes, stale counters, or dust bounds.
+    ///
+    /// Fee beyond collectible headroom is dropped (not socialized).
+    pub fn charge_account_fee_not_atomic(
+        &mut self,
+        idx: u16,
+        fee_abs: u128,
+        now_slot: u64,
+    ) -> Result<()> {
+        if self.market_mode != MarketMode::Live {
+            return Err(RiskError::Unauthorized);
+        }
+        if idx as usize >= MAX_ACCOUNTS || !self.is_used(idx as usize) {
+            return Err(RiskError::AccountNotFound);
+        }
+        if now_slot < self.current_slot {
+            return Err(RiskError::Overflow);
+        }
+        if fee_abs > MAX_PROTOCOL_FEE_ABS {
+            return Err(RiskError::Overflow);
+        }
+
+        self.current_slot = now_slot;
+
+        if fee_abs > 0 {
+            self.charge_fee_to_insurance(idx as usize, fee_abs)?;
+        }
+
+        Ok(())
+    }
+
+    // ========================================================================
     // Fee credits
     // ========================================================================
 

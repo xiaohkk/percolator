@@ -4143,3 +4143,74 @@ fn test_funding_partition_invariance() {
     assert_eq!(cap_a, cap_b,
         "funding partition invariance: one-call cap={} != two-call cap={}", cap_a, cap_b);
 }
+
+// ============================================================================
+// Public account fee entrypoint (TDD)
+// ============================================================================
+
+#[test]
+fn test_charge_account_fee_basic() {
+    let mut engine = RiskEngine::new(default_params());
+    let a = engine.add_user(1000).unwrap();
+    engine.deposit(a, 100_000, 1000, 100).unwrap();
+
+    let cap_before = engine.accounts[a as usize].capital.get();
+    let ins_before = engine.insurance_fund.balance.get();
+    let vault_before = engine.vault.get();
+
+    engine.charge_account_fee_not_atomic(a, 5_000, 101).unwrap();
+
+    // Fee comes from capital → insurance. Vault unchanged.
+    assert_eq!(engine.accounts[a as usize].capital.get(), cap_before - 5_000);
+    assert_eq!(engine.insurance_fund.balance.get(), ins_before + 5_000);
+    assert_eq!(engine.vault.get(), vault_before);
+    assert!(engine.check_conservation());
+}
+
+#[test]
+fn test_charge_account_fee_excess_routes_to_fee_debt() {
+    let mut engine = RiskEngine::new(default_params());
+    let a = engine.add_user(1000).unwrap();
+    engine.deposit(a, 1_000, 1000, 100).unwrap();
+
+    // Fee larger than capital — excess goes to fee_credits
+    engine.charge_account_fee_not_atomic(a, 5_000, 101).unwrap();
+
+    assert_eq!(engine.accounts[a as usize].capital.get(), 0);
+    assert!(engine.accounts[a as usize].fee_credits.get() < 0,
+        "excess fee must create fee debt");
+    assert!(engine.check_conservation());
+}
+
+#[test]
+fn test_charge_account_fee_does_not_touch_pnl_or_reserve() {
+    let mut engine = RiskEngine::new(default_params());
+    let a = engine.add_user(1000).unwrap();
+    engine.deposit(a, 100_000, 1000, 100).unwrap();
+
+    let pnl_before = engine.accounts[a as usize].pnl;
+    let reserved_before = engine.accounts[a as usize].reserved_pnl;
+    let oi_long_before = engine.oi_eff_long_q;
+    let oi_short_before = engine.oi_eff_short_q;
+    let pnl_pos_tot_before = engine.pnl_pos_tot;
+
+    engine.charge_account_fee_not_atomic(a, 5_000, 101).unwrap();
+
+    assert_eq!(engine.accounts[a as usize].pnl, pnl_before, "PnL must not change");
+    assert_eq!(engine.accounts[a as usize].reserved_pnl, reserved_before, "reserved must not change");
+    assert_eq!(engine.oi_eff_long_q, oi_long_before, "OI_long must not change");
+    assert_eq!(engine.oi_eff_short_q, oi_short_before, "OI_short must not change");
+    assert_eq!(engine.pnl_pos_tot, pnl_pos_tot_before, "pnl_pos_tot must not change");
+}
+
+#[test]
+fn test_charge_account_fee_live_only() {
+    let mut engine = RiskEngine::new(default_params());
+    let a = engine.add_user(1000).unwrap();
+    engine.deposit(a, 100_000, 1000, 100).unwrap();
+    engine.accrue_market_to(100, 1000).unwrap();
+    engine.resolve_market(1000, 100).unwrap();
+
+    let result = engine.charge_account_fee_not_atomic(a, 1000, 200);
+    assert!(result.is_err(), "account fee must be rejected on resolved markets");
+}
