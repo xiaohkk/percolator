@@ -506,6 +506,32 @@ pub enum RiskError {
 
 pub type Result<T> = core::result::Result<T, RiskError>;
 
+/// Result of force_close_resolved_not_atomic (spec §10.8).
+/// Eliminates the Ok(0) ambiguity between "deferred" and "closed with zero payout."
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResolvedCloseResult {
+    /// Phase 1 reconciled but terminal payout not yet ready.
+    /// Account is still open. Re-call after all accounts reconciled.
+    Deferred,
+    /// Account closed and freed. Payout is the returned capital.
+    Closed(u128),
+}
+
+impl ResolvedCloseResult {
+    /// Extract capital if Closed, panic if Deferred.
+    pub fn expect_closed(self, msg: &str) -> u128 {
+        match self {
+            Self::Closed(cap) => cap,
+            Self::Deferred => panic!("{}", msg),
+        }
+    }
+
+    /// True if the account was deferred (still open).
+    pub fn is_deferred(self) -> bool {
+        matches!(self, Self::Deferred)
+    }
+}
+
 /// Liquidation policy (spec §10.6)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LiquidationPolicy {
@@ -4622,7 +4648,7 @@ impl RiskEngine {
     /// For positive-PnL on non-terminal markets, reconciliation persists and
     /// Ok(0) is returned (account stays open — re-call close_resolved_terminal
     /// after all accounts reconciled).
-    pub fn force_close_resolved_not_atomic(&mut self, idx: u16, resolved_slot: u64) -> Result<u128> {
+    pub fn force_close_resolved_not_atomic(&mut self, idx: u16, resolved_slot: u64) -> Result<ResolvedCloseResult> {
         // Phase 1: always reconcile (persists on success)
         self.reconcile_resolved_not_atomic(idx, resolved_slot)?;
 
@@ -4632,11 +4658,12 @@ impl RiskEngine {
         // pnl > 0: needs terminal readiness for payout
         if self.accounts[i].pnl > 0 && !self.is_terminal_ready() {
             // Reconciled but not yet payable. Progress persisted.
-            return Ok(0);
+            return Ok(ResolvedCloseResult::Deferred);
         }
 
         // Phase 2: terminal close
-        self.close_resolved_terminal_not_atomic(idx)
+        let capital = self.close_resolved_terminal_not_atomic(idx)?;
+        Ok(ResolvedCloseResult::Closed(capital))
     }
 
     /// Phase 1: Reconcile a resolved account. Materializes K-pair PnL,
@@ -5001,6 +5028,54 @@ impl RiskEngine {
         }
 
         Ok(())
+    }
+
+    // ========================================================================
+    // Fee credits
+    // ========================================================================
+    // settle_flat_negative_pnl (spec §10.8)
+    // ========================================================================
+
+    /// Lightweight permissionless instruction to resolve flat accounts with
+    /// negative PnL. Does NOT call accrue_market_to. Only absorbs the
+    /// negative PnL through insurance and zeroes it.
+    ///
+    /// Preconditions: account is flat (position_basis_q == 0) and pnl < 0.
+    pub fn settle_flat_negative_pnl_not_atomic(&mut self, idx: u16, now_slot: u64) -> Result<()> {
+        if self.market_mode != MarketMode::Live {
+            return Err(RiskError::Unauthorized);
+        }
+        if idx as usize >= MAX_ACCOUNTS || !self.is_used(idx as usize) {
+            return Err(RiskError::AccountNotFound);
+        }
+        if now_slot < self.current_slot {
+            return Err(RiskError::Overflow);
+        }
+        let i = idx as usize;
+        if self.accounts[i].position_basis_q != 0 {
+            return Err(RiskError::Undercollateralized);
+        }
+        if self.accounts[i].pnl >= 0 {
+            return Err(RiskError::Overflow); // no negative PnL to resolve
+        }
+
+        self.current_slot = now_slot;
+        self.resolve_flat_negative(i);
+        Ok(())
+    }
+
+    // ========================================================================
+    // Public getters for wrapper use
+    // ========================================================================
+
+    /// Whether the market is in Resolved mode.
+    pub fn is_resolved(&self) -> bool {
+        self.market_mode == MarketMode::Resolved
+    }
+
+    /// Resolved market context (price, slot). Only meaningful when is_resolved().
+    pub fn resolved_context(&self) -> (u64, u64) {
+        (self.resolved_price, self.resolved_slot)
     }
 
     // ========================================================================

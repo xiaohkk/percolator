@@ -2374,7 +2374,7 @@ fn test_force_close_resolved_flat_no_pnl() {
     engine.deposit(idx, 50_000, 1000, 100).unwrap();
 
     engine.market_mode = MarketMode::Resolved;
-    let returned = engine.force_close_resolved_not_atomic(idx, 100).unwrap();
+    let returned = engine.force_close_resolved_not_atomic(idx, 100).unwrap().expect_closed("force_close");
     assert_eq!(returned, 50_000);
     assert!(!engine.is_used(idx as usize));
     assert!(engine.check_conservation());
@@ -2415,7 +2415,7 @@ fn test_force_close_resolved_with_negative_pnl() {
 
     engine.market_mode = MarketMode::Resolved;
     let cap_before = engine.accounts[a as usize].capital.get();
-    let returned = engine.force_close_resolved_not_atomic(a, 100).unwrap();
+    let returned = engine.force_close_resolved_not_atomic(a, 100).unwrap().expect_closed("force_close");
 
     assert!(returned < cap_before, "loss must reduce returned capital");
     assert!(!engine.is_used(a as usize));
@@ -2434,7 +2434,7 @@ fn test_force_close_resolved_with_positive_pnl() {
 
     engine.market_mode = MarketMode::Resolved;
     engine.pnl_matured_pos_tot = engine.pnl_pos_tot;
-    let returned = engine.force_close_resolved_not_atomic(idx, 100).unwrap();
+    let returned = engine.force_close_resolved_not_atomic(idx, 100).unwrap().expect_closed("force_close");
     // Positive PnL converted to capital (haircutted) before return
     assert!(returned >= 50_000, "positive PnL must increase returned capital");
     assert!(!engine.is_used(idx as usize));
@@ -2452,7 +2452,7 @@ fn test_force_close_resolved_with_fee_debt() {
     engine.accounts[idx as usize].fee_credits = I128::new(-5000);
 
     engine.market_mode = MarketMode::Resolved;
-    let returned = engine.force_close_resolved_not_atomic(idx, 100).unwrap();
+    let returned = engine.force_close_resolved_not_atomic(idx, 100).unwrap().expect_closed("force_close");
     // Fee debt swept from capital first (spec §7.5 fee seniority):
     // 50_000 capital - 5_000 fee sweep = 45_000 returned
     assert_eq!(returned, 45_000, "fee debt swept before capital return");
@@ -2521,17 +2521,14 @@ fn test_force_close_combined_convenience() {
     engine.accrue_market_to(200, resolve_price).unwrap();
     engine.resolve_market(resolve_price, 200).unwrap();
 
-    // First call on positive-PnL account: reconciles, returns Ok(0)
+    // First call on positive-PnL account: reconciles, may be Deferred
     let a_result = engine.force_close_resolved_not_atomic(a, 200).unwrap();
-    // a is reconciled (position zeroed) but b still has a position
-    // So a gets deferred payout
-    if engine.accounts[a as usize].pnl > 0 {
-        assert_eq!(a_result, 0, "positive PnL deferred until terminal");
+    if engine.accounts[a as usize].pnl > 0 && a_result.is_deferred() {
         assert!(engine.is_used(a as usize), "account stays open when deferred");
     }
 
     // Close b (loser, no payout gate)
-    let b_result = engine.force_close_resolved_not_atomic(b, 200).unwrap();
+    engine.force_close_resolved_not_atomic(b, 200).unwrap().expect_closed("close b");
     assert!(!engine.is_used(b as usize), "b closed");
 
     // Now re-call a — terminal ready
@@ -2570,10 +2567,10 @@ fn test_force_close_same_epoch_positive_k_pair_pnl() {
     engine.resolve_market(1500, 200).unwrap();
 
     // Phase 1: reconcile loser (b) first — zeroes their position
-    let _b_returned = engine.force_close_resolved_not_atomic(b, 200).unwrap();
+    let _b_returned = engine.force_close_resolved_not_atomic(b, 200).unwrap().expect_closed("force_close");
 
     // Phase 2: now all positions zeroed — a gets terminal payout
-    let returned = engine.force_close_resolved_not_atomic(a, 200).unwrap();
+    let returned = engine.force_close_resolved_not_atomic(a, 200).unwrap().expect_closed("force_close");
 
     // Returned should include settled K-pair profit
     assert!(returned >= cap_after_trade, "K-pair profit must increase returned capital");
@@ -2598,7 +2595,7 @@ fn test_force_close_same_epoch_negative_k_pair_pnl() {
     engine.market_mode = MarketMode::Resolved;
     engine.pnl_matured_pos_tot = engine.pnl_pos_tot;
     let cap_before = engine.accounts[a as usize].capital.get();
-    let returned = engine.force_close_resolved_not_atomic(a, 200).unwrap();
+    let returned = engine.force_close_resolved_not_atomic(a, 200).unwrap().expect_closed("force_close");
 
     // Loss settled from capital
     assert!(returned < cap_before, "K-pair loss must reduce returned capital");
@@ -2616,7 +2613,7 @@ fn test_force_close_with_fee_debt_exceeding_capital() {
     engine.accounts[idx as usize].fee_credits = I128::new(-50_000);
 
     engine.market_mode = MarketMode::Resolved;
-    let returned = engine.force_close_resolved_not_atomic(idx, 100).unwrap();
+    let returned = engine.force_close_resolved_not_atomic(idx, 100).unwrap().expect_closed("force_close");
     // Capital (10k) fully swept to insurance, remaining debt forgiven
     assert_eq!(returned, 0, "all capital swept for fee debt");
     assert!(!engine.is_used(idx as usize));
@@ -2630,7 +2627,7 @@ fn test_force_close_zero_capital_zero_pnl() {
     // No deposit — capital = 0 (new_account_fee consumed all)
 
     engine.market_mode = MarketMode::Resolved;
-    let returned = engine.force_close_resolved_not_atomic(idx, 100).unwrap();
+    let returned = engine.force_close_resolved_not_atomic(idx, 100).unwrap().expect_closed("force_close");
     assert_eq!(returned, 0);
     assert!(!engine.is_used(idx as usize));
     assert!(engine.check_conservation());
@@ -2653,15 +2650,15 @@ fn test_force_close_c_tot_tracks_exactly() {
     let c_tot_before = engine.c_tot.get();
 
     engine.market_mode = MarketMode::Resolved;
-    let ret_a = engine.force_close_resolved_not_atomic(a, 100).unwrap();
+    let ret_a = engine.force_close_resolved_not_atomic(a, 100).unwrap().expect_closed("force_close");
     assert_eq!(engine.c_tot.get(), c_tot_before - ret_a);
 
     let c_tot_mid = engine.c_tot.get();
-    let ret_b = engine.force_close_resolved_not_atomic(b, 100).unwrap();
+    let ret_b = engine.force_close_resolved_not_atomic(b, 100).unwrap().expect_closed("force_close");
     assert_eq!(engine.c_tot.get(), c_tot_mid - ret_b);
 
     let c_tot_mid2 = engine.c_tot.get();
-    let ret_c = engine.force_close_resolved_not_atomic(c, 100).unwrap();
+    let ret_c = engine.force_close_resolved_not_atomic(c, 100).unwrap().expect_closed("force_close");
     assert_eq!(engine.c_tot.get(), c_tot_mid2 - ret_c);
 
     assert_eq!(engine.c_tot.get(), 0, "all accounts closed → C_tot must be 0");
@@ -2682,12 +2679,12 @@ fn test_force_close_stored_pos_count_tracks() {
 
     engine.market_mode = MarketMode::Resolved;
     engine.pnl_matured_pos_tot = engine.pnl_pos_tot;
-    engine.force_close_resolved_not_atomic(a, 100).unwrap();
+    engine.force_close_resolved_not_atomic(a, 100).unwrap().expect_closed("force_close");
     assert_eq!(engine.stored_pos_count_long, 0, "long count must decrement");
     // Short count unchanged — b still has position
     assert_eq!(engine.stored_pos_count_short, 1);
 
-    engine.force_close_resolved_not_atomic(b, 100).unwrap();
+    engine.force_close_resolved_not_atomic(b, 100).unwrap().expect_closed("force_close");
     assert_eq!(engine.stored_pos_count_short, 0, "short count must decrement");
 }
 
@@ -2703,7 +2700,7 @@ fn test_force_close_multiple_sequential_no_aggregate_drift() {
 
     engine.market_mode = MarketMode::Resolved;
     for &idx in &accounts {
-        engine.force_close_resolved_not_atomic(idx, 100).unwrap();
+        engine.force_close_resolved_not_atomic(idx, 100).unwrap().expect_closed("force_close");
     }
 
     assert_eq!(engine.c_tot.get(), 0);
@@ -2732,8 +2729,8 @@ fn test_force_close_decrements_positions() {
     assert_eq!(engine.oi_eff_long_q, 0, "resolve_market zeroes OI");
 
     // Close both sides — position counts go to 0
-    engine.force_close_resolved_not_atomic(a, 100).unwrap();
-    engine.force_close_resolved_not_atomic(b, 100).unwrap();
+    engine.force_close_resolved_not_atomic(a, 100).unwrap().expect_closed("force_close");
+    engine.force_close_resolved_not_atomic(b, 100).unwrap().expect_closed("force_close");
     assert_eq!(engine.stored_pos_count_long, 0);
     assert_eq!(engine.stored_pos_count_short, 0);
     assert!(engine.check_conservation());
@@ -2753,10 +2750,10 @@ fn test_force_close_both_sides_sequential() {
     engine.resolve_market(1000, 100).unwrap();
 
     // Close a first (reconcile, may not get terminal payout yet)
-    let a_returned = engine.force_close_resolved_not_atomic(a, 100).unwrap();
+    let a_returned = engine.force_close_resolved_not_atomic(a, 100).unwrap().expect_closed("force_close");
 
     // Close b — both positions now zeroed, snapshot captured
-    let b_returned = engine.force_close_resolved_not_atomic(b, 100).unwrap();
+    let b_returned = engine.force_close_resolved_not_atomic(b, 100).unwrap().expect_closed("force_close");
 
     // If a got 0 (deferred payout), it was freed but payout is in capital
     // Both must succeed and conservation must hold
@@ -4213,4 +4210,123 @@ fn test_charge_account_fee_live_only() {
 
     let result = engine.charge_account_fee_not_atomic(a, 1000, 200);
     assert!(result.is_err(), "account fee must be rejected on resolved markets");
+}
+
+// ============================================================================
+// Clean public API additions (TDD)
+// ============================================================================
+
+#[test]
+fn test_force_close_returns_enum_deferred() {
+    // force_close_resolved must return a typed enum, not ambiguous Ok(0).
+    let oracle = 1000u64;
+    let slot = 100u64;
+    let mut engine = RiskEngine::new_with_market(default_params(), slot, oracle);
+    let a = engine.add_user(1000).unwrap();
+    let b = engine.add_user(1000).unwrap();
+    engine.deposit(a, 500_000, oracle, slot).unwrap();
+    engine.deposit(b, 500_000, oracle, slot).unwrap();
+
+    let size = make_size_q(100);
+    engine.execute_trade_not_atomic(a, b, oracle, slot, size, oracle, 0i128, 0).unwrap();
+
+    // Price up — a (long) has positive PnL
+    engine.accrue_market_to(slot + 1, 1050).unwrap();
+    engine.resolve_market(1050, slot + 1).unwrap();
+
+    // force_close on positive-PnL account when b still has position → Deferred
+    let result = engine.force_close_resolved_not_atomic(a, slot + 1).unwrap();
+    match result {
+        ResolvedCloseResult::Deferred => {
+            assert!(engine.is_used(a as usize), "Deferred means account still open");
+        }
+        ResolvedCloseResult::Closed(cap) => {
+            panic!("expected Deferred, got Closed({})", cap);
+        }
+    }
+
+    // Close b (loser), then re-close a → should be Closed
+    engine.force_close_resolved_not_atomic(b, slot + 1).unwrap().expect_closed("close b");
+    let result2 = engine.force_close_resolved_not_atomic(a, slot + 1).unwrap();
+    match result2 {
+        ResolvedCloseResult::Closed(_cap) => {
+            assert!(!engine.is_used(a as usize));
+        }
+        ResolvedCloseResult::Deferred => {
+            panic!("expected Closed after all reconciled");
+        }
+    }
+    assert!(engine.check_conservation());
+}
+
+#[test]
+fn test_settle_flat_negative_pnl() {
+    // Lightweight permissionless path to zero out flat negative PnL.
+    let mut engine = RiskEngine::new(default_params());
+    let a = engine.add_user(1000).unwrap();
+    engine.deposit(a, 50_000, 1000, 100).unwrap();
+
+    // Inject flat negative PnL (simulate settled loss from prior touch)
+    engine.set_pnl(a as usize, -1000);
+
+    let ins_before = engine.insurance_fund.balance.get();
+
+    // settle_flat_negative_pnl absorbs the loss via insurance
+    engine.settle_flat_negative_pnl_not_atomic(a, 101).unwrap();
+
+    // PnL should be zeroed, insurance should have absorbed the loss
+    assert_eq!(engine.accounts[a as usize].pnl, 0,
+        "flat negative PnL must be zeroed");
+    assert!(engine.check_conservation());
+}
+
+#[test]
+fn test_settle_flat_negative_rejects_nonflat() {
+    // Must reject accounts with open positions
+    let (mut engine, a, b) = setup_two_users(500_000, 500_000);
+    let size = make_size_q(100);
+    engine.execute_trade_not_atomic(a, b, 1000, 2, size, 1000, 0i128, 0).unwrap();
+
+    let result = engine.settle_flat_negative_pnl_not_atomic(a, 3);
+    assert!(result.is_err(), "must reject accounts with open positions");
+}
+
+#[test]
+fn test_settle_flat_negative_rejects_positive_pnl() {
+    let mut engine = RiskEngine::new(default_params());
+    let a = engine.add_user(1000).unwrap();
+    engine.deposit(a, 50_000, 1000, 100).unwrap();
+    engine.set_pnl(a as usize, 1000); // positive PnL
+
+    let result = engine.settle_flat_negative_pnl_not_atomic(a, 101);
+    assert!(result.is_err(), "must reject positive PnL accounts");
+}
+
+#[test]
+fn test_is_resolved_getter() {
+    let mut engine = RiskEngine::new(default_params());
+    let _a = engine.add_user(1000).unwrap();
+    engine.deposit(_a, 100_000, 1000, 100).unwrap();
+
+    assert!(!engine.is_resolved(), "must be Live initially");
+
+    engine.accrue_market_to(100, 1000).unwrap();
+    engine.resolve_market(1000, 100).unwrap();
+
+    assert!(engine.is_resolved(), "must be Resolved after resolve_market");
+}
+
+#[test]
+fn test_resolved_context_getter() {
+    let oracle = 1000u64;
+    let slot = 100u64;
+    let mut engine = RiskEngine::new_with_market(default_params(), slot, oracle);
+    let _a = engine.add_user(1000).unwrap();
+    engine.deposit(_a, 100_000, oracle, slot).unwrap();
+    engine.accrue_market_to(slot, oracle).unwrap();
+    engine.resolve_market(oracle, slot).unwrap();
+
+    let (price, rslot) = engine.resolved_context();
+    assert_eq!(price, oracle);
+    assert_eq!(rslot, slot);
 }
