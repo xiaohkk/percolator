@@ -1927,7 +1927,8 @@ fn proof_audit4_init_in_place_canonical() {
     engine.last_oracle_price = 9999;
     engine.last_market_slot = 55;
     engine.funding_price_sample_last = 777;
-    engine.funding_remainder = 42;
+    engine.f_long_num = 42;
+    engine.f_short_num = -42;
     engine.params.insurance_floor = U128::new(12345);
     engine.next_account_id = 99;
     engine.free_head = u16::MAX; // break the freelist
@@ -1950,7 +1951,8 @@ fn proof_audit4_init_in_place_canonical() {
     assert!(engine.last_crank_slot == 0);
     assert!(engine.gc_cursor == 0);
     assert!(engine.lifetime_liquidations == 0);
-    assert!(engine.funding_remainder == 0);
+    assert!(engine.f_long_num == 0);
+    assert!(engine.f_short_num == 0);
 
     // ---- ADL / side state ----
     assert!(engine.adl_mult_long == ADL_ONE);

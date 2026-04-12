@@ -326,28 +326,31 @@ fn t10_38_accrue_funding_payer_driven() {
     let k_long_after = engine.adl_coeff_long;
     let k_short_after = engine.adl_coeff_short;
 
-    // Engine computes: fund_term = floor_div_signed_conservative(fund_px_0 * rate * dt / 1e9)
-    // With fund_px_0=100, dt=1: fund_num = 100 * rate * 1 = 100 * rate
-    // fund_term = floor(fund_num / 1_000_000_000)
-    // delta_k = A_side * fund_term
+    // v12.15: K gets truncation-divided integer part, F gets remainder.
+    // fund_num = 100 * rate. fund_term = fund_num / 1e9 (truncation toward zero).
+    // For |fund_num| < 1e9, fund_term = 0 and all funding goes to F.
     let fund_num = 100i128 * (rate as i128);
-    let fund_term = floor_div_signed_conservative_i128(fund_num, 1_000_000_000u128);
+    let fund_term = fund_num / (1_000_000_000i128);
+    let remainder = fund_num - fund_term * 1_000_000_000i128;
 
-    // K_long -= A_long * fund_term, K_short += A_short * fund_term
     let a_long = ADL_ONE as i128;
-    let expected_long = k_long_before - a_long * fund_term;
-    let expected_short = k_short_before + a_long * fund_term;
+    let expected_k_long = k_long_before - a_long * fund_term;
+    let expected_k_short = k_short_before + a_long * fund_term;
 
-    assert!(k_long_after == expected_long, "K_long must match fund_term computation");
-    assert!(k_short_after == expected_short, "K_short must match fund_term computation");
+    assert!(k_long_after == expected_k_long, "K_long must match truncated fund_term");
+    assert!(k_short_after == expected_k_short, "K_short must match truncated fund_term");
 
-    if rate > 0 {
-        assert!(k_long_after <= k_long_before, "positive rate: longs pay");
-        assert!(k_short_after >= k_short_before, "positive rate: shorts receive");
-    } else {
-        assert!(k_long_after >= k_long_before, "negative rate: longs receive");
-        assert!(k_short_after <= k_short_before, "negative rate: shorts pay");
-    }
+    // F captures the remainder (per-side, with A multiplication)
+    let expected_f_long = -(a_long * remainder);
+    let expected_f_short = a_long * remainder;
+    assert!(engine.f_long_num == expected_f_long, "F_long must capture remainder");
+    assert!(engine.f_short_num == expected_f_short, "F_short must capture remainder");
+
+    // Combined K + F is exact: no funding is lost
+    // K_delta * FUNDING_DEN + F_delta = A_side * fund_num (exact)
+    let k_delta_long = k_long_after - k_long_before;
+    let total_long = k_delta_long * 1_000_000_000i128 + engine.f_long_num;
+    assert!(total_long == -(a_long * fund_num), "K + F must equal exact funding");
 }
 
 // ############################################################################
