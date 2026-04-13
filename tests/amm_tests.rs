@@ -96,7 +96,7 @@ fn test_e2e_complete_user_journey() {
     // Accrue market to new price
     engine.advance_slot(10);
     let slot = engine.current_slot;
-    engine.accrue_market_to(slot, new_price).unwrap();
+    engine.accrue_market_to(slot, new_price, 0).unwrap();
 
     // Settle side effects for Alice (should have positive PnL from long)
     engine.settle_side_effects_with_h_lock(alice as usize, 0).unwrap();
@@ -114,7 +114,7 @@ fn test_e2e_complete_user_journey() {
     let slot = engine.current_slot;
     {
         let mut ctx = InstructionContext::new_with_h_lock(0);
-        engine.accrue_market_to(slot, new_price).unwrap();
+        engine.accrue_market_to(slot, new_price, 0).unwrap();
         engine.current_slot = slot;
         engine.touch_account_live_local(alice as usize, &mut ctx).unwrap();
         engine.finalize_touched_accounts_post_live(&ctx);
@@ -144,7 +144,7 @@ fn test_e2e_complete_user_journey() {
     let slot = engine.current_slot;
     {
         let mut ctx = InstructionContext::new_with_h_lock(0);
-        engine.accrue_market_to(slot, new_price).unwrap();
+        engine.accrue_market_to(slot, new_price, 0).unwrap();
         engine.current_slot = slot;
         engine.touch_account_live_local(alice as usize, &mut ctx).unwrap();
         engine.finalize_touched_accounts_post_live(&ctx);
@@ -195,13 +195,13 @@ fn test_e2e_funding_complete_cycle() {
     let alice_cap_before = engine.accounts[alice as usize].capital.get();
     let bob_cap_before = engine.accounts[bob as usize].capital.get();
 
-    // Store a positive funding rate: longs pay shorts (500 bps/slot)
-    // keeper_crank_not_atomic stores r_last = 500 via recompute_r_last_from_final_state
+    // Apply a positive funding rate: longs pay shorts
+    // v12.16.4: rate passed directly to accrue_market_to via keeper_crank
     engine.advance_slot(1);
     let slot1 = engine.current_slot;
     engine.keeper_crank_not_atomic(slot1, oracle_price, &[], 64, 50_000_000i128, 0).unwrap();
 
-    // Now r_last = 500. Advance time so next accrue_market_to applies funding.
+    // Advance time so next accrue_market_to applies funding.
     engine.advance_slot(20);
     let slot2 = engine.current_slot;
 

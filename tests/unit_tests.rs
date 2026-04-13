@@ -348,7 +348,7 @@ fn test_haircut_ratio_with_surplus() {
     engine.execute_trade_not_atomic(a, b, oracle, slot, size_q, oracle, 0i128, 0).expect("trade");
 
     // Now accrue market with a higher price
-    engine.accrue_market_to(2, 1100).expect("accrue");
+    engine.accrue_market_to(2, 1100, 0).expect("accrue");
     // Touch accounts to realize PnL
     {
         let mut ctx = InstructionContext::new_with_h_lock(0);
@@ -472,7 +472,7 @@ fn test_warmup_full_conversion_after_period() {
     engine.keeper_crank_not_atomic(slot2, new_oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64, 0i128, h_lock).expect("crank");
     {
         let mut ctx = InstructionContext::new_with_h_lock(h_lock);
-        engine.accrue_market_to(slot2, new_oracle).unwrap();
+        engine.accrue_market_to(slot2, new_oracle, 0).unwrap();
         engine.current_slot = slot2;
         engine.touch_account_live_local(a as usize, &mut ctx).unwrap();
         engine.finalize_touched_accounts_post_live(&ctx);
@@ -489,7 +489,7 @@ fn test_warmup_full_conversion_after_period() {
     engine.keeper_crank_not_atomic(slot3, new_oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64, 0i128, h_lock).expect("crank2");
     {
         let mut ctx = InstructionContext::new_with_h_lock(h_lock);
-        engine.accrue_market_to(slot3, new_oracle).unwrap();
+        engine.accrue_market_to(slot3, new_oracle, 0).unwrap();
         engine.current_slot = slot3;
         engine.touch_account_live_local(a as usize, &mut ctx).unwrap();
         engine.finalize_touched_accounts_post_live(&ctx);
@@ -915,7 +915,7 @@ fn test_close_account_after_trade_and_unwind() {
     engine.keeper_crank_not_atomic(slot2, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64, 0i128, 0).expect("crank");
     {
         let mut ctx = InstructionContext::new_with_h_lock(0);
-        engine.accrue_market_to(slot2, oracle).unwrap();
+        engine.accrue_market_to(slot2, oracle, 0).unwrap();
         engine.current_slot = slot2;
         engine.touch_account_live_local(a as usize, &mut ctx).unwrap();
         engine.finalize_touched_accounts_post_live(&ctx);
@@ -1269,7 +1269,7 @@ fn test_same_slot_price_change_applies_mark() {
 
     // Same slot, different price: mark-only update must apply
     let new_oracle = 1100u64;
-    engine.accrue_market_to(slot, new_oracle).expect("accrue");
+    engine.accrue_market_to(slot, new_oracle, 0).expect("accrue");
 
     // K_long must increase (price went up, longs gain)
     assert!(engine.adl_coeff_long > k_long_before,
@@ -1394,17 +1394,15 @@ fn test_accrue_market_to_multi_substep_large_dt() {
     let mut engine = RiskEngine::new(default_params());
     engine.last_oracle_price = 1000;
     engine.last_market_slot = 0;
-    engine.funding_price_sample_last = 1000;
     engine.adl_mult_long = ADL_ONE;
     engine.adl_mult_short = ADL_ONE;
     engine.oi_eff_long_q = POS_SCALE;
     engine.oi_eff_short_q = POS_SCALE;
 
     // High funding rate, large time gap requiring multiple sub-steps
-    engine.funding_rate_e9_per_slot_last = 500_000_000; // 50% in e9 (ppb)
     let large_dt = MAX_FUNDING_DT * 3 + 100; // triggers 4 sub-steps
 
-    let result = engine.accrue_market_to(large_dt, 1100);
+    let result = engine.accrue_market_to(large_dt, 1100, 500_000_000);
     assert!(result.is_ok(), "multi-substep accrual must not overflow: {:?}", result);
 
     // Price increased, so K_long must increase (mark + funding payer = long)
@@ -1418,18 +1416,16 @@ fn test_accrue_market_funding_rate_zero_no_funding_applied() {
     let mut engine = RiskEngine::new(default_params());
     engine.last_oracle_price = 1000;
     engine.last_market_slot = 0;
-    engine.funding_price_sample_last = 1000;
     engine.adl_mult_long = ADL_ONE;
     engine.adl_mult_short = ADL_ONE;
     engine.oi_eff_long_q = POS_SCALE;
     engine.oi_eff_short_q = POS_SCALE;
-    engine.funding_rate_e9_per_slot_last = 0;
 
     let k_long_before = engine.adl_coeff_long;
     let k_short_before = engine.adl_coeff_short;
 
     // Same price, time passes: with zero rate, only mark applies (0 delta_p)
-    engine.accrue_market_to(100, 1000).unwrap();
+    engine.accrue_market_to(100, 1000, 0).unwrap();
 
     // No price change + no funding → K unchanged
     assert_eq!(engine.adl_coeff_long, k_long_before);
@@ -1442,19 +1438,16 @@ fn test_accrue_market_applies_funding_transfer() {
     let mut engine = RiskEngine::new(default_params());
     engine.last_oracle_price = 1000;
     engine.last_market_slot = 0;
-    engine.funding_price_sample_last = 1000;
     engine.adl_mult_long = ADL_ONE;
     engine.adl_mult_short = ADL_ONE;
     engine.oi_eff_long_q = POS_SCALE;
     engine.oi_eff_short_q = POS_SCALE;
 
-    // Positive rate: longs pay shorts
-    engine.funding_rate_e9_per_slot_last = 100_000_000; // 10% in ppb (e9)
-
     let k_long_before = engine.adl_coeff_long;
     let k_short_before = engine.adl_coeff_short;
 
-    engine.accrue_market_to(10, 1000).unwrap(); // same price, dt=10
+    // Positive rate: longs pay shorts (10% in ppb)
+    engine.accrue_market_to(10, 1000, 100_000_000).unwrap(); // same price, dt=10
 
     // fund_num = 1000 * 100_000_000 * 10 = 1_000_000_000_000
     // fund_term = floor(1_000_000_000_000 / 1_000_000_000) = 1000
@@ -1476,17 +1469,15 @@ fn test_accrue_market_no_funding_when_rate_zero() {
     let mut engine = RiskEngine::new(default_params());
     engine.last_oracle_price = 1000;
     engine.last_market_slot = 0;
-    engine.funding_price_sample_last = 1000;
     engine.adl_mult_long = ADL_ONE;
     engine.adl_mult_short = ADL_ONE;
     engine.oi_eff_long_q = POS_SCALE;
     engine.oi_eff_short_q = POS_SCALE;
-    engine.funding_rate_e9_per_slot_last = 0;
 
     let k_long_before = engine.adl_coeff_long;
     let k_short_before = engine.adl_coeff_short;
 
-    engine.accrue_market_to(10, 1000).unwrap();
+    engine.accrue_market_to(10, 1000, 0).unwrap();
 
     assert_eq!(engine.adl_coeff_long, k_long_before, "zero rate: long K unchanged");
     assert_eq!(engine.adl_coeff_short, k_short_before, "zero rate: short K unchanged");
@@ -1663,7 +1654,6 @@ fn test_charge_fee_safe_rejects_pnl_at_i256_min() {
     engine.last_oracle_price = oracle;
     engine.last_market_slot = slot;
     engine.last_crank_slot = slot;
-    engine.funding_price_sample_last = oracle;
 
     // Liquidation should handle this gracefully (return Err or succeed without i128::MIN)
     let result = engine.liquidate_at_oracle_not_atomic(a, slot, oracle, LiquidationPolicy::FullClose, 0i128, 0);
@@ -1700,7 +1690,7 @@ fn test_drain_only_blocks_oi_increase() {
 #[test]
 fn test_oracle_price_zero_rejected() {
     let (mut engine, a, _b) = setup_two_users(10_000_000, 10_000_000);
-    let result = engine.accrue_market_to(2, 0);
+    let result = engine.accrue_market_to(2, 0, 0);
     assert!(result.is_err(), "oracle price 0 must be rejected");
 }
 
@@ -1709,15 +1699,13 @@ fn test_oracle_price_max_accepted() {
     let mut engine = RiskEngine::new(default_params());
     engine.last_oracle_price = 1000;
     engine.last_market_slot = 0;
-    engine.funding_price_sample_last = 1000;
     engine.adl_mult_long = ADL_ONE;
     engine.adl_mult_short = ADL_ONE;
-    engine.funding_rate_e9_per_slot_last = 0;
 
-    let result = engine.accrue_market_to(1, MAX_ORACLE_PRICE);
+    let result = engine.accrue_market_to(1, MAX_ORACLE_PRICE, 0);
     assert!(result.is_ok(), "MAX_ORACLE_PRICE must be accepted");
 
-    let result2 = engine.accrue_market_to(2, MAX_ORACLE_PRICE + 1);
+    let result2 = engine.accrue_market_to(2, MAX_ORACLE_PRICE + 1, 0);
     assert!(result2.is_err(), "above MAX_ORACLE_PRICE must be rejected");
 }
 
@@ -2097,7 +2085,7 @@ fn test_property_50_flat_only_auto_conversion() {
     // Touch with open position — should NOT auto-convert
     {
         let mut ctx = InstructionContext::new_with_h_lock(0);
-        engine.accrue_market_to(slot + 1, oracle).unwrap();
+        engine.accrue_market_to(slot + 1, oracle, 0).unwrap();
         engine.current_slot = slot + 1;
         engine.touch_account_live_local(idx_a, &mut ctx).unwrap();
         engine.finalize_touched_accounts_post_live(&ctx);
@@ -2121,7 +2109,7 @@ fn test_property_50_flat_only_auto_conversion() {
     let cap_before_flat = engine.accounts[idx_a].capital.get();
     {
         let mut ctx = InstructionContext::new_with_h_lock(0);
-        engine.accrue_market_to(slot + 2, oracle).unwrap();
+        engine.accrue_market_to(slot + 2, oracle, 0).unwrap();
         engine.current_slot = slot + 2;
         engine.touch_account_live_local(idx_a, &mut ctx).unwrap();
         engine.finalize_touched_accounts_post_live(&ctx);
@@ -2448,7 +2436,7 @@ fn test_resolved_two_phase_no_deadlock() {
 
     // Price up within 10% band — a gets positive PnL, b negative
     let resolve_price = 1050u64;
-    engine.accrue_market_to(200, resolve_price).unwrap();
+    engine.accrue_market_to(200, resolve_price, 0).unwrap();
     engine.resolve_market(resolve_price, 200).unwrap();
 
     // Phase 1: reconcile both (persists progress, no deadlock)
@@ -2482,7 +2470,7 @@ fn test_force_close_combined_convenience() {
 
     engine.execute_trade_not_atomic(a, b, 1000, 100, (100 * POS_SCALE) as i128, 1000, 0i128, 0).unwrap();
     let resolve_price = 1050u64;
-    engine.accrue_market_to(200, resolve_price).unwrap();
+    engine.accrue_market_to(200, resolve_price, 0).unwrap();
     engine.resolve_market(resolve_price, 200).unwrap();
 
     // First call on positive-PnL account: reconciles, may be Deferred
@@ -2522,7 +2510,7 @@ fn test_force_close_same_epoch_positive_k_pair_pnl() {
 
     // Advance K via price movement (mark-to-market) — NOT touching a or b as candidates
     // so K-pair PnL remains unrealized for them
-    engine.accrue_market_to(200, 1500).unwrap();
+    engine.accrue_market_to(200, 1500, 0).unwrap();
     engine.current_slot = 200;
     // Align fee slots to 200 to prevent fee on force_close
 
@@ -3014,7 +3002,7 @@ fn test_touch_live_local_does_not_auto_convert() {
 
     let mut ctx = InstructionContext::new_with_h_lock(50);
     // accrue first
-    engine.accrue_market_to(100, 1000).unwrap();
+    engine.accrue_market_to(100, 1000, 0).unwrap();
     engine.touch_account_live_local(idx as usize, &mut ctx).unwrap();
 
     // Capital must NOT increase (no auto-conversion in live local touch)
@@ -3086,6 +3074,8 @@ fn test_resolve_market_basic() {
     engine.deposit(b, 500_000, 1000, 100).unwrap();
     engine.execute_trade_not_atomic(a, b, 1000, 100, (100 * POS_SCALE) as i128, 1000, 0i128, 0).unwrap();
 
+    // Accrue to resolution slot first (v12.16.4 requirement)
+    engine.accrue_market_to(200, 1000, 0).unwrap();
     // Resolve at the same price
     let result = engine.resolve_market(1000, 200);
     assert!(result.is_ok());
@@ -3102,6 +3092,8 @@ fn test_resolve_market_rejects_out_of_band_price() {
     let idx_tmp = engine.add_user(1000).unwrap(); engine.deposit(idx_tmp, 100_000, 1000, 100).unwrap();
     engine.last_oracle_price = 1000;
 
+    // Accrue to resolution slot first (v12.16.4 requirement)
+    engine.accrue_market_to(200, 1000, 0).unwrap();
     // resolve_price_deviation_bps = 1000 (10%)
     // Price must be within 10% of P_last=1000 → [900, 1100]
     let result = engine.resolve_market(1200, 200); // 20% deviation
@@ -3114,6 +3106,8 @@ fn test_resolve_market_accepts_in_band_price() {
     let idx_tmp = engine.add_user(1000).unwrap(); engine.deposit(idx_tmp, 100_000, 1000, 100).unwrap();
     engine.last_oracle_price = 1000;
 
+    // Accrue to resolution slot first (v12.16.4 requirement)
+    engine.accrue_market_to(200, 1000, 0).unwrap();
     let result = engine.resolve_market(1050, 200); // 5% deviation, within 10% band
     assert!(result.is_ok());
 }
@@ -3138,7 +3132,7 @@ fn test_blocker1_trade_open_must_not_use_unreleased_pnl() {
     engine.execute_trade_not_atomic(a, b, 1000, 100, size, 1000, 0i128, 50).unwrap();
 
     // Price moves up — a gains unreleased profit
-    engine.accrue_market_to(101, 1100).unwrap();
+    engine.accrue_market_to(101, 1100, 0).unwrap();
     engine.current_slot = 101;
     let mut ctx = InstructionContext::new_with_h_lock(50);
     engine.touch_account_live_local(a as usize, &mut ctx).unwrap();
@@ -3283,7 +3277,7 @@ fn audit_6_materialize_with_fee_needs_live_gate() {
     let mut engine = RiskEngine::new(default_params());
     let _a = engine.add_user(1000).unwrap();
     engine.deposit(_a, 100_000, 1000, 100).unwrap();
-    engine.accrue_market_to(100, 1000).unwrap();
+    engine.accrue_market_to(100, 1000, 0).unwrap();
     engine.resolve_market(1000, 100).unwrap();
 
     let result = engine.materialize_with_fee(
@@ -3300,6 +3294,8 @@ fn audit_8_resolve_must_enforce_band_before_first_accrue() {
     engine.deposit(_a, 100_000, 1000, 100).unwrap();
     // engine.last_oracle_price = 1000 from init
     // resolve_price_deviation_bps = 1000 (10%)
+    // v12.16.4: must accrue to resolution slot first
+    engine.accrue_market_to(200, 1000, 0).unwrap();
     // Price 2000 is 100% deviation, well outside 10% band
     let result = engine.resolve_market(2000, 200);
     assert!(result.is_err(),
@@ -3344,10 +3340,10 @@ fn audit_10_accrue_market_to_must_reject_on_resolved() {
     let mut engine = RiskEngine::new(default_params());
     let _a = engine.add_user(1000).unwrap();
     engine.deposit(_a, 100_000, 1000, 100).unwrap();
-    engine.accrue_market_to(100, 1000).unwrap();
+    engine.accrue_market_to(100, 1000, 0).unwrap();
     engine.resolve_market(1000, 100).unwrap();
 
-    let result = engine.accrue_market_to(200, 1100);
+    let result = engine.accrue_market_to(200, 1100, 0);
     assert!(result.is_err(), "accrue_market_to must reject on resolved markets");
 }
 
@@ -3500,11 +3496,8 @@ fn funding_new_entrant_must_not_inherit_old_fraction() {
     let size = make_size_q(100);
     engine.execute_trade_not_atomic(a, b, oracle, slot, size, oracle, 0i128, 0).unwrap();
 
-    // Set a tiny positive funding rate
-    engine.recompute_r_last_from_final_state(1i128).unwrap(); // 1 ppb/slot
-
-    // Accrue 1 slot — fractional funding accumulates
-    engine.accrue_market_to(slot + 1, oracle).unwrap();
+    // Accrue 1 slot with a tiny positive funding rate — fractional funding accumulates
+    engine.accrue_market_to(slot + 1, oracle, 1).unwrap();
 
     // New pair joins
     let c = engine.add_user(1000).unwrap();
@@ -3514,8 +3507,8 @@ fn funding_new_entrant_must_not_inherit_old_fraction() {
     let size2 = make_size_q(100);
     engine.execute_trade_not_atomic(c, d, oracle, slot + 1, size2, oracle, 0i128, 0).unwrap();
 
-    // Accrue 1 more slot
-    engine.accrue_market_to(slot + 2, oracle).unwrap();
+    // Accrue 1 more slot with same rate
+    engine.accrue_market_to(slot + 2, oracle, 1).unwrap();
     engine.current_slot = slot + 2;
 
     // Touch new pair
@@ -3549,17 +3542,13 @@ fn funding_basic_sign_convention() {
     // Trade at oracle price — no slippage, no mark delta
     engine.execute_trade_not_atomic(a, b, oracle, slot, size, oracle, 50_000_000i128, 0).unwrap();
 
-    // Verify rate stored
-    assert_eq!(engine.funding_rate_e9_per_slot_last, 50_000_000i128);
-
-    // Manually accrue to verify funding changes K
+    // Manually accrue to verify funding changes K (pass rate directly)
     let k_before = engine.adl_coeff_long;
-    engine.accrue_market_to(slot + 10, oracle).unwrap();
+    engine.accrue_market_to(slot + 10, oracle, 50_000_000).unwrap();
     let k_after = engine.adl_coeff_long;
     assert!(k_after != k_before,
-        "K must change from funding: before={} after={} oi_long={} oi_short={} rate={} fund_px={}",
-        k_before, k_after, engine.oi_eff_long_q, engine.oi_eff_short_q,
-        engine.funding_rate_e9_per_slot_last, engine.funding_price_sample_last);
+        "K must change from funding: before={} after={} oi_long={} oi_short={}",
+        k_before, k_after, engine.oi_eff_long_q, engine.oi_eff_short_q);
 
     engine.current_slot = slot + 10;
 
@@ -3751,7 +3740,7 @@ fn test_funding_partition_invariance() {
     let size = make_size_q(100);
     ea.execute_trade_not_atomic(a1, a2, oracle, slot, size, oracle, rate, 0).unwrap();
     // One accrue of 2 slots
-    ea.accrue_market_to(slot + 2, oracle).unwrap();
+    ea.accrue_market_to(slot + 2, oracle, 0).unwrap();
     ea.current_slot = slot + 2;
     let mut ctx_a = InstructionContext::new_with_h_lock(0);
     ea.touch_account_live_local(a1 as usize, &mut ctx_a).unwrap();
@@ -3766,8 +3755,8 @@ fn test_funding_partition_invariance() {
     eb.deposit(b2, 500_000, oracle, slot).unwrap();
     eb.execute_trade_not_atomic(b1, b2, oracle, slot, size, oracle, rate, 0).unwrap();
     // Two accrues of 1 slot each
-    eb.accrue_market_to(slot + 1, oracle).unwrap();
-    eb.accrue_market_to(slot + 2, oracle).unwrap();
+    eb.accrue_market_to(slot + 1, oracle, 0).unwrap();
+    eb.accrue_market_to(slot + 2, oracle, 0).unwrap();
     eb.current_slot = slot + 2;
     let mut ctx_b = InstructionContext::new_with_h_lock(0);
     eb.touch_account_live_local(b1 as usize, &mut ctx_b).unwrap();
@@ -3856,7 +3845,7 @@ fn test_charge_account_fee_live_only() {
     let mut engine = RiskEngine::new(default_params());
     let a = engine.add_user(1000).unwrap();
     engine.deposit(a, 100_000, 1000, 100).unwrap();
-    engine.accrue_market_to(100, 1000).unwrap();
+    engine.accrue_market_to(100, 1000, 0).unwrap();
     engine.resolve_market(1000, 100).unwrap();
 
     let result = engine.charge_account_fee_not_atomic(a, 1000, 200);
@@ -3882,7 +3871,7 @@ fn test_force_close_returns_enum_deferred() {
     engine.execute_trade_not_atomic(a, b, oracle, slot, size, oracle, 0i128, 0).unwrap();
 
     // Price up — a (long) has positive PnL
-    engine.accrue_market_to(slot + 1, 1050).unwrap();
+    engine.accrue_market_to(slot + 1, 1050, 0).unwrap();
     engine.resolve_market(1050, slot + 1).unwrap();
 
     // force_close on positive-PnL account when b still has position → Deferred
@@ -3962,7 +3951,7 @@ fn test_is_resolved_getter() {
 
     assert!(!engine.is_resolved(), "must be Live initially");
 
-    engine.accrue_market_to(100, 1000).unwrap();
+    engine.accrue_market_to(100, 1000, 0).unwrap();
     engine.resolve_market(1000, 100).unwrap();
 
     assert!(engine.is_resolved(), "must be Resolved after resolve_market");
@@ -3975,7 +3964,7 @@ fn test_resolved_context_getter() {
     let mut engine = RiskEngine::new_with_market(default_params(), slot, oracle);
     let _a = engine.add_user(1000).unwrap();
     engine.deposit(_a, 100_000, oracle, slot).unwrap();
-    engine.accrue_market_to(slot, oracle).unwrap();
+    engine.accrue_market_to(slot, oracle, 0).unwrap();
     engine.resolve_market(oracle, slot).unwrap();
 
     let (price, rslot) = engine.resolved_context();

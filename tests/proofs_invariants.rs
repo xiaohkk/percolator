@@ -221,7 +221,7 @@ fn inductive_settle_loss_preserves_accounting() {
     // touch_account_live_local settles losses from principal (step 9)
     {
         let mut ctx = InstructionContext::new_with_h_lock(0);
-        engine.accrue_market_to(DEFAULT_SLOT, DEFAULT_ORACLE).unwrap();
+        engine.accrue_market_to(DEFAULT_SLOT, DEFAULT_ORACLE, 0).unwrap();
         engine.current_slot = DEFAULT_SLOT;
         let _ = engine.touch_account_live_local(idx as usize, &mut ctx);
         engine.finalize_touched_accounts_post_live(&ctx);

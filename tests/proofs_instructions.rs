@@ -271,8 +271,6 @@ fn t10_37_accrue_mark_matches_eager() {
     engine.adl_mult_short = ADL_ONE;
     engine.last_oracle_price = 100;
     engine.last_market_slot = 0;
-    engine.funding_rate_e9_per_slot_last = 0;
-    engine.funding_price_sample_last = 100;
 
     let k_long_before = engine.adl_coeff_long;
     let k_short_before = engine.adl_coeff_short;
@@ -282,7 +280,7 @@ fn t10_37_accrue_mark_matches_eager() {
     let new_price = (100i16 + dp as i16) as u64;
     kani::assume(new_price > 0);
 
-    let result = engine.accrue_market_to(1, new_price);
+    let result = engine.accrue_market_to(1, new_price, 0);
     assert!(result.is_ok());
 
     let k_long_after = engine.adl_coeff_long;
@@ -310,17 +308,15 @@ fn t10_38_accrue_funding_payer_driven() {
     engine.adl_mult_short = ADL_ONE;
     engine.last_oracle_price = 100;
     engine.last_market_slot = 0;
-    engine.funding_price_sample_last = 100;
 
     let rate: i8 = kani::any();
     kani::assume(rate != 0);
     kani::assume(rate >= -100 && rate <= 100);
-    engine.funding_rate_e9_per_slot_last = rate as i128;
 
     let k_long_before = engine.adl_coeff_long;
     let k_short_before = engine.adl_coeff_short;
 
-    let result = engine.accrue_market_to(1, 100);
+    let result = engine.accrue_market_to(1, 100, rate as i128);
     assert!(result.is_ok());
 
     let k_long_after = engine.adl_coeff_long;
@@ -502,7 +498,6 @@ fn t11_50_execute_trade_atomic_oi_update_sign_flip() {
     engine.last_oracle_price = 100;
     engine.last_market_slot = 1;
     engine.last_crank_slot = 1;
-    engine.funding_price_sample_last = 100;
 
     let size_q = POS_SCALE as i128;
     let r1 = engine.execute_trade_not_atomic(a, b, 100, 1, size_q, 100, 0i128, 0);
@@ -530,7 +525,6 @@ fn t11_51_execute_trade_slippage_zero_sum() {
     engine.last_oracle_price = 100;
     engine.last_market_slot = 1;
     engine.last_crank_slot = 1;
-    engine.funding_price_sample_last = 100;
 
     let vault_before = engine.vault.get();
 
@@ -576,7 +570,7 @@ fn t11_52_touch_account_full_restart_fee_seniority() {
     // New touch pattern: accrue market, then touch_account_live_local + finalize
     {
         let mut ctx = InstructionContext::new_with_h_lock(0);
-        engine.accrue_market_to(100, 100).unwrap();
+        engine.accrue_market_to(100, 100, 0).unwrap();
         engine.current_slot = 100;
         engine.touch_account_live_local(idx as usize, &mut ctx).unwrap();
         engine.finalize_touched_accounts_post_live(&ctx);
@@ -607,7 +601,6 @@ fn t11_54_worked_example_regression() {
     engine.last_oracle_price = 100;
     engine.last_market_slot = 1;
     engine.last_crank_slot = 1;
-    engine.funding_price_sample_last = 100;
 
     let size_q = (2 * POS_SCALE) as i128;
     let r1 = engine.execute_trade_not_atomic(a, b, 100, 1, size_q, 100, 0i128, 0);

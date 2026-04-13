@@ -366,9 +366,6 @@ pub struct RiskEngine {
     pub params: RiskParams,
     pub current_slot: u64,
 
-    /// Stored funding rate for anti-retroactivity
-    pub funding_rate_e9_per_slot_last: i128,
-
     /// Market mode (spec §2.2)
     pub market_mode: MarketMode,
     /// Resolved market state
@@ -416,13 +413,13 @@ pub struct RiskEngine {
     /// Materialized account count (spec §2.2)
     pub materialized_account_count: u64,
 
+    /// Count of accounts with PNL < 0 (spec §4.7, v12.16.4)
+    pub neg_pnl_account_count: u64,
+
     /// Last oracle price used in accrue_market_to
     pub last_oracle_price: u64,
     /// Last slot used in accrue_market_to
     pub last_market_slot: u64,
-    /// Funding price sample (for anti-retroactivity)
-    pub funding_price_sample_last: u64,
-
     /// Cumulative funding numerator for long side (v12.15)
     pub f_long_num: i128,
     /// Cumulative funding numerator for short side (v12.15)
@@ -658,7 +655,6 @@ impl RiskEngine {
             },
             params,
             current_slot: init_slot,
-            funding_rate_e9_per_slot_last: 0,
             market_mode: MarketMode::Live,
             resolved_price: 0,
             resolved_slot: 0,
@@ -689,9 +685,9 @@ impl RiskEngine {
             phantom_dust_bound_long_q: 0u128,
             phantom_dust_bound_short_q: 0u128,
             materialized_account_count: 0,
+            neg_pnl_account_count: 0,
             last_oracle_price: init_oracle_price,
             last_market_slot: init_slot,
-            funding_price_sample_last: init_oracle_price,
             f_long_num: 0,
             f_short_num: 0,
             f_epoch_start_long_num: 0,
@@ -723,7 +719,6 @@ impl RiskEngine {
         self.insurance_fund = InsuranceFund { balance: U128::ZERO };
         self.params = params;
         self.current_slot = init_slot;
-        self.funding_rate_e9_per_slot_last = 0;
         self.market_mode = MarketMode::Live;
         self.resolved_price = 0;
         self.resolved_slot = 0;
@@ -754,9 +749,9 @@ impl RiskEngine {
         self.phantom_dust_bound_long_q = 0;
         self.phantom_dust_bound_short_q = 0;
         self.materialized_account_count = 0;
+        self.neg_pnl_account_count = 0;
         self.last_oracle_price = init_oracle_price;
         self.last_market_slot = init_slot;
-        self.funding_price_sample_last = init_oracle_price;
         self.f_long_num = 0;
         self.f_short_num = 0;
         self.f_epoch_start_long_num = 0;
@@ -835,6 +830,11 @@ impl RiskEngine {
 
     test_visible! {
     fn free_slot(&mut self, idx: u16) {
+        // Track neg_pnl_account_count before zeroing (spec §4.7, v12.16.4)
+        if self.accounts[idx as usize].pnl < 0 {
+            self.neg_pnl_account_count = self.neg_pnl_account_count.checked_sub(1)
+                .expect("free_slot: neg_pnl_account_count underflow");
+        }
         // Zero account fields in-place to avoid stack overflow (Account > 4KB).
         let a = &mut self.accounts[idx as usize];
         a.capital = U128::ZERO;
@@ -1001,6 +1001,14 @@ impl RiskEngine {
         if new_pos > old_pos {
             // Case A: positive increase
             let reserve_add = new_pos - old_pos;
+            // Track neg_pnl_account_count sign transitions (spec §4.7)
+            if old < 0 && new_pnl >= 0 {
+                self.neg_pnl_account_count = self.neg_pnl_account_count.checked_sub(1)
+                    .expect("neg_pnl_account_count underflow");
+            } else if old >= 0 && new_pnl < 0 {
+                self.neg_pnl_account_count = self.neg_pnl_account_count.checked_add(1)
+                    .expect("neg_pnl_account_count overflow");
+            }
             self.accounts[idx].pnl = new_pnl;
 
             match reserve_mode {
@@ -1050,6 +1058,14 @@ impl RiskEngine {
                     self.pnl_matured_pos_tot = self.pnl_matured_pos_tot.checked_sub(pos_loss)
                         .expect("pnl_matured_pos_tot underflow (resolved)");
                 }
+            }
+            // Track neg_pnl_account_count sign transitions (spec §4.7)
+            if old < 0 && new_pnl >= 0 {
+                self.neg_pnl_account_count = self.neg_pnl_account_count.checked_sub(1)
+                    .expect("neg_pnl_account_count underflow");
+            } else if old >= 0 && new_pnl < 0 {
+                self.neg_pnl_account_count = self.neg_pnl_account_count.checked_add(1)
+                    .expect("neg_pnl_account_count overflow");
             }
             self.accounts[idx].pnl = new_pnl;
 
@@ -1537,11 +1553,16 @@ impl RiskEngine {
     // accrue_market_to (spec §5.4)
     // ========================================================================
 
-    pub fn accrue_market_to(&mut self, now_slot: u64, oracle_price: u64) -> Result<()> {
+    pub fn accrue_market_to(&mut self, now_slot: u64, oracle_price: u64, funding_rate_e9: i128) -> Result<()> {
         if self.market_mode != MarketMode::Live {
             return Err(RiskError::Unauthorized);
         }
         if oracle_price == 0 || oracle_price > MAX_ORACLE_PRICE {
+            return Err(RiskError::Overflow);
+        }
+
+        // Validate funding rate bound (spec §1.4, folded into accrue per v12.16.4)
+        if funding_rate_e9.unsigned_abs() > MAX_ABS_FUNDING_E9_PER_SLOT as u128 {
             return Err(RiskError::Overflow);
         }
 
@@ -1588,11 +1609,12 @@ impl RiskEngine {
         // Step 6: Funding transfer via sub-stepping (spec v12.15 §5.4)
         // K gets the integer fund_term (backward compatible). F accumulates
         // the per-side fractional remainder for high-precision per-account settlement.
-        let r_last = self.funding_rate_e9_per_slot_last;
+        // Use passed-in funding_rate_e9 directly (v12.16.4: no stored rate).
+        // Use self.last_oracle_price as fund_px_0 (v12.16.4: no separate funding_price_sample_last).
         let mut f_long = self.f_long_num;
         let mut f_short = self.f_short_num;
-        if r_last != 0 && total_dt > 0 && long_live && short_live {
-            let fund_px_0 = self.funding_price_sample_last;
+        if funding_rate_e9 != 0 && total_dt > 0 && long_live && short_live {
+            let fund_px_0 = self.last_oracle_price;
 
             if fund_px_0 > 0 {
                 let mut dt_remaining = total_dt;
@@ -1604,7 +1626,7 @@ impl RiskEngine {
 
                     // fund_num = fund_px_0 * funding_rate_e9_per_slot * dt_sub
                     let fund_num: i128 = (fund_px_0 as i128)
-                        .checked_mul(r_last)
+                        .checked_mul(funding_rate_e9)
                         .ok_or(RiskError::Overflow)?
                         .checked_mul(dt_sub as i128)
                         .ok_or(RiskError::Overflow)?;
@@ -1622,11 +1644,6 @@ impl RiskEngine {
                     }
 
                     // F tracks the remainder delta (fractional correction per side)
-                    // remainder_delta = fund_accum - old_accum + fund_term * FUNDING_DEN
-                    //                 = fund_num   (by algebra: old + fund_num = fund_term * DEN + new_accum)
-                    // Wait, we want only the remainder contribution. The remainder changed from
-                    // old_accum to fund_accum. If fund_term was extracted, the remainder delta is
-                    // fund_num - fund_term * FUNDING_DEN = the sub-unit part of this step.
                     let remainder_delta = fund_num.checked_sub(
                         fund_term.checked_mul(FUNDING_DEN as i128).ok_or(RiskError::Overflow)?
                     ).ok_or(RiskError::Overflow)?;
@@ -1648,17 +1665,7 @@ impl RiskEngine {
         self.current_slot = now_slot;
         self.last_market_slot = now_slot;
         self.last_oracle_price = oracle_price;
-        self.funding_price_sample_last = oracle_price;
 
-        Ok(())
-    }
-
-    /// Pre-validate funding rate bound (called at top of each instruction,
-    /// before any mutations, so bad rates never cause partial-mutation errors).
-    fn validate_funding_rate_e9(rate: i128) -> Result<()> {
-        if rate.unsigned_abs() > MAX_ABS_FUNDING_E9_PER_SLOT as u128 {
-            return Err(RiskError::Overflow);
-        }
         Ok(())
     }
 
@@ -1671,33 +1678,14 @@ impl RiskEngine {
         Ok(())
     }
 
-    /// recompute_r_last_from_final_state (spec v12.14.0 §4.12).
-    /// Stores the pre-validated funding rate for the next interval.
-    test_visible! {
-    fn recompute_r_last_from_final_state(&mut self, externally_computed_rate: i128) -> Result<()> {
-        // Rate already validated at instruction entry; store unconditionally.
-        // Belt-and-suspenders: re-check here too.
-        if externally_computed_rate.unsigned_abs() > MAX_ABS_FUNDING_E9_PER_SLOT as u128 {
-            return Err(RiskError::Overflow);
-        }
-        self.funding_rate_e9_per_slot_last = externally_computed_rate;
-        Ok(())
-    }
-    }
-
     /// Public entry-point for the end-of-instruction lifecycle
     /// (spec §10.0 steps 4-7 / §10.8 steps 9-12).
     ///
-    /// Runs schedule_end_of_instruction_resets, finalize, and
-    /// recompute_r_last_from_final_state in the canonical order.
-    /// Callers that bypass `keeper_crank_not_atomic` (e.g. the resolved-market
-    /// settlement crank) must invoke this before returning.
-    pub fn run_end_of_instruction_lifecycle(&mut self, ctx: &mut InstructionContext, funding_rate_e9: i128) -> Result<()> {
-                Self::validate_funding_rate_e9(funding_rate_e9)?;
-
+    /// Runs schedule_end_of_instruction_resets and finalize in canonical order.
+    /// v12.16.4: no stored rate, so no recompute_r_last call.
+    pub fn run_end_of_instruction_lifecycle(&mut self, ctx: &mut InstructionContext) -> Result<()> {
         self.schedule_end_of_instruction_resets(ctx)?;
         self.finalize_end_of_instruction_resets(ctx);
-        self.recompute_r_last_from_final_state(funding_rate_e9)?;
         Ok(())
     }
 
@@ -2880,7 +2868,6 @@ impl RiskEngine {
         funding_rate_e9: i128,
         h_lock: u64,
     ) -> Result<()> {
-                Self::validate_funding_rate_e9(funding_rate_e9)?;
                 Self::validate_h_lock(h_lock, &self.params)?;
 
         if oracle_price == 0 || oracle_price > MAX_ORACLE_PRICE {
@@ -2902,7 +2889,7 @@ impl RiskEngine {
         let mut ctx = InstructionContext::new_with_h_lock(h_lock);
 
         // Step 2: accrue market
-        self.accrue_market_to(now_slot, oracle_price)?;
+        self.accrue_market_to(now_slot, oracle_price, funding_rate_e9)?;
         self.current_slot = now_slot;
 
         // Step 3: live local touch
@@ -2950,7 +2937,6 @@ impl RiskEngine {
         // Steps 8-9: end-of-instruction resets
         self.schedule_end_of_instruction_resets(&mut ctx)?;
         self.finalize_end_of_instruction_resets(&ctx);
-        self.recompute_r_last_from_final_state(funding_rate_e9)?;
 
         Ok(())
     }
@@ -2969,7 +2955,6 @@ impl RiskEngine {
         funding_rate_e9: i128,
         h_lock: u64,
     ) -> Result<()> {
-                Self::validate_funding_rate_e9(funding_rate_e9)?;
                 Self::validate_h_lock(h_lock, &self.params)?;
 
         if oracle_price == 0 || oracle_price > MAX_ORACLE_PRICE {
@@ -2986,7 +2971,7 @@ impl RiskEngine {
         let mut ctx = InstructionContext::new_with_h_lock(h_lock);
 
         // Step 2: accrue market
-        self.accrue_market_to(now_slot, oracle_price)?;
+        self.accrue_market_to(now_slot, oracle_price, funding_rate_e9)?;
         self.current_slot = now_slot;
 
         // Step 3: live local touch (no auto-convert, no fee-sweep)
@@ -2998,7 +2983,6 @@ impl RiskEngine {
         // Steps 5-6: end-of-instruction resets
         self.schedule_end_of_instruction_resets(&mut ctx)?;
         self.finalize_end_of_instruction_resets(&ctx);
-        self.recompute_r_last_from_final_state(funding_rate_e9)?;
 
         // Step 7: assert OI balance
         assert!(self.oi_eff_long_q == self.oi_eff_short_q, "OI_eff_long != OI_eff_short after settle");
@@ -3021,7 +3005,6 @@ impl RiskEngine {
         funding_rate_e9: i128,
         h_lock: u64,
     ) -> Result<()> {
-                Self::validate_funding_rate_e9(funding_rate_e9)?;
                 Self::validate_h_lock(h_lock, &self.params)?;
 
         if oracle_price == 0 || oracle_price > MAX_ORACLE_PRICE {
@@ -3062,7 +3045,7 @@ impl RiskEngine {
         let mut ctx = InstructionContext::new_with_h_lock(h_lock);
 
         // Step 10: accrue market once
-        self.accrue_market_to(now_slot, oracle_price)?;
+        self.accrue_market_to(now_slot, oracle_price, funding_rate_e9)?;
         self.current_slot = now_slot;
 
         // Steps 11-12: live local touch both (no auto-convert, no fee-sweep)
@@ -3223,9 +3206,6 @@ impl RiskEngine {
         // Steps 16-17: end-of-instruction resets
         self.schedule_end_of_instruction_resets(&mut ctx)?;
         self.finalize_end_of_instruction_resets(&ctx);
-
-        // Step 32: recompute r_last if funding-rate inputs changed (spec §10.5)
-        self.recompute_r_last_from_final_state(funding_rate_e9)?;
 
         // Step 18: assert OI balance (spec §10.4)
         assert!(self.oi_eff_long_q == self.oi_eff_short_q, "OI_eff_long != OI_eff_short after trade");
@@ -3437,7 +3417,6 @@ impl RiskEngine {
         funding_rate_e9: i128,
         h_lock: u64,
     ) -> Result<bool> {
-                Self::validate_funding_rate_e9(funding_rate_e9)?;
                 Self::validate_h_lock(h_lock, &self.params)?;
 
         // Bounds and existence check BEFORE touch_account_live_local to prevent
@@ -3453,7 +3432,7 @@ impl RiskEngine {
         let mut ctx = InstructionContext::new_with_h_lock(h_lock);
 
         // Step 2: accrue market
-        self.accrue_market_to(now_slot, oracle_price)?;
+        self.accrue_market_to(now_slot, oracle_price, funding_rate_e9)?;
         self.current_slot = now_slot;
 
         // Step 3: live local touch
@@ -3469,7 +3448,6 @@ impl RiskEngine {
         // End-of-instruction resets
         self.schedule_end_of_instruction_resets(&mut ctx)?;
         self.finalize_end_of_instruction_resets(&ctx);
-        self.recompute_r_last_from_final_state(funding_rate_e9)?;
 
         // Assert OI balance unconditionally (spec §10.6 step 11)
         assert!(self.oi_eff_long_q == self.oi_eff_short_q, "OI_eff_long != OI_eff_short after liquidation");
@@ -3622,7 +3600,6 @@ impl RiskEngine {
         funding_rate_e9: i128,
         h_lock: u64,
     ) -> Result<CrankOutcome> {
-                Self::validate_funding_rate_e9(funding_rate_e9)?;
                 Self::validate_h_lock(h_lock, &self.params)?;
 
         if oracle_price == 0 || oracle_price > MAX_ORACLE_PRICE {
@@ -3650,7 +3627,7 @@ impl RiskEngine {
         }
 
         // Step 5: accrue_market_to exactly once
-        self.accrue_market_to(now_slot, oracle_price)?;
+        self.accrue_market_to(now_slot, oracle_price, funding_rate_e9)?;
 
         // Step 6: current_slot = now_slot
         self.current_slot = now_slot;
@@ -3718,9 +3695,6 @@ impl RiskEngine {
         // Steps 9-10: end-of-instruction resets
         self.schedule_end_of_instruction_resets(&mut ctx)?;
         self.finalize_end_of_instruction_resets(&ctx);
-
-        // Step 11: recompute r_last exactly once from final post-reset state
-        self.recompute_r_last_from_final_state(funding_rate_e9)?;
 
         // Step 12: assert OI balance
         assert!(self.oi_eff_long_q == self.oi_eff_short_q,
@@ -3829,7 +3803,6 @@ impl RiskEngine {
         funding_rate_e9: i128,
         h_lock: u64,
     ) -> Result<()> {
-                Self::validate_funding_rate_e9(funding_rate_e9)?;
                 Self::validate_h_lock(h_lock, &self.params)?;
 
         if oracle_price == 0 || oracle_price > MAX_ORACLE_PRICE {
@@ -3846,7 +3819,7 @@ impl RiskEngine {
         let mut ctx = InstructionContext::new_with_h_lock(h_lock);
 
         // Step 2: accrue market
-        self.accrue_market_to(now_slot, oracle_price)?;
+        self.accrue_market_to(now_slot, oracle_price, funding_rate_e9)?;
         self.current_slot = now_slot;
 
         // Step 3: live local touch (no auto-convert)
@@ -3901,7 +3874,6 @@ impl RiskEngine {
         // Steps 11-12: end-of-instruction resets
         self.schedule_end_of_instruction_resets(&mut ctx)?;
         self.finalize_end_of_instruction_resets(&ctx);
-        self.recompute_r_last_from_final_state(funding_rate_e9)?;
 
         Ok(())
     }
@@ -3911,7 +3883,6 @@ impl RiskEngine {
     // ========================================================================
 
     pub fn close_account_not_atomic(&mut self, idx: u16, now_slot: u64, oracle_price: u64, funding_rate_e9: i128, h_lock: u64) -> Result<u128> {
-                Self::validate_funding_rate_e9(funding_rate_e9)?;
                 Self::validate_h_lock(h_lock, &self.params)?;
 
         if self.market_mode != MarketMode::Live {
@@ -3925,7 +3896,7 @@ impl RiskEngine {
         let mut ctx = InstructionContext::new_with_h_lock(h_lock);
 
         // Accrue market + live local touch + finalize
-        self.accrue_market_to(now_slot, oracle_price)?;
+        self.accrue_market_to(now_slot, oracle_price, funding_rate_e9)?;
         self.current_slot = now_slot;
         self.touch_account_live_local(idx as usize, &mut ctx)?;
         self.finalize_touched_accounts_post_live(&ctx);
@@ -3961,7 +3932,6 @@ impl RiskEngine {
         // End-of-instruction resets before freeing
         self.schedule_end_of_instruction_resets(&mut ctx)?;
         self.finalize_end_of_instruction_resets(&ctx);
-        self.recompute_r_last_from_final_state(funding_rate_e9)?;
 
         self.free_slot(idx);
 
@@ -3988,11 +3958,14 @@ impl RiskEngine {
     // ========================================================================
 
     /// Transition market from Live to Resolved at a price-bounded settlement price.
+    /// Per spec §9.7 (v12.16.4): requires market already accrued through resolution slot
+    /// (slot_last == current_slot == now_slot), eliminating retroactive funding erasure.
     pub fn resolve_market(&mut self, resolved_price: u64, now_slot: u64) -> Result<()> {
         if self.market_mode != MarketMode::Live {
             return Err(RiskError::Unauthorized);
         }
-        if now_slot < self.current_slot {
+        // Spec §9.7: require slot_last == current_slot == now_slot
+        if now_slot != self.current_slot || now_slot != self.last_market_slot {
             return Err(RiskError::Overflow);
         }
         if resolved_price == 0 || resolved_price > MAX_ORACLE_PRICE {
@@ -4015,14 +3988,8 @@ impl RiskEngine {
             }
         }
 
-        // Save and zero funding state for zero-funding final accrual.
-        // Restore on error to maintain validate-then-mutate contract.
-        let saved_rate = self.funding_rate_e9_per_slot_last;
-        self.funding_rate_e9_per_slot_last = 0;
-        if let Err(e) = self.accrue_market_to(now_slot, resolved_price) {
-            self.funding_rate_e9_per_slot_last = saved_rate;
-            return Err(e);
-        }
+        // Zero-funding final accrual at resolved price (v12.16.4: pass 0 directly).
+        self.accrue_market_to(now_slot, resolved_price, 0)?;
 
         // Steps 7-13: set resolved state
         self.current_slot = now_slot;
@@ -4158,6 +4125,7 @@ impl RiskEngine {
     }
 
     /// Check if resolved market is terminal-ready for payouts.
+    /// v12.16.4: uses O(1) neg_pnl_account_count instead of O(n) scan.
     pub fn is_terminal_ready(&self) -> bool {
         if self.resolved_payout_ready != 0 { return true; }
         // All positions zeroed
@@ -4168,12 +4136,8 @@ impl RiskEngine {
         if self.stale_account_count_long != 0 || self.stale_account_count_short != 0 {
             return false;
         }
-        // No negative PnL accounts remaining
-        let mut has_negative = false;
-        self.for_each_used(|_idx, acct| {
-            if acct.pnl < 0 { has_negative = true; }
-        });
-        !has_negative
+        // No negative PnL accounts remaining (spec §4.7, v12.16.4)
+        self.neg_pnl_account_count == 0
     }
 
     /// Phase 2: Terminal close. Requires terminal readiness.

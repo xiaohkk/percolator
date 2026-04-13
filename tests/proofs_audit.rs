@@ -445,7 +445,7 @@ fn proof_settle_epoch_snap_zero_on_truncation() {
     // Now touch the account — settle_side_effects should zero the position
     {
         let mut ctx = InstructionContext::new_with_h_lock(0);
-        engine.accrue_market_to(DEFAULT_SLOT, DEFAULT_ORACLE).unwrap();
+        engine.accrue_market_to(DEFAULT_SLOT, DEFAULT_ORACLE, 0).unwrap();
         engine.current_slot = DEFAULT_SLOT;
         let _ = engine.touch_account_live_local(a as usize, &mut ctx);
         engine.finalize_touched_accounts_post_live(&ctx);
@@ -611,7 +611,7 @@ fn proof_touch_unused_returns_error() {
 
     // Slot 0 is not used (no add_user called)
     let mut ctx = InstructionContext::new_with_h_lock(0);
-    engine.accrue_market_to(DEFAULT_SLOT, DEFAULT_ORACLE).unwrap();
+    engine.accrue_market_to(DEFAULT_SLOT, DEFAULT_ORACLE, 0).unwrap();
     engine.current_slot = DEFAULT_SLOT;
     let result = engine.touch_account_live_local(0, &mut ctx);
     assert!(result.is_err(), "touch on unused slot must fail");
@@ -625,7 +625,7 @@ fn proof_touch_oob_returns_error() {
     let mut engine = RiskEngine::new(zero_fee_params());
 
     let mut ctx = InstructionContext::new_with_h_lock(0);
-    engine.accrue_market_to(DEFAULT_SLOT, DEFAULT_ORACLE).unwrap();
+    engine.accrue_market_to(DEFAULT_SLOT, DEFAULT_ORACLE, 0).unwrap();
     engine.current_slot = DEFAULT_SLOT;
     let result = engine.touch_account_live_local(MAX_ACCOUNTS, &mut ctx);
     assert!(result.is_err(), "touch on OOB index must fail");

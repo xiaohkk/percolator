@@ -59,7 +59,6 @@ fn t11_44_trade_path_reopens_ready_reset_side() {
     engine.last_oracle_price = 100;
     engine.last_market_slot = 1;
     engine.last_crank_slot = 1;
-    engine.funding_price_sample_last = 100;
 
     let size_q = POS_SCALE as i128;
     let result = engine.execute_trade_not_atomic(a, b, 100, 1, size_q, 100, 0i128, 0);
@@ -216,7 +215,6 @@ fn t11_53_keeper_crank_quiesces_after_pending_reset() {
 
     engine.last_oracle_price = 100;
     engine.last_market_slot = 0;
-    engine.funding_price_sample_last = 100;
     engine.adl_mult_long = ADL_ONE;
     engine.adl_mult_short = ADL_ONE;
     engine.adl_epoch_long = 0;
@@ -304,7 +302,6 @@ fn proof_keeper_reset_lifecycle_last_stale_triggers_finalize() {
 
     engine.last_oracle_price = 100;
     engine.last_market_slot = 0;
-    engine.funding_price_sample_last = 100;
     engine.adl_mult_long = ADL_ONE;
     engine.adl_mult_short = ADL_ONE;
     engine.adl_epoch_long = 1;   // new epoch (post-reset)

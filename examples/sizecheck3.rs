@@ -7,7 +7,7 @@ fn main() {
     println!("C_TOT={}", core::mem::offset_of!(percolator::RiskEngine, c_tot));
     println!("PNL_POS_TOT={}", core::mem::offset_of!(percolator::RiskEngine, pnl_pos_tot));
     println!("NUM_USED={}", core::mem::offset_of!(percolator::RiskEngine, num_used_accounts));
-    println!("FUNDING={}", core::mem::offset_of!(percolator::RiskEngine, funding_rate_e9_per_slot_last));
+    println!("NEG_PNL_COUNT={}", core::mem::offset_of!(percolator::RiskEngine, neg_pnl_account_count));
     println!("BITMAP={}", core::mem::offset_of!(percolator::RiskEngine, used));
     println!("ENGINE_SIZE={}", std::mem::size_of::<percolator::RiskEngine>());
 }

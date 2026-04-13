@@ -130,7 +130,7 @@ fn proof_f8_loss_seniority_in_touch() {
     // Price crash → negative PnL for long
     let slot2 = DEFAULT_SLOT + 10;
     let mut ctx = InstructionContext::new_with_h_lock(0);
-    let _ = engine.accrue_market_to(slot2, 800);
+    let _ = engine.accrue_market_to(slot2, 800, 0);
     engine.current_slot = slot2;
     let _ = engine.touch_account_live_local(a as usize, &mut ctx);
     engine.finalize_touched_accounts_post_live(&ctx);

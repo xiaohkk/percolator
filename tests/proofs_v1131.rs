@@ -12,27 +12,27 @@ use common::*;
 // PROPERTY 46: Funding rate recomputation determinism and bound enforcement
 // ############################################################################
 
-/// recompute_r_last_from_final_state(rate) stores exactly rate when
-/// |rate| <= MAX_ABS_FUNDING_E9_PER_SLOT (spec v12.14.0 §4.12).
+/// accrue_market_to accepts funding_rate_e9 when |rate| <= MAX_ABS_FUNDING_E9_PER_SLOT.
+/// v12.16.4: rate is passed directly to accrue, no stored field.
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
-fn proof_recompute_r_last_stores_rate() {
+fn proof_funding_rate_accepted_in_accrue() {
     let mut engine = RiskEngine::new(zero_fee_params());
 
     let rate: i32 = kani::any();
     kani::assume(rate.unsigned_abs() <= MAX_ABS_FUNDING_E9_PER_SLOT as u32);
 
-    engine.recompute_r_last_from_final_state(rate as i128);
-    assert!(engine.funding_rate_e9_per_slot_last == rate as i128,
-        "r_last must equal the supplied rate");
+    let result = engine.accrue_market_to(0, 1, rate as i128);
+    assert!(result.is_ok(), "in-bounds rate must be accepted by accrue_market_to");
 }
 
 // ############################################################################
 // PROPERTY 74: Funding rate bound enforcement
 // ############################################################################
 
-/// recompute_r_last_from_final_state returns Err for |rate| > MAX_ABS_FUNDING_E9_PER_SLOT.
+/// accrue_market_to returns Err for |rate| > MAX_ABS_FUNDING_E9_PER_SLOT.
+/// v12.16.4: validation folded into accrue_market_to.
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
@@ -40,7 +40,7 @@ fn proof_funding_rate_bound_rejected() {
     let mut engine = RiskEngine::new(zero_fee_params());
     let rate: i128 = kani::any();
     kani::assume(rate.unsigned_abs() > MAX_ABS_FUNDING_E9_PER_SLOT as u128);
-    let result = engine.recompute_r_last_from_final_state(rate);
+    let result = engine.accrue_market_to(0, 1, rate);
     assert!(result.is_err(), "out-of-bounds rate must return Err");
 }
 
@@ -63,19 +63,17 @@ fn proof_funding_sign_and_floor() {
     engine.oi_eff_short_q = POS_SCALE;
     engine.last_oracle_price = DEFAULT_ORACLE;
     engine.last_market_slot = 0;
-    engine.funding_price_sample_last = DEFAULT_ORACLE;
 
     // Symbolic rate (bounded, nonzero)
     let rate: i32 = kani::any();
     kani::assume(rate != 0);
     kani::assume(rate.unsigned_abs() <= MAX_ABS_FUNDING_E9_PER_SLOT as u32);
-    engine.funding_rate_e9_per_slot_last = rate as i128;
 
     let k_long_before = engine.adl_coeff_long;
     let k_short_before = engine.adl_coeff_short;
 
-    // dt=1, same price → only funding changes K
-    let result = engine.accrue_market_to(1, DEFAULT_ORACLE);
+    // dt=1, same price → only funding changes K (rate passed directly)
+    let result = engine.accrue_market_to(1, DEFAULT_ORACLE, rate as i128);
     assert!(result.is_ok());
 
     if rate > 0 {
@@ -108,13 +106,12 @@ fn proof_funding_floor_not_truncation() {
     engine.oi_eff_short_q = POS_SCALE;
     engine.last_oracle_price = DEFAULT_ORACLE;
     engine.last_market_slot = 0;
-    engine.funding_price_sample_last = DEFAULT_ORACLE; // 1000
-    engine.funding_rate_e9_per_slot_last = -1; // tiny negative rate
 
     let k_long_before = engine.adl_coeff_long;
     let k_short_before = engine.adl_coeff_short;
 
-    let result = engine.accrue_market_to(1, DEFAULT_ORACLE);
+    // tiny negative rate passed directly
+    let result = engine.accrue_market_to(1, DEFAULT_ORACLE, -1);
     assert!(result.is_ok());
 
     // fund_num = 1000 * (-1) * 1 = -1000
@@ -141,8 +138,6 @@ fn proof_funding_skip_zero_oi_short() {
     engine.adl_mult_short = ADL_ONE;
     engine.last_oracle_price = DEFAULT_ORACLE;
     engine.last_market_slot = 0;
-    engine.funding_price_sample_last = DEFAULT_ORACLE;
-    engine.funding_rate_e9_per_slot_last = 5000;
 
     engine.oi_eff_long_q = POS_SCALE;
     engine.oi_eff_short_q = 0;
@@ -150,7 +145,7 @@ fn proof_funding_skip_zero_oi_short() {
     let k_long_before = engine.adl_coeff_long;
     let k_short_before = engine.adl_coeff_short;
 
-    let result = engine.accrue_market_to(100, DEFAULT_ORACLE);
+    let result = engine.accrue_market_to(100, DEFAULT_ORACLE, 5000);
     assert!(result.is_ok());
 
     assert_eq!(engine.adl_coeff_long, k_long_before,
@@ -169,8 +164,6 @@ fn proof_funding_skip_zero_oi_long() {
     engine.adl_mult_short = ADL_ONE;
     engine.last_oracle_price = DEFAULT_ORACLE;
     engine.last_market_slot = 0;
-    engine.funding_price_sample_last = DEFAULT_ORACLE;
-    engine.funding_rate_e9_per_slot_last = -3000;
 
     engine.oi_eff_long_q = 0;
     engine.oi_eff_short_q = POS_SCALE;
@@ -178,7 +171,7 @@ fn proof_funding_skip_zero_oi_long() {
     let k_long_before = engine.adl_coeff_long;
     let k_short_before = engine.adl_coeff_short;
 
-    let result = engine.accrue_market_to(100, DEFAULT_ORACLE);
+    let result = engine.accrue_market_to(100, DEFAULT_ORACLE, -3000);
     assert!(result.is_ok());
 
     assert_eq!(engine.adl_coeff_long, k_long_before,
@@ -197,8 +190,6 @@ fn proof_funding_skip_zero_oi_both() {
     engine.adl_mult_short = ADL_ONE;
     engine.last_oracle_price = DEFAULT_ORACLE;
     engine.last_market_slot = 0;
-    engine.funding_price_sample_last = DEFAULT_ORACLE;
-    engine.funding_rate_e9_per_slot_last = 10000;
 
     engine.oi_eff_long_q = 0;
     engine.oi_eff_short_q = 0;
@@ -206,7 +197,7 @@ fn proof_funding_skip_zero_oi_both() {
     let k_long_before = engine.adl_coeff_long;
     let k_short_before = engine.adl_coeff_short;
 
-    let result = engine.accrue_market_to(100, DEFAULT_ORACLE);
+    let result = engine.accrue_market_to(100, DEFAULT_ORACLE, 10000);
     assert!(result.is_ok());
 
     assert_eq!(engine.adl_coeff_long, k_long_before,
@@ -232,12 +223,10 @@ fn proof_funding_substep_large_dt() {
     engine.oi_eff_short_q = POS_SCALE;
     engine.last_oracle_price = DEFAULT_ORACLE;
     engine.last_market_slot = 0;
-    engine.funding_price_sample_last = DEFAULT_ORACLE;
-    engine.funding_rate_e9_per_slot_last = 100;
 
     // dt = MAX_FUNDING_DT + 1 → 2 sub-steps: MAX_FUNDING_DT and 1
     let dt = MAX_FUNDING_DT + 1;
-    let result = engine.accrue_market_to(dt, DEFAULT_ORACLE);
+    let result = engine.accrue_market_to(dt, DEFAULT_ORACLE, 100);
     assert!(result.is_ok());
 
     // fund_term per sub-step with rate=100 ppb, price=1000, divisor=1e9:
@@ -266,13 +255,11 @@ fn proof_funding_price_basis_timing() {
     engine.adl_mult_short = ADL_ONE;
     engine.oi_eff_long_q = POS_SCALE;
     engine.oi_eff_short_q = POS_SCALE;
-    engine.last_oracle_price = 500; // old price
+    engine.last_oracle_price = 500; // old price (also used as fund_px_0 in v12.16.4)
     engine.last_market_slot = 0;
-    engine.funding_price_sample_last = 500; // fund_px_0 = 500
-    engine.funding_rate_e9_per_slot_last = 100_000_000; // 10% in ppb
 
-    // Call with new oracle price 1500
-    let result = engine.accrue_market_to(1, 1500);
+    // Call with new oracle price 1500, rate = 10% in ppb
+    let result = engine.accrue_market_to(1, 1500, 100_000_000);
     assert!(result.is_ok());
 
     // Funding should use fund_px_0=500, not oracle_price=1500
@@ -287,9 +274,9 @@ fn proof_funding_price_basis_timing() {
     assert_eq!(engine.adl_coeff_long, expected_k_long,
         "funding must use fund_px_0=500, not oracle=1500");
 
-    // After call, fund_px_last must be updated to oracle_price
-    assert_eq!(engine.funding_price_sample_last, 1500,
-        "fund_px_last must be updated to oracle_price for next interval");
+    // After call, last_oracle_price must be updated to oracle_price
+    assert_eq!(engine.last_oracle_price, 1500,
+        "last_oracle_price must be updated to oracle_price for next interval");
 }
 
 // ############################################################################
@@ -308,8 +295,6 @@ fn proof_accrue_no_funding_when_rate_zero() {
     engine.oi_eff_short_q = POS_SCALE;
     engine.last_oracle_price = DEFAULT_ORACLE;
     engine.last_market_slot = 0;
-    engine.funding_price_sample_last = DEFAULT_ORACLE;
-    engine.funding_rate_e9_per_slot_last = 0;
 
     let dt: u16 = kani::any();
     kani::assume(dt >= 1 && dt <= 1000);
@@ -317,7 +302,7 @@ fn proof_accrue_no_funding_when_rate_zero() {
     let k_long_before = engine.adl_coeff_long;
     let k_short_before = engine.adl_coeff_short;
 
-    let result = engine.accrue_market_to(dt as u64, DEFAULT_ORACLE);
+    let result = engine.accrue_market_to(dt as u64, DEFAULT_ORACLE, 0);
     assert!(result.is_ok());
 
     assert_eq!(engine.adl_coeff_long, k_long_before, "zero rate: K_long unchanged");
@@ -337,7 +322,6 @@ fn proof_accrue_mark_still_works() {
     engine.oi_eff_short_q = POS_SCALE;
     engine.last_oracle_price = DEFAULT_ORACLE;
     engine.last_market_slot = 0;
-    engine.funding_price_sample_last = DEFAULT_ORACLE;
 
     let new_price: u64 = kani::any();
     kani::assume(new_price > 0 && new_price <= 2000 && new_price != DEFAULT_ORACLE);
@@ -345,7 +329,7 @@ fn proof_accrue_mark_still_works() {
     let k_long_before = engine.adl_coeff_long;
     let k_short_before = engine.adl_coeff_short;
 
-    let result = engine.accrue_market_to(1, new_price);
+    let result = engine.accrue_market_to(1, new_price, 0);
     assert!(result.is_ok());
 
     // Mark must change K: K_long += A_long * ΔP, K_short -= A_short * ΔP
@@ -776,9 +760,8 @@ fn proof_partial_liq_health_check_mandatory() {
 // PROPERTY 42: Post-reset funding recomputation stores exactly 0
 // ############################################################################
 
-/// keeper_crank_not_atomic invokes recompute_r_last_from_final_state exactly once after
-/// final reset handling. The stored rate equals the supplied funding_rate
-/// regardless of the pre-crank rate.
+/// keeper_crank_not_atomic passes the supplied funding_rate directly to accrue_market_to.
+/// v12.16.4: no stored rate field; rate is consumed directly per call.
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
@@ -788,20 +771,14 @@ fn proof_keeper_crank_r_last_stores_supplied_rate() {
     let idx = engine.add_user(0).unwrap();
     engine.deposit(idx, 1_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
-    // Symbolic pre-crank rate and supplied rate
-    let pre_rate: i128 = kani::any();
-    engine.funding_rate_e9_per_slot_last = pre_rate;
-
+    // Symbolic supplied rate
     let supplied_rate: i32 = kani::any();
     kani::assume(supplied_rate.unsigned_abs() <= MAX_ABS_FUNDING_E9_PER_SLOT as u32);
 
+    // v12.16.4: rate passed directly to accrue_market_to via keeper_crank_not_atomic
     let result = engine.keeper_crank_not_atomic(DEFAULT_SLOT + 1, DEFAULT_ORACLE,
         &[(idx, None)], 64, supplied_rate as i128, 0);
     assert!(result.is_ok());
-
-    // r_last must equal the supplied rate, not the pre-crank rate
-    assert!(engine.funding_rate_e9_per_slot_last == supplied_rate as i128,
-        "r_last must equal supplied funding_rate after keeper_crank_not_atomic");
 }
 
 // ############################################################################

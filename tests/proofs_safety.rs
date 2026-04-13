@@ -179,7 +179,7 @@ fn bounded_liquidation_conservation() {
     // (settle_losses → resolve_flat_negative → insurance/absorb)
     {
         let mut ctx = InstructionContext::new_with_h_lock(0);
-        let _ = engine.accrue_market_to(DEFAULT_SLOT, DEFAULT_ORACLE);
+        let _ = engine.accrue_market_to(DEFAULT_SLOT, DEFAULT_ORACLE, 0);
         engine.current_slot = DEFAULT_SLOT;
         let _ = engine.touch_account_live_local(a as usize, &mut ctx);
         engine.finalize_touched_accounts_post_live(&ctx);
@@ -338,7 +338,7 @@ fn proof_flat_negative_resolves_through_insurance() {
 
     {
         let mut ctx = InstructionContext::new_with_h_lock(0);
-        engine.accrue_market_to(DEFAULT_SLOT, DEFAULT_ORACLE).unwrap();
+        engine.accrue_market_to(DEFAULT_SLOT, DEFAULT_ORACLE, 0).unwrap();
         engine.current_slot = DEFAULT_SLOT;
         engine.touch_account_live_local(idx as usize, &mut ctx).unwrap();
         engine.finalize_touched_accounts_post_live(&ctx);
@@ -650,16 +650,14 @@ fn t13_54_funding_no_mint_asymmetric_a() {
 
     engine.last_oracle_price = 100;
     engine.last_market_slot = 0;
-    engine.funding_price_sample_last = 100;
 
     let rate: i8 = kani::any();
     kani::assume(rate != 0 && rate >= -10 && rate <= 10);
-    engine.funding_rate_e9_per_slot_last = rate as i128;
 
     let k_long_before = engine.adl_coeff_long;
     let k_short_before = engine.adl_coeff_short;
 
-    let result = engine.accrue_market_to(1, 100);
+    let result = engine.accrue_market_to(1, 100, rate as i128);
     assert!(result.is_ok());
 
     let k_long_after = engine.adl_coeff_long;
@@ -754,7 +752,7 @@ fn proof_protected_principal() {
     engine.last_market_slot = DEFAULT_SLOT;
     {
         let mut ctx = InstructionContext::new_with_h_lock(0);
-        let _ = engine.accrue_market_to(DEFAULT_SLOT, DEFAULT_ORACLE);
+        let _ = engine.accrue_market_to(DEFAULT_SLOT, DEFAULT_ORACLE, 0);
         engine.current_slot = DEFAULT_SLOT;
         let _ = engine.touch_account_live_local(b as usize, &mut ctx);
         engine.finalize_touched_accounts_post_live(&ctx);
@@ -785,7 +783,6 @@ fn proof_withdraw_simulation_preserves_residual() {
     engine.last_oracle_price = 100;
     engine.last_market_slot = 1;
     engine.last_crank_slot = 1;
-    engine.funding_price_sample_last = 100;
 
     // Trade so a has a position (exercises the margin-check + haircut path)
     let size_q = POS_SCALE as i128;
@@ -824,32 +821,20 @@ fn proof_funding_rate_validated_before_storage() {
     engine.last_oracle_price = 100;
     engine.last_market_slot = 0;
     engine.last_crank_slot = 0;
-    engine.funding_price_sample_last = 100;
 
     let a = engine.add_user(0).unwrap();
     engine.deposit(a, 10_000_000, 100, 0).unwrap();
 
-    // Pass an invalid funding rate (> MAX_ABS_FUNDING_E9_PER_SLOT)
+    // Pass an invalid funding rate (> MAX_ABS_FUNDING_E9_PER_SLOT) directly
+    // v12.16.4: rate is validated inside accrue_market_to
     let bad_rate: i128 = MAX_ABS_FUNDING_E9_PER_SLOT + 1;
-    // keeper_crank_not_atomic no longer accepts funding rate — it uses stored rate.
-    // Set a bad rate directly and verify crank still works.
-    engine.funding_rate_e9_per_slot_last = bad_rate;
+    let result = engine.keeper_crank_not_atomic(1, 100, &[(a, None)], 1, bad_rate, 0);
+    assert!(result.is_err(), "out-of-bounds rate must be rejected by keeper_crank_not_atomic");
 
-    // The stored rate should be clamped or validated
-    let result = engine.keeper_crank_not_atomic(1, 100, &[(a, None)], 1, 0i128, 0);
-    kani::cover!(result.is_ok(), "crank Ok path reachable");
-
-    if result.is_ok() {
-        let stored = engine.funding_rate_e9_per_slot_last;
-        assert!(stored.abs() <= MAX_ABS_FUNDING_E9_PER_SLOT,
-            "stored funding rate must be within bounds after successful crank");
-    }
-
-    // Reset to valid rate and verify protocol works
-    engine.funding_rate_e9_per_slot_last = 0;
-    let result2 = engine.keeper_crank_not_atomic(2, 100, &[(a, None)], 1, 0i128, 0);
+    // Valid rate must succeed
+    let result2 = engine.keeper_crank_not_atomic(1, 100, &[(a, None)], 1, 0i128, 0);
     assert!(result2.is_ok(),
-        "protocol must not be bricked by a previous bad funding rate input");
+        "protocol must accept valid funding rate");
 }
 
 // ============================================================================
@@ -960,7 +945,7 @@ fn proof_trading_loss_seniority() {
     let touch_slot = DEFAULT_SLOT + 50;
     {
         let mut ctx = InstructionContext::new_with_h_lock(0);
-        let _ = engine.accrue_market_to(touch_slot, DEFAULT_ORACLE);
+        let _ = engine.accrue_market_to(touch_slot, DEFAULT_ORACLE, 0);
         engine.current_slot = touch_slot;
         let _ = engine.touch_account_live_local(a as usize, &mut ctx);
         engine.finalize_touched_accounts_post_live(&ctx);
@@ -1722,24 +1707,19 @@ fn proof_audit2_funding_rate_clamped() {
     let size_q = (10 * POS_SCALE) as i128;
     engine.execute_trade_not_atomic(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size_q, DEFAULT_ORACLE, 0i128, 0).unwrap();
 
-    // Set an extreme out-of-range funding rate directly.
-    // Use bounded range to keep solver tractable while still exercising
-    // the extreme case: rate just above MAX_ABS_FUNDING_E9_PER_SLOT.
+    // Pass an extreme out-of-range funding rate directly to keeper_crank.
+    // v12.16.4: rate is validated inside accrue_market_to, so extreme rates
+    // are rejected before any state mutation.
     let extreme_offset: u16 = kani::any();
     kani::assume(extreme_offset >= 1);
     let extreme_rate = MAX_ABS_FUNDING_E9_PER_SLOT + (extreme_offset as i128);
-    engine.funding_rate_e9_per_slot_last = extreme_rate;
 
-    // keeper_crank_not_atomic validates funding_rate at entry — will reject the bad rate
-    // since we pass 0i128 as the new rate. But the stored extreme rate from
-    // the previous interval is consumed by accrue_market_to.
     let slot2 = DEFAULT_SLOT + 1;
-    let result = engine.keeper_crank_not_atomic(slot2, DEFAULT_ORACLE, &[(a, None), (b, None)], 64, 0i128, 0);
-    // May succeed or fail depending on whether accrue overflows — both are acceptable
-    kani::cover!(result.is_ok(), "crank with extreme stored rate reachable");
-    if result.is_ok() {
-        assert!(engine.check_conservation());
-    }
+    let result = engine.keeper_crank_not_atomic(slot2, DEFAULT_ORACLE, &[(a, None), (b, None)], 64, extreme_rate, 0);
+    // Out-of-bounds rate must be rejected
+    assert!(result.is_err(), "extreme funding rate must be rejected");
+    // State must be unchanged — conservation preserved
+    assert!(engine.check_conservation());
 }
 
 // ############################################################################
@@ -1900,7 +1880,6 @@ fn proof_audit4_init_in_place_canonical() {
     engine.pnl_pos_tot = 333;
     engine.pnl_matured_pos_tot = 222;
     engine.current_slot = 42;
-    engine.funding_rate_e9_per_slot_last = -99;
     engine.last_crank_slot = 77;
     engine.gc_cursor = 2;
     engine.adl_mult_long = 42;
@@ -1925,7 +1904,6 @@ fn proof_audit4_init_in_place_canonical() {
     engine.materialized_account_count = 5;
     engine.last_oracle_price = 9999;
     engine.last_market_slot = 55;
-    engine.funding_price_sample_last = 777;
     engine.f_long_num = 42;
     engine.f_short_num = -42;
     engine.params.insurance_floor = U128::new(12345);
@@ -1945,7 +1923,6 @@ fn proof_audit4_init_in_place_canonical() {
 
     // ---- Slots / cursors ----
     assert!(engine.current_slot == 0);
-    assert!(engine.funding_rate_e9_per_slot_last == 0);
     assert!(engine.last_crank_slot == 0);
     assert!(engine.gc_cursor == 0);
     assert!(engine.f_long_num == 0);
@@ -1976,7 +1953,6 @@ fn proof_audit4_init_in_place_canonical() {
     assert!(engine.materialized_account_count == 0);
     assert!(engine.last_oracle_price == DEFAULT_ORACLE);
     assert!(engine.last_market_slot == 0);
-    assert!(engine.funding_price_sample_last == DEFAULT_ORACLE);
     assert!(engine.params.insurance_floor.get() == 0);
 
     // ---- Used bitmap: all zeroed ----

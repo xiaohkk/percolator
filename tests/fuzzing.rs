@@ -510,13 +510,12 @@ impl FuzzState {
                 rate_bps,
             } => {
                 let before = (*self.engine).clone();
-                // Set funding rate for next accrue_market_to call
-                self.engine.funding_rate_e9_per_slot_last = *rate_bps as i128;
                 let now_slot = self.engine.current_slot.saturating_add(*dt);
 
+                // v12.16.4: pass funding rate directly to accrue_market_to
                 let result = self
                     .engine
-                    .accrue_market_to(now_slot, *oracle_price);
+                    .accrue_market_to(now_slot, *oracle_price, *rate_bps as i128);
 
                 match result {
                     Ok(()) => {
@@ -537,7 +536,7 @@ impl FuzzState {
 
                 let result = (|| -> Result<()> {
                     let mut ctx = InstructionContext::new_with_h_lock(0);
-                    self.engine.accrue_market_to(now_slot, oracle)?;
+                    self.engine.accrue_market_to(now_slot, oracle, 0)?;
                     self.engine.current_slot = now_slot;
                     self.engine.touch_account_live_local(idx as usize, &mut ctx)?;
                     self.engine.finalize_touched_accounts_post_live(&ctx);
@@ -1104,18 +1103,16 @@ fn conservation_after_trade_and_funding_regression() {
     engine.last_crank_slot = 0;
     engine.last_market_slot = 0;
     engine.last_oracle_price = DEFAULT_ORACLE;
-    engine.funding_price_sample_last = DEFAULT_ORACLE;
 
     // Execute trade to create positions
     engine
         .execute_trade_not_atomic(lp_idx, user_idx, DEFAULT_ORACLE, 0, 1000, DEFAULT_ORACLE, 0i128, 0)
         .unwrap();
 
-    // Accrue market with funding
-    engine.funding_rate_e9_per_slot_last = 500;
+    // Accrue market with funding (rate passed directly)
     engine.advance_slot(1000);
     let slot = engine.current_slot;
-    engine.accrue_market_to(slot, DEFAULT_ORACLE).unwrap();
+    engine.accrue_market_to(slot, DEFAULT_ORACLE, 500).unwrap();
 
     // Verify conservation
     assert!(
@@ -1147,13 +1144,11 @@ fn harness_rollback_simulation_test() {
     let user_idx = engine.add_user(1).unwrap();
     engine.deposit(user_idx, 1000, DEFAULT_ORACLE, 0).unwrap();
 
-    // Accrue market to create state that could be mutated
+    // Accrue market to create state that could be mutated (rate passed directly)
     engine.last_oracle_price = DEFAULT_ORACLE;
-    engine.funding_price_sample_last = DEFAULT_ORACLE;
-    engine.funding_rate_e9_per_slot_last = 100;
     engine.advance_slot(100);
     let slot = engine.current_slot;
-    engine.accrue_market_to(slot, DEFAULT_ORACLE).unwrap();
+    engine.accrue_market_to(slot, DEFAULT_ORACLE, 100).unwrap();
 
     // Capture complete state before failed operation (deep clone of RiskEngine)
     let before = (*engine).clone();
