@@ -260,9 +260,9 @@ fn proof_notional_scales_with_price() {
     assert!(n2 >= n1, "notional must be monotone in price");
 }
 
-/// advance_profit_warmup_cohort releases at most reserved_pnl (§4.9)
+/// advance_profit_warmup releases at most reserved_pnl (§4.9)
 #[kani::proof]
-#[kani::unwind(34)]
+#[kani::unwind(4)]
 #[kani::solver(cadical)]
 fn proof_warmup_release_bounded_by_reserved() {
     let mut engine = RiskEngine::new(zero_fee_params());
@@ -275,11 +275,11 @@ fn proof_warmup_release_bounded_by_reserved() {
     // After set_pnl, reserved_pnl tracks the positive PnL increase
     let r_before = engine.accounts[idx as usize].reserved_pnl;
 
-    engine.advance_profit_warmup_cohort(idx as usize);
+    engine.advance_profit_warmup(idx as usize);
     let r_after = engine.accounts[idx as usize].reserved_pnl;
 
     // reserved can only decrease or stay the same
-    assert!(r_after <= r_before, "advance_profit_warmup_cohort must not increase reserve");
+    assert!(r_after <= r_before, "advance_profit_warmup must not increase reserve");
 }
 
 // ============================================================================

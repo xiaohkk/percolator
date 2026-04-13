@@ -193,7 +193,7 @@ fn t6_26b_full_drain_reset_nonzero_k_diff() {
 // ############################################################################
 
 #[kani::proof]
-#[kani::unwind(34)]
+#[kani::unwind(4)]
 #[kani::solver(cadical)]
 fn t9_35_warmup_release_monotone_in_time() {
     let mut engine = RiskEngine::new(zero_fee_params());
@@ -213,13 +213,13 @@ fn t9_35_warmup_release_monotone_in_time() {
     // Compute release at t1 on a clone
     let mut e1 = engine.clone();
     e1.current_slot = t1 as u64;
-    e1.advance_profit_warmup_cohort(idx as usize);
+    e1.advance_profit_warmup(idx as usize);
     let released1 = r_initial - e1.accounts[idx as usize].reserved_pnl;
 
     // Compute release at t2 on another clone
     let mut e2 = engine;
     e2.current_slot = t2 as u64;
-    e2.advance_profit_warmup_cohort(idx as usize);
+    e2.advance_profit_warmup(idx as usize);
     let released2 = r_initial - e2.accounts[idx as usize].reserved_pnl;
 
     assert!(released2 >= released1, "warmup release must be monotone non-decreasing in time");

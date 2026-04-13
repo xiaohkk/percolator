@@ -2201,7 +2201,7 @@ fn test_property_52_convert_released_pnl_explicit() {
     assert_eq!(engine.accounts[idx].reserved_pnl, 10_000, "all goes to reserve with h_lock>0");
     // Advance past horizon to mature cohorts, releasing 7000 (keep 3000 reserved)
     engine.current_slot = slot + 20; // well past h_lock=10
-    engine.advance_profit_warmup_cohort(idx);
+    engine.advance_profit_warmup(idx);
     // All 10000 is now matured; manually set reserved to 3000 to simulate partial release
     engine.accounts[idx].reserved_pnl = 3_000;
     // Adjust matured for the re-reservation
@@ -2780,7 +2780,7 @@ fn test_property_31_fullclose_liquidation_zeros_position() {
 // ============================================================================
 
 #[test]
-fn test_append_reserve_creates_exact_cohort() {
+fn test_append_reserve_creates_sched_bucket() {
     let mut engine = RiskEngine::new(default_params());
     let idx = engine.add_user(1000).unwrap();
     engine.deposit(idx, 100_000, 1000, 100).unwrap();
@@ -2791,10 +2791,10 @@ fn test_append_reserve_creates_exact_cohort() {
 
     engine.append_or_route_new_reserve(idx as usize, 10_000, 100, 50);
 
-    assert_eq!(engine.accounts[idx as usize].exact_cohort_count, 1);
-    assert_eq!(engine.accounts[idx as usize].exact_reserve_cohorts[0].remaining_q, 10_000);
-    assert_eq!(engine.accounts[idx as usize].exact_reserve_cohorts[0].horizon_slots, 50);
-    assert_eq!(engine.accounts[idx as usize].exact_reserve_cohorts[0].start_slot, 100);
+    assert_eq!(engine.accounts[idx as usize].sched_present, 1);
+    assert_eq!(engine.accounts[idx as usize].sched_remaining_q, 10_000);
+    assert_eq!(engine.accounts[idx as usize].sched_horizon, 50);
+    assert_eq!(engine.accounts[idx as usize].sched_start_slot, 100);
     assert_eq!(engine.accounts[idx as usize].reserved_pnl, 10_000);
 }
 
@@ -2808,15 +2808,16 @@ fn test_append_reserve_merges_same_slot_horizon() {
     engine.append_or_route_new_reserve(idx as usize, 5_000, 100, 50);
     engine.append_or_route_new_reserve(idx as usize, 3_000, 100, 50);
 
-    // Should merge into one cohort
-    assert_eq!(engine.accounts[idx as usize].exact_cohort_count, 1);
-    assert_eq!(engine.accounts[idx as usize].exact_reserve_cohorts[0].remaining_q, 8_000);
-    assert_eq!(engine.accounts[idx as usize].exact_reserve_cohorts[0].anchor_q, 8_000);
+    // Should merge into one scheduled bucket
+    assert_eq!(engine.accounts[idx as usize].sched_present, 1);
+    assert_eq!(engine.accounts[idx as usize].sched_remaining_q, 8_000);
+    assert_eq!(engine.accounts[idx as usize].sched_anchor_q, 8_000);
+    assert_eq!(engine.accounts[idx as usize].pending_present, 0);
     assert_eq!(engine.accounts[idx as usize].reserved_pnl, 8_000);
 }
 
 #[test]
-fn test_append_reserve_different_horizon_creates_new_cohort() {
+fn test_append_reserve_different_horizon_creates_pending() {
     let mut engine = RiskEngine::new(default_params());
     let idx = engine.add_user(1000).unwrap();
     engine.deposit(idx, 100_000, 1000, 100).unwrap();
@@ -2825,26 +2826,30 @@ fn test_append_reserve_different_horizon_creates_new_cohort() {
     engine.append_or_route_new_reserve(idx as usize, 5_000, 100, 50);
     engine.append_or_route_new_reserve(idx as usize, 3_000, 100, 100); // different horizon
 
-    assert_eq!(engine.accounts[idx as usize].exact_cohort_count, 2);
+    // First goes to sched, second to pending (different horizon, so no merge)
+    assert_eq!(engine.accounts[idx as usize].sched_present, 1);
+    assert_eq!(engine.accounts[idx as usize].pending_present, 1);
+    assert_eq!(engine.accounts[idx as usize].pending_remaining_q, 3_000);
     assert_eq!(engine.accounts[idx as usize].reserved_pnl, 8_000);
 }
 
 #[test]
-fn test_apply_reserve_loss_lifo_newest_first() {
+fn test_apply_reserve_loss_newest_first() {
     let mut engine = RiskEngine::new(default_params());
     let idx = engine.add_user(1000).unwrap();
     engine.deposit(idx, 100_000, 1000, 100).unwrap();
     engine.current_slot = 100;
 
-    // Create two cohorts: oldest 5k, newest 3k
+    // Create sched (5k) then pending (3k at different slot)
     engine.append_or_route_new_reserve(idx as usize, 5_000, 100, 50);
     engine.append_or_route_new_reserve(idx as usize, 3_000, 101, 100);
 
-    // Lose 4k — should consume all of newest (3k) + 1k from oldest
-    engine.apply_reserve_loss_lifo(idx as usize, 4_000);
+    // Lose 4k — should consume all of pending (3k) + 1k from sched
+    engine.apply_reserve_loss_newest_first(idx as usize, 4_000);
 
-    assert_eq!(engine.accounts[idx as usize].exact_cohort_count, 1); // newest removed
-    assert_eq!(engine.accounts[idx as usize].exact_reserve_cohorts[0].remaining_q, 4_000); // oldest had 5k - 1k = 4k
+    assert_eq!(engine.accounts[idx as usize].pending_present, 0); // pending removed
+    assert_eq!(engine.accounts[idx as usize].sched_present, 1);
+    assert_eq!(engine.accounts[idx as usize].sched_remaining_q, 4_000); // sched had 5k - 1k = 4k
     assert_eq!(engine.accounts[idx as usize].reserved_pnl, 4_000);
 }
 
@@ -2861,29 +2866,28 @@ fn test_prepare_account_for_resolved_touch() {
     engine.prepare_account_for_resolved_touch(idx as usize);
 
     assert_eq!(engine.accounts[idx as usize].reserved_pnl, 0);
-    assert_eq!(engine.accounts[idx as usize].exact_cohort_count, 0);
-    assert!(engine.accounts[idx as usize].overflow_older_present == 0);
-    assert!(engine.accounts[idx as usize].overflow_newest_present == 0);
+    assert_eq!(engine.accounts[idx as usize].sched_present, 0);
+    assert_eq!(engine.accounts[idx as usize].pending_present, 0);
 }
 
 
 #[test]
-fn test_advance_profit_warmup_cohort_exact_maturity() {
+fn test_advance_profit_warmup_sched_maturity() {
     let mut engine = RiskEngine::new(default_params());
     let idx = engine.add_user(1000).unwrap();
     engine.deposit(idx, 100_000, 1000, 100).unwrap();
     engine.current_slot = 100;
 
-    // Create a cohort: 10_000 reserve, horizon 100 slots, starting at slot 100
+    // Create a scheduled bucket: 10_000 reserve, horizon 100 slots, starting at slot 100
     engine.accounts[idx as usize].pnl = 10_000;
     engine.pnl_pos_tot = 10_000;
     engine.append_or_route_new_reserve(idx as usize, 10_000, 100, 100);
     assert_eq!(engine.accounts[idx as usize].reserved_pnl, 10_000);
 
-    // Advance 50 slots → should release floor(10_000 * 50 / 100) = 5_000
+    // Advance 50 slots -> should release floor(10_000 * 50 / 100) = 5_000
     engine.current_slot = 150;
     let matured_before = engine.pnl_matured_pos_tot;
-    engine.advance_profit_warmup_cohort(idx as usize);
+    engine.advance_profit_warmup(idx as usize);
 
     let released = engine.pnl_matured_pos_tot - matured_before;
     assert_eq!(released, 5_000, "50% of horizon should release 50% of reserve");
@@ -2891,36 +2895,39 @@ fn test_advance_profit_warmup_cohort_exact_maturity() {
 
     // Advance to full maturity (slot 200)
     engine.current_slot = 200;
-    engine.advance_profit_warmup_cohort(idx as usize);
+    engine.advance_profit_warmup(idx as usize);
 
     assert_eq!(engine.accounts[idx as usize].reserved_pnl, 0, "fully matured");
-    assert_eq!(engine.accounts[idx as usize].exact_cohort_count, 0, "empty cohort removed");
+    assert_eq!(engine.accounts[idx as usize].sched_present, 0, "empty bucket cleared");
 }
 
 #[test]
-fn test_advance_profit_warmup_cohort_multiple_cohorts() {
+fn test_advance_profit_warmup_sched_then_pending_promotion() {
     let mut engine = RiskEngine::new(default_params());
     let idx = engine.add_user(1000).unwrap();
     engine.deposit(idx, 100_000, 1000, 100).unwrap();
     engine.current_slot = 100;
 
-    // Two cohorts with different horizons
+    // Two buckets: sched (10k, h=100) then pending (5k, h=200)
     engine.accounts[idx as usize].pnl = 15_000;
     engine.pnl_pos_tot = 15_000;
-    engine.append_or_route_new_reserve(idx as usize, 10_000, 100, 100); // 100-slot horizon
-    engine.append_or_route_new_reserve(idx as usize, 5_000, 100, 200);  // 200-slot horizon
+    engine.append_or_route_new_reserve(idx as usize, 10_000, 100, 100); // sched: 100-slot horizon
+    engine.append_or_route_new_reserve(idx as usize, 5_000, 100, 200);  // pending: 200-slot horizon
 
-    assert_eq!(engine.accounts[idx as usize].exact_cohort_count, 2);
+    assert_eq!(engine.accounts[idx as usize].sched_present, 1);
+    assert_eq!(engine.accounts[idx as usize].pending_present, 1);
     assert_eq!(engine.accounts[idx as usize].reserved_pnl, 15_000);
 
-    // At slot 200: first cohort fully matured, second cohort 50% matured
+    // At slot 200: sched fully matured -> clears + promotes pending to sched
     engine.current_slot = 200;
-    engine.advance_profit_warmup_cohort(idx as usize);
+    engine.advance_profit_warmup(idx as usize);
 
-    // First: 10_000 released. Second: floor(5_000 * 100/200) = 2_500 released.
-    // Total released: 12_500. Remaining: 2_500.
-    assert_eq!(engine.accounts[idx as usize].reserved_pnl, 2_500);
-    assert_eq!(engine.accounts[idx as usize].exact_cohort_count, 1, "fully matured cohort removed");
+    // sched 10_000 fully released, pending promoted to sched (starts at slot 200)
+    assert_eq!(engine.accounts[idx as usize].reserved_pnl, 5_000);
+    assert_eq!(engine.accounts[idx as usize].sched_present, 1, "pending promoted to sched");
+    assert_eq!(engine.accounts[idx as usize].pending_present, 0);
+    assert_eq!(engine.accounts[idx as usize].sched_remaining_q, 5_000);
+    assert_eq!(engine.accounts[idx as usize].sched_start_slot, 200);
 }
 
 #[test]
@@ -2935,7 +2942,7 @@ fn test_set_pnl_with_reserve_positive_increase_creates_cohort() {
 
     assert_eq!(engine.accounts[idx as usize].pnl, 10_000);
     assert_eq!(engine.accounts[idx as usize].reserved_pnl, 10_000);
-    assert_eq!(engine.accounts[idx as usize].exact_cohort_count, 1);
+    assert_eq!(engine.accounts[idx as usize].sched_present, 1);
     assert_eq!(engine.pnl_pos_tot, 10_000);
     // Matured should NOT increase (reserve not yet matured)
     assert_eq!(engine.pnl_matured_pos_tot, 0);
@@ -3300,41 +3307,35 @@ fn audit_8_resolve_must_enforce_band_before_first_accrue() {
 }
 
 #[test]
-fn audit_9_overflow_older_merge_ignores_h_lock() {
-    // Same-slot addition to overflow_older must merge regardless of h_lock,
-    // because overflow segments always use H_max, not caller's h_lock.
+fn audit_9_pending_merge_uses_max_horizon() {
+    // When pending bucket already exists, further appends merge and
+    // horizon = max(existing, new h_lock).
     let mut engine = RiskEngine::new(default_params());
     let a = engine.add_user(1000).unwrap();
     engine.deposit(a, 1_000_000, 1000, 100).unwrap();
 
     let idx = a as usize;
-    let h_lock = 10u64;
 
-    // Fill exact capacity with distinct slots
-    for i in 0..MAX_EXACT_RESERVE_COHORTS_PER_ACCOUNT {
-        engine.accounts[idx].pnl += 1000;
-        engine.pnl_pos_tot += 1000;
-        engine.append_or_route_new_reserve(idx, 1000, 100 + i as u64, h_lock);
-    }
-
-    let slot = 200u64;
-    // First overflow: creates overflow_older with H_max
+    // First append creates sched
     engine.accounts[idx].pnl += 1000;
     engine.pnl_pos_tot += 1000;
-    engine.append_or_route_new_reserve(idx, 1000, slot, h_lock);
-    assert!(engine.accounts[idx].overflow_older_present != 0);
-    assert_eq!(engine.accounts[idx].overflow_older.horizon_slots, engine.params.h_max);
+    engine.append_or_route_new_reserve(idx, 1000, 100, 10);
+    assert_eq!(engine.accounts[idx].sched_present, 1);
 
-    // Same-slot merge: different h_lock but should still merge into overflow_older
-    let diff_h = 50u64;
+    // Second append (different horizon) creates pending
     engine.accounts[idx].pnl += 1000;
     engine.pnl_pos_tot += 1000;
-    engine.append_or_route_new_reserve(idx, 1000, slot, diff_h);
+    engine.append_or_route_new_reserve(idx, 1000, 101, 50);
+    assert_eq!(engine.accounts[idx].pending_present, 1);
+    assert_eq!(engine.accounts[idx].pending_horizon, 50);
 
-    // Should merge into overflow_older (same slot), NOT create overflow_newest
-    assert_eq!(engine.accounts[idx].overflow_newest_present, 0,
-        "same-slot overflow must merge, not create newest");
-    assert_eq!(engine.accounts[idx].overflow_older.remaining_q, 2000);
+    // Third append merges into pending with max horizon
+    engine.accounts[idx].pnl += 1000;
+    engine.pnl_pos_tot += 1000;
+    engine.append_or_route_new_reserve(idx, 1000, 102, 100);
+    assert_eq!(engine.accounts[idx].pending_remaining_q, 2000);
+    assert_eq!(engine.accounts[idx].pending_horizon, 100,
+        "pending horizon must be max of all merged horizons");
 }
 
 #[test]
@@ -3704,9 +3705,9 @@ fn test_reclaim_rejects_nonempty_queue_metadata() {
     engine.deposit(a, 100, 1000, 100).unwrap();
 
     let idx = a as usize;
-    // Corrupt state: reserved_pnl = 0 but queue metadata not empty
+    // Corrupt state: reserved_pnl = 0 but bucket metadata not empty
     engine.accounts[idx].reserved_pnl = 0;
-    engine.accounts[idx].exact_cohort_count = 1; // orphaned metadata
+    engine.accounts[idx].sched_present = 1; // orphaned metadata
     engine.accounts[idx].pnl = 0;
     engine.accounts[idx].position_basis_q = 0;
     // Make capital dust (below min_initial_deposit)

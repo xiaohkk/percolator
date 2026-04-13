@@ -120,15 +120,6 @@ pub const MAX_MARGIN_BPS: u64 = 10_000;
 pub const MAX_LIQUIDATION_FEE_BPS: u64 = 10_000;
 pub const MAX_PROTOCOL_FEE_ABS: u128 = 1_000_000_000_000_000_000_000_000_000_000_000_000; // 10^36, spec §1.4
 
-// Reserve cohort queue bounds (spec §1.4)
-// Bounded to 3 under Kani per checklist §L — induction extends to 28 by hand.
-#[cfg(kani)]
-pub const MAX_EXACT_RESERVE_COHORTS_PER_ACCOUNT: usize = 3;
-#[cfg(not(kani))]
-pub const MAX_EXACT_RESERVE_COHORTS_PER_ACCOUNT: usize = 28;
-pub const MAX_OVERFLOW_RESERVE_SEGMENTS: usize = 2;
-pub const MAX_RESERVE_SEGMENTS_PER_ACCOUNT: usize =
-    MAX_EXACT_RESERVE_COHORTS_PER_ACCOUNT + MAX_OVERFLOW_RESERVE_SEGMENTS; // = 30
 pub const MAX_WARMUP_SLOTS: u64 = u64::MAX;
 pub const MAX_RESOLVE_PRICE_DEVIATION_BPS: u64 = 10_000;
 
@@ -168,32 +159,6 @@ use wide_math::{
 pub enum MarketMode {
     Live = 0,
     Resolved = 1,
-}
-
-/// Reserve cohort (spec §6.1): one segment of time-locked positive PnL reserve.
-/// Used for both exact cohorts, overflow_older (scheduled), and overflow_newest (pending).
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReserveCohort {
-    pub remaining_q: u128,
-    pub anchor_q: u128,
-    pub start_slot: u64,
-    pub horizon_slots: u64,
-    pub sched_release_q: u128,
-}
-
-impl ReserveCohort {
-    pub const EMPTY: Self = Self {
-        remaining_q: 0,
-        anchor_q: 0,
-        start_slot: 0,
-        horizon_slots: 0,
-        sched_release_q: 0,
-    };
-
-    pub fn is_empty(&self) -> bool {
-        self.remaining_q == 0 && self.anchor_q == 0
-    }
 }
 
 /// Reserve mode for set_pnl (spec §4.5, v12.14.0)
@@ -303,16 +268,19 @@ pub struct Account {
     /// Fee credits
     pub fee_credits: I128,
 
-    // ---- Reserve cohort queue (spec §6.1) ----
-    /// Exact reserve cohorts, oldest first. Only [0..exact_cohort_count) are active.
-    pub exact_reserve_cohorts: [ReserveCohort; MAX_EXACT_RESERVE_COHORTS_PER_ACCOUNT],
-    pub exact_cohort_count: u8,
-    /// Preserved overflow (scheduled). Present iff overflow_older_present != 0.
-    pub overflow_older: ReserveCohort,
-    pub overflow_older_present: u8,
-    /// Newest pending overflow. Present iff overflow_newest_present != 0.
-    pub overflow_newest: ReserveCohort,
-    pub overflow_newest_present: u8,
+    // ---- Two-bucket warmup reserve (spec §4.3) ----
+    /// Scheduled reserve bucket (older, matures linearly)
+    pub sched_present: u8,
+    pub sched_remaining_q: u128,
+    pub sched_anchor_q: u128,
+    pub sched_start_slot: u64,
+    pub sched_horizon: u64,
+    pub sched_release_q: u128,
+    /// Pending reserve bucket (newest, does not mature while pending)
+    pub pending_present: u8,
+    pub pending_remaining_q: u128,
+    pub pending_horizon: u64,
+    pub pending_created_slot: u64,
 }
 
 impl Account {
@@ -343,12 +311,16 @@ fn empty_account() -> Account {
         matcher_context: [0; 32],
         owner: [0; 32],
         fee_credits: I128::ZERO,
-        exact_reserve_cohorts: [ReserveCohort::EMPTY; MAX_EXACT_RESERVE_COHORTS_PER_ACCOUNT],
-        exact_cohort_count: 0,
-        overflow_older: ReserveCohort::EMPTY,
-        overflow_older_present: 0,
-        overflow_newest: ReserveCohort::EMPTY,
-        overflow_newest_present: 0,
+        sched_present: 0,
+        sched_remaining_q: 0,
+        sched_anchor_q: 0,
+        sched_start_slot: 0,
+        sched_horizon: 0,
+        sched_release_q: 0,
+        pending_present: 0,
+        pending_remaining_q: 0,
+        pending_horizon: 0,
+        pending_created_slot: 0,
     }
 }
 
@@ -878,12 +850,16 @@ impl RiskEngine {
         a.matcher_context = [0; 32];
         a.owner = [0; 32];
         a.fee_credits = I128::ZERO;
-        for c in a.exact_reserve_cohorts.iter_mut() { *c = ReserveCohort::EMPTY; }
-        a.exact_cohort_count = 0;
-        a.overflow_older = ReserveCohort::EMPTY;
-        a.overflow_older_present = 0;
-        a.overflow_newest = ReserveCohort::EMPTY;
-        a.overflow_newest_present = 0;
+        a.sched_present = 0;
+        a.sched_remaining_q = 0;
+        a.sched_anchor_q = 0;
+        a.sched_start_slot = 0;
+        a.sched_horizon = 0;
+        a.sched_release_q = 0;
+        a.pending_present = 0;
+        a.pending_remaining_q = 0;
+        a.pending_horizon = 0;
+        a.pending_created_slot = 0;
         self.clear_used(idx as usize);
         self.next_free[idx as usize] = self.free_head;
         self.free_head = idx;
@@ -962,14 +938,16 @@ impl RiskEngine {
             a.matcher_context = [0; 32];
             a.owner = [0; 32];
             a.fee_credits = I128::ZERO;
-            for i in 0..MAX_EXACT_RESERVE_COHORTS_PER_ACCOUNT {
-                a.exact_reserve_cohorts[i] = ReserveCohort::EMPTY;
-            }
-            a.exact_cohort_count = 0;
-            a.overflow_older = ReserveCohort::EMPTY;
-            a.overflow_older_present = 0;
-            a.overflow_newest = ReserveCohort::EMPTY;
-            a.overflow_newest_present = 0;
+            a.sched_present = 0;
+            a.sched_remaining_q = 0;
+            a.sched_anchor_q = 0;
+            a.sched_start_slot = 0;
+            a.sched_horizon = 0;
+            a.sched_release_q = 0;
+            a.pending_present = 0;
+            a.pending_remaining_q = 0;
+            a.pending_horizon = 0;
+            a.pending_created_slot = 0;
         }
 
         Ok(())
@@ -982,7 +960,7 @@ impl RiskEngine {
     /// set_pnl: thin wrapper routing through set_pnl_with_reserve(ImmediateRelease).
     /// All PnL mutations go through one canonical path. ImmediateRelease routes
     /// positive increases directly to matured (no reserve queue), and decreases
-    /// go through apply_reserve_loss_lifo — replacing the old saturating_sub.
+    /// go through apply_reserve_loss_newest_first — replacing the old saturating_sub.
     test_visible! {
     fn set_pnl(&mut self, idx: usize, new_pnl: i128) {
         self.set_pnl_with_reserve(idx, new_pnl, ReserveMode::ImmediateRelease)
@@ -1058,7 +1036,7 @@ impl RiskEngine {
             if self.market_mode == MarketMode::Live {
                 let reserve_loss = core::cmp::min(pos_loss, self.accounts[idx].reserved_pnl);
                 if reserve_loss > 0 {
-                    self.apply_reserve_loss_lifo(idx, reserve_loss);
+                    self.apply_reserve_loss_newest_first(idx, reserve_loss);
                 }
                 let matured_loss = pos_loss - reserve_loss;
                 if matured_loss > 0 {
@@ -1078,9 +1056,8 @@ impl RiskEngine {
             // Step 20: if new_pos == 0 and Live, require empty queue
             if new_pos == 0 && self.market_mode == MarketMode::Live {
                 assert!(self.accounts[idx].reserved_pnl == 0);
-                assert!(self.accounts[idx].exact_cohort_count == 0);
-                assert!(self.accounts[idx].overflow_older_present == 0);
-                assert!(self.accounts[idx].overflow_newest_present == 0);
+                assert!(self.accounts[idx].sched_present == 0);
+                assert!(self.accounts[idx].pending_present == 0);
             }
 
             assert!(self.pnl_matured_pos_tot <= self.pnl_pos_tot);
@@ -2331,192 +2308,98 @@ impl RiskEngine {
     }
 
     // ========================================================================
-    // Reserve cohort queue helpers (spec §4.4, v12.14.0)
+    // Two-bucket warmup reserve helpers (spec §4.3)
     // ========================================================================
 
-    /// append_or_route_new_reserve (spec §4.4.1)
+    /// append_or_route_new_reserve (spec §4.3)
     test_visible! {
     fn append_or_route_new_reserve(&mut self, idx: usize, reserve_add: u128, now_slot: u64, h_lock: u64) {
         let a = &mut self.accounts[idx];
-        let count = a.exact_cohort_count as usize;
-        let has_cap = count < MAX_EXACT_RESERVE_COHORTS_PER_ACCOUNT;
 
-        // Step 1: promote overflow_older if exact capacity available
-        if a.overflow_older_present != 0 && has_cap {
-            a.exact_reserve_cohorts[count] = a.overflow_older;
-            a.exact_cohort_count += 1;
-            a.overflow_older = ReserveCohort::EMPTY;
-            a.overflow_older_present = 0;
+        // Step 1: if sched absent and pending present → promote pending to scheduled
+        if a.sched_present == 0 && a.pending_present != 0 {
+            a.sched_present = 1;
+            a.sched_remaining_q = a.pending_remaining_q;
+            a.sched_anchor_q = a.pending_remaining_q;
+            a.sched_start_slot = now_slot;
+            a.sched_horizon = a.pending_horizon;
+            a.sched_release_q = 0;
+            a.pending_present = 0;
+            a.pending_remaining_q = 0;
+            a.pending_horizon = 0;
+            a.pending_created_slot = 0;
         }
 
-        let count = a.exact_cohort_count as usize;
-        let has_cap = count < MAX_EXACT_RESERVE_COHORTS_PER_ACCOUNT;
-
-        // Step 2: activate pending overflow_newest if overflow_older absent
-        if a.overflow_older_present == 0 && a.overflow_newest_present != 0 {
-            let pending_q = a.overflow_newest.remaining_q;
-            let pending_h = a.overflow_newest.horizon_slots;
-            a.overflow_newest = ReserveCohort::EMPTY;
-            a.overflow_newest_present = 0;
-            let activated = ReserveCohort {
-                remaining_q: pending_q, anchor_q: pending_q,
-                start_slot: now_slot, horizon_slots: pending_h, sched_release_q: 0,
-            };
-            if has_cap {
-                a.exact_reserve_cohorts[count] = activated;
-                a.exact_cohort_count += 1;
-            } else {
-                a.overflow_older = activated;
-                a.overflow_older_present = 1;
-            }
+        if a.sched_present == 0 {
+            // Step 2: sched absent → create scheduled bucket
+            a.sched_present = 1;
+            a.sched_remaining_q = reserve_add;
+            a.sched_anchor_q = reserve_add;
+            a.sched_start_slot = now_slot;
+            a.sched_horizon = h_lock;
+            a.sched_release_q = 0;
+        } else if a.sched_present != 0 && a.pending_present == 0
+            && a.sched_start_slot == now_slot && a.sched_horizon == h_lock && a.sched_release_q == 0
+        {
+            // Step 3: merge into scheduled (same slot, same horizon, not yet released)
+            a.sched_remaining_q = a.sched_remaining_q.checked_add(reserve_add).expect("reserve overflow");
+            a.sched_anchor_q = a.sched_anchor_q.checked_add(reserve_add).expect("anchor overflow");
+        } else if a.pending_present == 0 {
+            // Step 4: create pending bucket
+            a.pending_present = 1;
+            a.pending_remaining_q = reserve_add;
+            a.pending_horizon = h_lock;
+            a.pending_created_slot = now_slot;
+        } else {
+            // Step 5: merge into pending (horizon = max)
+            a.pending_remaining_q = a.pending_remaining_q.checked_add(reserve_add).expect("reserve overflow");
+            a.pending_horizon = core::cmp::max(a.pending_horizon, h_lock);
         }
 
-        let count = a.exact_cohort_count as usize;
-        let has_cap = count < MAX_EXACT_RESERVE_COHORTS_PER_ACCOUNT;
-
-        // Step 3: exact merge into newest cohort (same slot, same horizon, not yet scheduled)
-        if a.overflow_older_present == 0 && a.overflow_newest_present == 0 && count > 0 {
-            let newest = &mut a.exact_reserve_cohorts[count - 1];
-            if newest.start_slot == now_slot && newest.horizon_slots == h_lock && newest.sched_release_q == 0 {
-                newest.remaining_q = newest.remaining_q.checked_add(reserve_add).expect("reserve overflow");
-                newest.anchor_q = newest.anchor_q.checked_add(reserve_add).expect("anchor overflow");
-                a.reserved_pnl = a.reserved_pnl.checked_add(reserve_add).expect("R_i overflow");
-                return;
-            }
-        }
-
-        // Step 4: merge into overflow_older (horizon is always H_max, not h_lock)
-        if a.overflow_older_present != 0 && a.overflow_newest_present == 0 {
-            let o = &mut a.overflow_older;
-            if o.start_slot == now_slot && o.horizon_slots == self.params.h_max && o.sched_release_q == 0 {
-                o.remaining_q = o.remaining_q.checked_add(reserve_add).expect("reserve overflow");
-                o.anchor_q = o.anchor_q.checked_add(reserve_add).expect("anchor overflow");
-                a.reserved_pnl = a.reserved_pnl.checked_add(reserve_add).expect("R_i overflow");
-                return;
-            }
-        }
-
-        let new_cohort = ReserveCohort {
-            remaining_q: reserve_add, anchor_q: reserve_add,
-            start_slot: now_slot, horizon_slots: h_lock, sched_release_q: 0,
-        };
-
-        // Step 5: append new exact cohort
-        if has_cap && a.overflow_older_present == 0 && a.overflow_newest_present == 0 {
-            a.exact_reserve_cohorts[count] = new_cohort;
-            a.exact_cohort_count += 1;
-            a.reserved_pnl = a.reserved_pnl.checked_add(reserve_add).expect("R_i overflow");
-            return;
-        }
-
-        // Step 6: create overflow_older (overflow segments always use h_max)
-        if a.overflow_older_present == 0 && a.overflow_newest_present == 0 {
-            let mut overflow_cohort = new_cohort;
-            overflow_cohort.horizon_slots = self.params.h_max;
-            a.overflow_older = overflow_cohort;
-            a.overflow_older_present = 1;
-            a.reserved_pnl = a.reserved_pnl.checked_add(reserve_add).expect("R_i overflow");
-            return;
-        }
-
-        // Step 7: create overflow_newest (overflow segments always use h_max)
-        if a.overflow_older_present != 0 && a.overflow_newest_present == 0 {
-            let mut overflow_cohort = new_cohort;
-            overflow_cohort.horizon_slots = self.params.h_max;
-            a.overflow_newest = overflow_cohort;
-            a.overflow_newest_present = 1;
-            a.reserved_pnl = a.reserved_pnl.checked_add(reserve_add).expect("R_i overflow");
-            return;
-        }
-
-        // Step 8: merge into existing overflow_newest
-        // n.horizon_slots remains h_max from creation — never modified
-        let n = &mut a.overflow_newest;
-        n.remaining_q = n.remaining_q.checked_add(reserve_add).expect("reserve overflow");
-        n.anchor_q = n.anchor_q.checked_add(reserve_add).expect("anchor overflow");
-        n.start_slot = now_slot;
+        // Step 6: R_i += reserve_add
         a.reserved_pnl = a.reserved_pnl.checked_add(reserve_add).expect("R_i overflow");
     }
 
     }
 
-    /// apply_reserve_loss_lifo (spec §4.4.2) — LIFO from newest to oldest.
+    /// apply_reserve_loss_newest_first (spec §4.4) — consume from pending first, then scheduled.
     test_visible! {
-    fn apply_reserve_loss_lifo(&mut self, idx: usize, reserve_loss: u128) {
+    fn apply_reserve_loss_newest_first(&mut self, idx: usize, reserve_loss: u128) {
         let a = &mut self.accounts[idx];
         let mut remaining = reserve_loss;
 
-        // Step 2: overflow_newest first
-        if a.overflow_newest_present != 0 && remaining > 0 {
-            let take = core::cmp::min(remaining, a.overflow_newest.remaining_q);
-            a.overflow_newest.remaining_q -= take;
-            a.reserved_pnl -= take;
+        // Step 1: consume from pending first
+        if a.pending_present != 0 && remaining > 0 {
+            let take = core::cmp::min(remaining, a.pending_remaining_q);
+            a.pending_remaining_q -= take;
             remaining -= take;
-            if a.overflow_newest.remaining_q == 0 {
-                a.overflow_newest = ReserveCohort::EMPTY;
-                a.overflow_newest_present = 0;
+            if a.pending_remaining_q == 0 {
+                a.pending_present = 0;
+                a.pending_horizon = 0;
+                a.pending_created_slot = 0;
             }
         }
 
-        // Step 3: overflow_older next
-        if a.overflow_older_present != 0 && remaining > 0 {
-            let take = core::cmp::min(remaining, a.overflow_older.remaining_q);
-            a.overflow_older.remaining_q -= take;
-            a.reserved_pnl -= take;
+        // Step 2: consume from scheduled
+        if a.sched_present != 0 && remaining > 0 {
+            let take = core::cmp::min(remaining, a.sched_remaining_q);
+            a.sched_remaining_q -= take;
             remaining -= take;
-            if a.overflow_older.remaining_q == 0 {
-                a.overflow_older = ReserveCohort::EMPTY;
-                a.overflow_older_present = 0;
+            if a.sched_remaining_q == 0 {
+                a.sched_present = 0;
+                a.sched_anchor_q = 0;
+                a.sched_start_slot = 0;
+                a.sched_horizon = 0;
+                a.sched_release_q = 0;
             }
         }
 
-        // Step 4: exact cohorts newest-to-oldest
-        let count = a.exact_cohort_count as usize;
-        for i in (0..count).rev() {
-            if remaining == 0 { break; }
-            let take = core::cmp::min(remaining, a.exact_reserve_cohorts[i].remaining_q);
-            a.exact_reserve_cohorts[i].remaining_q -= take;
-            a.reserved_pnl -= take;
-            remaining -= take;
-        }
+        // Step 3: require full consumption
+        assert!(remaining == 0, "apply_reserve_loss_newest_first: loss exceeds R_i");
 
-        // Step 5: require fully consumed
-        assert!(remaining == 0, "apply_reserve_loss_lifo: loss exceeds R_i");
-
-        // Step 6: remove empty exact cohorts (compact)
-        let mut write = 0usize;
-        for read in 0..count {
-            if a.exact_reserve_cohorts[read].remaining_q > 0 {
-                if write != read {
-                    a.exact_reserve_cohorts[write] = a.exact_reserve_cohorts[read];
-                }
-                write += 1;
-            }
-        }
-        for i in write..count {
-            a.exact_reserve_cohorts[i] = ReserveCohort::EMPTY;
-        }
-        a.exact_cohort_count = write as u8;
-
-        // Step 7: post-loss overflow promotion
-        if a.overflow_older_present == 0 && a.overflow_newest_present != 0 {
-            let pending_q = a.overflow_newest.remaining_q;
-            let pending_h = a.overflow_newest.horizon_slots;
-            a.overflow_newest = ReserveCohort::EMPTY;
-            a.overflow_newest_present = 0;
-            let activated = ReserveCohort {
-                remaining_q: pending_q, anchor_q: pending_q,
-                start_slot: self.current_slot, horizon_slots: pending_h, sched_release_q: 0,
-            };
-            let count = a.exact_cohort_count as usize;
-            if count < MAX_EXACT_RESERVE_COHORTS_PER_ACCOUNT {
-                a.exact_reserve_cohorts[count] = activated;
-                a.exact_cohort_count += 1;
-            } else {
-                a.overflow_older = activated;
-                a.overflow_older_present = 1;
-            }
-        }
+        // Step 4-5: R_i -= consumed, empty buckets cleared above
+        a.reserved_pnl = a.reserved_pnl.checked_sub(reserve_loss)
+            .expect("apply_reserve_loss_newest_first: R_i underflow");
     }
 
     }
@@ -2526,140 +2409,116 @@ impl RiskEngine {
     fn prepare_account_for_resolved_touch(&mut self, idx: usize) {
         let a = &mut self.accounts[idx];
         if a.reserved_pnl == 0 { return; }
-        for i in 0..a.exact_cohort_count as usize {
-            a.exact_reserve_cohorts[i] = ReserveCohort::EMPTY;
-        }
-        a.exact_cohort_count = 0;
-        a.overflow_older = ReserveCohort::EMPTY;
-        a.overflow_older_present = 0;
-        a.overflow_newest = ReserveCohort::EMPTY;
-        a.overflow_newest_present = 0;
+        a.sched_present = 0;
+        a.sched_remaining_q = 0;
+        a.sched_anchor_q = 0;
+        a.sched_start_slot = 0;
+        a.sched_horizon = 0;
+        a.sched_release_q = 0;
+        a.pending_present = 0;
+        a.pending_remaining_q = 0;
+        a.pending_horizon = 0;
+        a.pending_created_slot = 0;
         a.reserved_pnl = 0;
         // Do NOT mutate PNL_matured_pos_tot (already set globally at resolve time)
     }
     }
 
-    /// advance_profit_warmup (spec §4.7, v12.14.0 cohort-based)
-    /// Releases reserve per stored scheduled cohort maturity.
+    /// advance_profit_warmup (spec §4.8, two-bucket)
+    /// Releases reserve from the scheduled bucket per linear maturity.
     test_visible! {
-    fn advance_profit_warmup_cohort(&mut self, idx: usize) {
+    fn advance_profit_warmup(&mut self, idx: usize) {
         let r = self.accounts[idx].reserved_pnl;
         if r == 0 {
-            // Require empty queue
-            assert!(self.accounts[idx].exact_cohort_count == 0);
-            assert!(self.accounts[idx].overflow_older_present == 0);
-            assert!(self.accounts[idx].overflow_newest_present == 0);
+            // Require both absent
+            assert!(self.accounts[idx].sched_present == 0);
+            assert!(self.accounts[idx].pending_present == 0);
             return;
         }
 
-        // Step 2: iterate exact cohorts oldest→newest, then overflow_older
-        let count = self.accounts[idx].exact_cohort_count as usize;
-        for ci in 0..count {
-            let c = &mut self.accounts[idx].exact_reserve_cohorts[ci];
-            if c.remaining_q == 0 { continue; }
-            let elapsed = self.current_slot.saturating_sub(c.start_slot) as u128;
-            let sched_total = if elapsed >= c.horizon_slots as u128 {
-                c.anchor_q
-            } else {
-                mul_div_floor_u128(c.anchor_q, elapsed, c.horizon_slots as u128)
-            };
-            assert!(sched_total >= c.sched_release_q, "sched_total < sched_release_q");
-            let sched_increment = sched_total - c.sched_release_q;
-            let release = core::cmp::min(c.remaining_q, sched_increment);
-            if release > 0 {
-                c.remaining_q -= release;
-                self.accounts[idx].reserved_pnl -= release;
-                self.pnl_matured_pos_tot = self.pnl_matured_pos_tot.checked_add(release)
-                    .expect("pnl_matured_pos_tot overflow");
-            }
-            c.sched_release_q = sched_total;
+        // Step 2: if sched absent and pending present → promote
+        if self.accounts[idx].sched_present == 0 && self.accounts[idx].pending_present != 0 {
+            let a = &mut self.accounts[idx];
+            a.sched_present = 1;
+            a.sched_remaining_q = a.pending_remaining_q;
+            a.sched_anchor_q = a.pending_remaining_q;
+            a.sched_start_slot = self.current_slot;
+            a.sched_horizon = a.pending_horizon;
+            a.sched_release_q = 0;
+            a.pending_present = 0;
+            a.pending_remaining_q = 0;
+            a.pending_horizon = 0;
+            a.pending_created_slot = 0;
         }
 
-        // Process overflow_older if present
-        if self.accounts[idx].overflow_older_present != 0 {
-            let c = &mut self.accounts[idx].overflow_older;
-            if c.remaining_q > 0 {
-                let elapsed = self.current_slot.saturating_sub(c.start_slot) as u128;
-                let sched_total = if elapsed >= c.horizon_slots as u128 {
-                    c.anchor_q
-                } else {
-                    mul_div_floor_u128(c.anchor_q, elapsed, c.horizon_slots as u128)
-                };
-                assert!(sched_total >= c.sched_release_q, "overflow sched_total < sched_release_q");
-                let sched_increment = sched_total - c.sched_release_q;
-                let release = core::cmp::min(c.remaining_q, sched_increment);
-                if release > 0 {
-                    c.remaining_q -= release;
-                    self.accounts[idx].reserved_pnl -= release;
-                    self.pnl_matured_pos_tot = self.pnl_matured_pos_tot.checked_add(release)
-                        .expect("pnl_matured_pos_tot overflow");
-                }
-                c.sched_release_q = sched_total;
-            }
-        }
-        // overflow_newest is pending — MUST NOT be advanced
-
-        // Step 3: remove empty exact cohorts
-        let count = self.accounts[idx].exact_cohort_count as usize;
-        let mut write = 0usize;
-        for read in 0..count {
-            if self.accounts[idx].exact_reserve_cohorts[read].remaining_q > 0 {
-                if write != read {
-                    self.accounts[idx].exact_reserve_cohorts[write] =
-                        self.accounts[idx].exact_reserve_cohorts[read];
-                }
-                write += 1;
-            }
-        }
-        for i in write..count {
-            self.accounts[idx].exact_reserve_cohorts[i] = ReserveCohort::EMPTY;
-        }
-        self.accounts[idx].exact_cohort_count = write as u8;
-
-        // Step 4: clear empty overflow_older
-        if self.accounts[idx].overflow_older_present != 0 && self.accounts[idx].overflow_older.remaining_q == 0 {
-            self.accounts[idx].overflow_older = ReserveCohort::EMPTY;
-            self.accounts[idx].overflow_older_present = 0;
+        // If sched still absent → return
+        if self.accounts[idx].sched_present == 0 {
+            return;
         }
 
-        // Step 5: clear empty overflow_newest
-        if self.accounts[idx].overflow_newest_present != 0 && self.accounts[idx].overflow_newest.remaining_q == 0 {
-            self.accounts[idx].overflow_newest = ReserveCohort::EMPTY;
-            self.accounts[idx].overflow_newest_present = 0;
+        // Step 4: elapsed = current_slot - sched_start_slot
+        let elapsed = self.current_slot.saturating_sub(self.accounts[idx].sched_start_slot) as u128;
+
+        // Step 5: sched_total = min(anchor, floor(anchor * elapsed / horizon))
+        let a = &mut self.accounts[idx];
+        let sched_total = if a.sched_horizon == 0 || elapsed >= a.sched_horizon as u128 {
+            a.sched_anchor_q
+        } else {
+            mul_div_floor_u128(a.sched_anchor_q, elapsed, a.sched_horizon as u128)
+        };
+
+        // Step 6: require sched_total >= sched_release_q
+        assert!(sched_total >= a.sched_release_q, "sched_total < sched_release_q");
+
+        // Step 7: sched_increment
+        let sched_increment = sched_total - a.sched_release_q;
+
+        // Step 8: release = min(remaining, increment)
+        let release = core::cmp::min(a.sched_remaining_q, sched_increment);
+
+        // Step 9: if release > 0
+        if release > 0 {
+            a.sched_remaining_q -= release;
+            a.reserved_pnl -= release;
+            self.pnl_matured_pos_tot = self.pnl_matured_pos_tot.checked_add(release)
+                .expect("pnl_matured_pos_tot overflow");
         }
 
-        // Step 6: promote overflow_older into exact if capacity available
-        let count = self.accounts[idx].exact_cohort_count as usize;
-        if self.accounts[idx].overflow_older_present != 0 && count < MAX_EXACT_RESERVE_COHORTS_PER_ACCOUNT {
-            self.accounts[idx].exact_reserve_cohorts[count] = self.accounts[idx].overflow_older;
-            self.accounts[idx].exact_cohort_count += 1;
-            self.accounts[idx].overflow_older = ReserveCohort::EMPTY;
-            self.accounts[idx].overflow_older_present = 0;
-        }
+        // Step 10: sched_release_q = sched_total
+        self.accounts[idx].sched_release_q = sched_total;
 
-        // Step 7: activate overflow_newest if overflow_older absent
-        if self.accounts[idx].overflow_older_present == 0 && self.accounts[idx].overflow_newest_present != 0 {
-            let pending_q = self.accounts[idx].overflow_newest.remaining_q;
-            let pending_h = self.accounts[idx].overflow_newest.horizon_slots;
-            self.accounts[idx].overflow_newest = ReserveCohort::EMPTY;
-            self.accounts[idx].overflow_newest_present = 0;
-            let activated = ReserveCohort {
-                remaining_q: pending_q, anchor_q: pending_q,
-                start_slot: self.current_slot, horizon_slots: pending_h, sched_release_q: 0,
-            };
-            let count = self.accounts[idx].exact_cohort_count as usize;
-            if count < MAX_EXACT_RESERVE_COHORTS_PER_ACCOUNT {
-                self.accounts[idx].exact_reserve_cohorts[count] = activated;
-                self.accounts[idx].exact_cohort_count += 1;
-            } else {
-                self.accounts[idx].overflow_older = activated;
-                self.accounts[idx].overflow_older_present = 1;
+        // Step 11: if scheduled empty → clear, promote pending if present
+        if self.accounts[idx].sched_remaining_q == 0 {
+            self.accounts[idx].sched_present = 0;
+            self.accounts[idx].sched_anchor_q = 0;
+            self.accounts[idx].sched_start_slot = 0;
+            self.accounts[idx].sched_horizon = 0;
+            self.accounts[idx].sched_release_q = 0;
+
+            // Promote pending if present
+            if self.accounts[idx].pending_present != 0 {
+                let a = &mut self.accounts[idx];
+                a.sched_present = 1;
+                a.sched_remaining_q = a.pending_remaining_q;
+                a.sched_anchor_q = a.pending_remaining_q;
+                a.sched_start_slot = self.current_slot;
+                a.sched_horizon = a.pending_horizon;
+                a.sched_release_q = 0;
+                a.pending_present = 0;
+                a.pending_remaining_q = 0;
+                a.pending_horizon = 0;
+                a.pending_created_slot = 0;
             }
         }
 
-        // Step 8-9: consistency checks
+        // Step 12: if R_i == 0 → require both absent
+        if self.accounts[idx].reserved_pnl == 0 {
+            assert!(self.accounts[idx].sched_present == 0);
+            assert!(self.accounts[idx].pending_present == 0);
+        }
+
         assert!(self.pnl_matured_pos_tot <= self.pnl_pos_tot,
-            "advance_profit_warmup_cohort: pnl_matured_pos_tot > pnl_pos_tot");
+            "advance_profit_warmup: pnl_matured_pos_tot > pnl_pos_tot");
     }
     }
 
@@ -2743,7 +2602,7 @@ impl RiskEngine {
         ctx.add_touched(idx as u16);
 
         // Step 4: advance cohort-based warmup
-        self.advance_profit_warmup_cohort(idx);
+        self.advance_profit_warmup(idx);
 
         // Step 5: settle side effects with H_lock for reserve routing
         self.settle_side_effects_with_h_lock(idx, ctx.h_lock_shared)?;
@@ -2895,14 +2754,16 @@ impl RiskEngine {
             a.matcher_context = matcher_context;
             a.owner = [0; 32];
             a.fee_credits = I128::ZERO;
-            for i in 0..MAX_EXACT_RESERVE_COHORTS_PER_ACCOUNT {
-                a.exact_reserve_cohorts[i] = ReserveCohort::EMPTY;
-            }
-            a.exact_cohort_count = 0;
-            a.overflow_older = ReserveCohort::EMPTY;
-            a.overflow_older_present = 0;
-            a.overflow_newest = ReserveCohort::EMPTY;
-            a.overflow_newest_present = 0;
+            a.sched_present = 0;
+            a.sched_remaining_q = 0;
+            a.sched_anchor_q = 0;
+            a.sched_start_slot = 0;
+            a.sched_horizon = 0;
+            a.sched_release_q = 0;
+            a.pending_present = 0;
+            a.pending_remaining_q = 0;
+            a.pending_horizon = 0;
+            a.pending_created_slot = 0;
         }
 
         if excess > 0 {
@@ -4396,10 +4257,8 @@ impl RiskEngine {
         if account.reserved_pnl != 0 {
             return Err(RiskError::Undercollateralized);
         }
-        // Require queue metadata empty (not just reserved_pnl == 0)
-        if account.exact_cohort_count != 0
-            || account.overflow_older_present != 0
-            || account.overflow_newest_present != 0 {
+        // Require bucket metadata empty (not just reserved_pnl == 0)
+        if account.sched_present != 0 || account.pending_present != 0 {
             return Err(RiskError::Undercollateralized);
         }
         if account.fee_credits.get() > 0 {
@@ -4475,9 +4334,7 @@ impl RiskEngine {
             if account.reserved_pnl != 0 {
                 continue;
             }
-            if account.exact_cohort_count != 0
-                || account.overflow_older_present != 0
-                || account.overflow_newest_present != 0 {
+            if account.sched_present != 0 || account.pending_present != 0 {
                 continue;
             }
             if account.fee_credits.get() > 0 {

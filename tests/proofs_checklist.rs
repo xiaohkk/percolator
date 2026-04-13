@@ -331,51 +331,43 @@ fn proof_goal5_no_same_trade_bootstrap() {
 }
 
 // ############################################################################
-// Goal 7: Overflow segments always use H_max
+// Goal 7: Pending merge uses max horizon
 // ############################################################################
 
-/// When exact capacity is exhausted, new overflow segments must use H_max
-/// regardless of the wrapper-supplied h_lock.
+/// When both buckets are occupied, merges into pending use horizon = max.
 #[kani::proof]
-#[kani::unwind(8)]
+#[kani::unwind(4)]
 #[kani::solver(cadical)]
-fn proof_goal7_overflow_uses_h_max() {
+fn proof_goal7_pending_merge_max_horizon() {
     let mut engine = RiskEngine::new(zero_fee_params());
     let idx = engine.add_user(0).unwrap();
     engine.deposit(idx, 1_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
-    // Fill exact capacity (3 under Kani) with h_lock=10
-    for i in 0..3u64 {
-        engine.accounts[idx as usize].pnl += 10_000;
-        engine.pnl_pos_tot += 10_000;
-        engine.append_or_route_new_reserve(idx as usize, 10_000, DEFAULT_SLOT + i, 10);
-    }
-    assert_eq!(engine.accounts[idx as usize].exact_cohort_count, 3, "exact full");
-
-    // Next append goes to overflow_older — must use h_max, NOT caller's h_lock
-    let short_hlock = 5u64; // caller wants short horizon
+    // First append creates sched
     engine.accounts[idx as usize].pnl += 10_000;
     engine.pnl_pos_tot += 10_000;
-    engine.append_or_route_new_reserve(idx as usize, 10_000, DEFAULT_SLOT + 10, short_hlock);
+    engine.append_or_route_new_reserve(idx as usize, 10_000, DEFAULT_SLOT, 10);
+    assert_eq!(engine.accounts[idx as usize].sched_present, 1);
 
-    assert!(engine.accounts[idx as usize].overflow_older_present != 0,
-        "overflow_older must be created");
-    assert_eq!(engine.accounts[idx as usize].overflow_older.horizon_slots,
-        engine.params.h_max,
-        "Goal 7: overflow must use H_max, not caller h_lock");
-
-    // Same for overflow_newest
+    // Second append creates pending (different slot)
     engine.accounts[idx as usize].pnl += 10_000;
     engine.pnl_pos_tot += 10_000;
-    engine.append_or_route_new_reserve(idx as usize, 10_000, DEFAULT_SLOT + 11, short_hlock);
+    engine.append_or_route_new_reserve(idx as usize, 10_000, DEFAULT_SLOT + 1, 5);
+    assert_eq!(engine.accounts[idx as usize].pending_present, 1);
 
-    if engine.accounts[idx as usize].overflow_newest_present != 0 {
-        assert_eq!(engine.accounts[idx as usize].overflow_newest.horizon_slots,
-            engine.params.h_max,
-            "Goal 7: overflow_newest must also use H_max");
-    }
+    let h1: u8 = kani::any();
+    kani::assume(h1 >= 1 && h1 <= 100);
+    let h_lock = h1 as u64;
 
-    kani::cover!(true, "overflow H_max enforced");
+    // Third append merges into pending
+    engine.accounts[idx as usize].pnl += 10_000;
+    engine.pnl_pos_tot += 10_000;
+    engine.append_or_route_new_reserve(idx as usize, 10_000, DEFAULT_SLOT + 2, h_lock);
+
+    assert!(engine.accounts[idx as usize].pending_horizon >= h_lock,
+        "Goal 7: pending horizon must be >= h_lock after merge");
+
+    kani::cover!(true, "pending max-horizon enforced");
 }
 
 // ############################################################################
@@ -455,4 +447,138 @@ fn proof_goal27_finalize_path_independent() {
         "Goal 27: matured aggregate must be order-independent");
 
     kani::cover!(true, "finalize is order-independent");
+}
+
+// ############################################################################
+// Two-bucket warmup proofs
+// ############################################################################
+
+/// R_i = sched_remaining + pending_remaining after append.
+#[kani::proof]
+#[kani::unwind(5)]
+#[kani::solver(cadical)]
+fn proof_two_bucket_reserve_sum_after_append() {
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let idx = engine.add_user(0).unwrap();
+    engine.deposit(idx, 1_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+
+    let h_lock: u64 = kani::any();
+    kani::assume(h_lock >= 1 && h_lock <= 100);
+
+    // First append: creates scheduled
+    let r1: u128 = kani::any();
+    kani::assume(r1 > 0 && r1 <= 50_000);
+    engine.accounts[idx as usize].pnl += r1 as i128;
+    engine.pnl_pos_tot += r1;
+    engine.append_or_route_new_reserve(idx as usize, r1, DEFAULT_SLOT, h_lock);
+
+    // Second append at different slot: creates pending
+    let r2: u128 = kani::any();
+    kani::assume(r2 > 0 && r2 <= 50_000);
+    engine.accounts[idx as usize].pnl += r2 as i128;
+    engine.pnl_pos_tot += r2;
+    engine.append_or_route_new_reserve(idx as usize, r2, DEFAULT_SLOT + 1, h_lock);
+
+    // R_i must equal sum of both buckets
+    let a = &engine.accounts[idx as usize];
+    let sched_r = if a.sched_present != 0 { a.sched_remaining_q } else { 0 };
+    let pend_r = if a.pending_present != 0 { a.pending_remaining_q } else { 0 };
+    assert_eq!(a.reserved_pnl, sched_r + pend_r,
+        "R_i must equal sched + pending");
+
+    kani::cover!(a.sched_present != 0 && a.pending_present != 0, "both buckets present");
+}
+
+/// Loss hits pending first (newest-first).
+#[kani::proof]
+#[kani::unwind(5)]
+#[kani::solver(cadical)]
+fn proof_two_bucket_loss_newest_first() {
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let idx = engine.add_user(0).unwrap();
+    engine.deposit(idx, 1_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+
+    // Create sched + pending
+    engine.accounts[idx as usize].pnl = 30_000;
+    engine.pnl_pos_tot = 30_000;
+    engine.append_or_route_new_reserve(idx as usize, 10_000, DEFAULT_SLOT, 10);
+    engine.append_or_route_new_reserve(idx as usize, 20_000, DEFAULT_SLOT + 1, 10);
+
+    let sched_before = engine.accounts[idx as usize].sched_remaining_q;
+
+    // Loss that fits in pending
+    let loss: u128 = kani::any();
+    kani::assume(loss > 0 && loss <= 20_000);
+    engine.apply_reserve_loss_newest_first(idx as usize, loss);
+
+    // Scheduled must be untouched
+    assert_eq!(engine.accounts[idx as usize].sched_remaining_q, sched_before,
+        "scheduled must be untouched when loss fits in pending");
+
+    kani::cover!(loss == 20_000, "exact pending drain");
+    kani::cover!(loss < 20_000, "partial pending loss");
+}
+
+/// Scheduled bucket matures exactly per its horizon.
+#[kani::proof]
+#[kani::unwind(5)]
+#[kani::solver(cadical)]
+fn proof_two_bucket_scheduled_timing() {
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let idx = engine.add_user(0).unwrap();
+    engine.deposit(idx, 1_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+
+    let anchor: u128 = kani::any();
+    kani::assume(anchor > 0 && anchor <= 1_000);
+    let h: u64 = kani::any();
+    kani::assume(h >= 1 && h <= 20);
+
+    engine.accounts[idx as usize].pnl = anchor as i128;
+    engine.pnl_pos_tot = anchor;
+    engine.append_or_route_new_reserve(idx as usize, anchor, DEFAULT_SLOT, h);
+
+    let dt: u64 = kani::any();
+    kani::assume(dt >= 1 && dt <= 40);
+    engine.current_slot = DEFAULT_SLOT + dt;
+
+    let r_before = engine.accounts[idx as usize].reserved_pnl;
+    engine.advance_profit_warmup(idx as usize);
+    let released = r_before - engine.accounts[idx as usize].reserved_pnl;
+
+    let expected = if dt as u128 >= h as u128 { anchor }
+        else { mul_div_floor_u128(anchor, dt as u128, h as u128) };
+    assert_eq!(released, expected, "release must match floor(anchor*elapsed/horizon)");
+
+    kani::cover!(dt < h, "partial maturity");
+    kani::cover!(dt >= h, "full maturity");
+}
+
+/// Pending does not mature.
+#[kani::proof]
+#[kani::unwind(5)]
+#[kani::solver(cadical)]
+fn proof_two_bucket_pending_non_maturity() {
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let idx = engine.add_user(0).unwrap();
+    engine.deposit(idx, 1_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+
+    // Create sched + pending
+    engine.accounts[idx as usize].pnl = 30_000;
+    engine.pnl_pos_tot = 30_000;
+    engine.append_or_route_new_reserve(idx as usize, 10_000, DEFAULT_SLOT, 10);
+    engine.append_or_route_new_reserve(idx as usize, 20_000, DEFAULT_SLOT + 1, 10);
+
+    let pending_before = engine.accounts[idx as usize].pending_remaining_q;
+
+    // Advance well past horizon
+    engine.current_slot = DEFAULT_SLOT + 200;
+    engine.advance_profit_warmup(idx as usize);
+
+    // If pending is still present (not promoted), it must not have matured
+    if engine.accounts[idx as usize].pending_present != 0 {
+        assert_eq!(engine.accounts[idx as usize].pending_remaining_q, pending_before,
+            "pending must not mature while pending");
+    }
+
+    kani::cover!(true, "warmup with pending exercised");
 }
