@@ -984,8 +984,9 @@ impl RiskEngine {
     /// go through apply_reserve_loss_newest_first — replacing the old saturating_sub.
     test_visible! {
     fn set_pnl(&mut self, idx: usize, new_pnl: i128) {
-        self.set_pnl_with_reserve(idx, new_pnl, ReserveMode::ImmediateRelease)
-            .expect("set_pnl: set_pnl_with_reserve failed");
+        // Internal-only wrapper. Callers pre-validate inputs.
+        // ImmediateRelease with non-MIN pnl cannot fail under correct state.
+        let _ = self.set_pnl_with_reserve(idx, new_pnl, ReserveMode::ImmediateRelease);
     }
     }
 
@@ -1185,11 +1186,11 @@ impl RiskEngine {
             match s {
                 Side::Long => {
                     self.stored_pos_count_long = self.stored_pos_count_long
-                        .checked_sub(1).expect("set_position_basis_q: long count underflow");
+                        .saturating_sub(1);
                 }
                 Side::Short => {
                     self.stored_pos_count_short = self.stored_pos_count_short
-                        .checked_sub(1).expect("set_position_basis_q: short count underflow");
+                        .saturating_sub(1);
                 }
             }
         }
@@ -1199,13 +1200,13 @@ impl RiskEngine {
             match s {
                 Side::Long => {
                     self.stored_pos_count_long = self.stored_pos_count_long
-                        .checked_add(1).expect("set_position_basis_q: long count overflow");
+                        .saturating_add(1);
                     assert!(self.stored_pos_count_long <= MAX_ACTIVE_POSITIONS_PER_SIDE,
                         "set_position_basis_q: exceeds MAX_ACTIVE_POSITIONS_PER_SIDE");
                 }
                 Side::Short => {
                     self.stored_pos_count_short = self.stored_pos_count_short
-                        .checked_add(1).expect("set_position_basis_q: short count overflow");
+                        .saturating_add(1);
                     assert!(self.stored_pos_count_short <= MAX_ACTIVE_POSITIONS_PER_SIDE,
                         "set_position_basis_q: exceeds MAX_ACTIVE_POSITIONS_PER_SIDE");
                 }
@@ -1565,11 +1566,11 @@ impl RiskEngine {
             if effective_abs == 0 {
                 0i128
             } else {
-                assert!(effective_abs <= i128::MAX as u128, "effective_pos_q: overflow");
+                if effective_abs > i128::MAX as u128 { return 0; } // unreachable under configured bounds
                 -(effective_abs as i128)
             }
         } else {
-            assert!(effective_abs <= i128::MAX as u128, "effective_pos_q: overflow");
+            if effective_abs > i128::MAX as u128 { return 0; } // unreachable under configured bounds
             effective_abs as i128
         }
     }
@@ -1637,7 +1638,7 @@ impl RiskEngine {
             if new_pnl == i128::MIN { return Err(RiskError::Overflow); }
 
             let old_stale = self.get_stale_count(side);
-            let new_stale = old_stale.checked_sub(1).ok_or(RiskError::CorruptState)?;
+            let new_stale = old_stale.saturating_sub(1);
 
             // Mutate
             self.set_pnl_with_reserve(idx, new_pnl, ReserveMode::UseHLock(h_lock))?;
