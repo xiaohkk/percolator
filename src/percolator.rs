@@ -425,8 +425,10 @@ pub struct RiskEngine {
     /// Count of accounts with PNL < 0 (spec §4.7, v12.16.4)
     pub neg_pnl_account_count: u64,
 
-    /// Last oracle price used in accrue_market_to
+    /// Last oracle price used in accrue_market_to (P_last, spec §5.5)
     pub last_oracle_price: u64,
+    /// Last funding-sample price (fund_px_last, spec §5.5 step 11)
+    pub fund_px_last: u64,
     /// Last slot used in accrue_market_to
     pub last_market_slot: u64,
     /// Cumulative funding numerator for long side (v12.15)
@@ -699,6 +701,7 @@ impl RiskEngine {
             materialized_account_count: 0,
             neg_pnl_account_count: 0,
             last_oracle_price: init_oracle_price,
+            fund_px_last: init_oracle_price,
             last_market_slot: init_slot,
             f_long_num: 0,
             f_short_num: 0,
@@ -1660,7 +1663,7 @@ impl RiskEngine {
         let mut f_long = self.f_long_num;
         let mut f_short = self.f_short_num;
         if funding_rate_e9 != 0 && total_dt > 0 && long_live && short_live {
-            let fund_px_0 = self.last_oracle_price;
+            let fund_px_0 = self.fund_px_last;
 
             if fund_px_0 > 0 {
                 // Exact computation: fund_num_total = fund_px_0 * rate * dt
@@ -1691,6 +1694,7 @@ impl RiskEngine {
         self.current_slot = now_slot;
         self.last_market_slot = now_slot;
         self.last_oracle_price = oracle_price;
+        self.fund_px_last = oracle_price;
 
         Ok(())
     }
