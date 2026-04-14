@@ -623,6 +623,41 @@ impl I256 {
         }
     }
 
+
+    /// Checked signed I256 * I256 multiplication via abs/sign decomposition.
+    /// Returns None on overflow (result doesn't fit I256).
+    pub fn checked_mul_i256(self, rhs: I256) -> Option<I256> {
+        if self.is_zero() || rhs.is_zero() { return Some(I256::ZERO); }
+        let neg = self.is_negative() != rhs.is_negative();
+        // Handle MIN carefully: abs_u256 panics on MIN, but MIN * 1 = MIN, MIN * -1 = overflow
+        if self == I256::MIN {
+            if rhs == I256::ONE { return Some(I256::MIN); }
+            if rhs == I256::MINUS_ONE { return None; } // -MIN > MAX
+            return None; // |MIN| * |rhs>1| > MAX
+        }
+        if rhs == I256::MIN {
+            if self == I256::ONE { return Some(I256::MIN); }
+            if self == I256::MINUS_ONE { return None; }
+            return None;
+        }
+        let abs_a = self.abs_u256();
+        let abs_b = rhs.abs_u256();
+        let product = abs_a.checked_mul(abs_b)?;
+        if neg {
+            // Result must be <= 2^255 (magnitude of MIN)
+            // 2^255 as U256: hi limb has bit 127 set (for [u128;2]) or bit 63 of limb[3] (for [u64;4])
+            let min_mag = U256::from_u128(0).checked_add(U256::from_u128(1u128 << 127)).unwrap_or(U256::MAX);
+            // For exactly 2^255, result is MIN
+            if product == min_mag { return Some(I256::MIN); }
+            if product > min_mag { return None; }
+            // product < 2^255: fits as negative I256
+            let pos = I256::from_u256_or_overflow(product)?;
+            pos.checked_neg()
+        } else {
+            I256::from_u256_or_overflow(product)
+        }
+    }
+
     // -- checked arithmetic --
 
     pub fn checked_add(self, rhs: I256) -> Option<I256> {
@@ -793,6 +828,41 @@ impl I256 {
     }
 
     // -- checked arithmetic --
+
+
+    /// Checked signed I256 * I256 multiplication via abs/sign decomposition.
+    /// Returns None on overflow (result doesn't fit I256).
+    pub fn checked_mul_i256(self, rhs: I256) -> Option<I256> {
+        if self.is_zero() || rhs.is_zero() { return Some(I256::ZERO); }
+        let neg = self.is_negative() != rhs.is_negative();
+        // Handle MIN carefully: abs_u256 panics on MIN, but MIN * 1 = MIN, MIN * -1 = overflow
+        if self == I256::MIN {
+            if rhs == I256::ONE { return Some(I256::MIN); }
+            if rhs == I256::MINUS_ONE { return None; } // -MIN > MAX
+            return None; // |MIN| * |rhs>1| > MAX
+        }
+        if rhs == I256::MIN {
+            if self == I256::ONE { return Some(I256::MIN); }
+            if self == I256::MINUS_ONE { return None; }
+            return None;
+        }
+        let abs_a = self.abs_u256();
+        let abs_b = rhs.abs_u256();
+        let product = abs_a.checked_mul(abs_b)?;
+        if neg {
+            // Result must be <= 2^255 (magnitude of MIN)
+            // 2^255 as U256: hi limb has bit 127 set (for [u128;2]) or bit 63 of limb[3] (for [u64;4])
+            let min_mag = U256::from_u128(0).checked_add(U256::from_u128(1u128 << 127)).unwrap_or(U256::MAX);
+            // For exactly 2^255, result is MIN
+            if product == min_mag { return Some(I256::MIN); }
+            if product > min_mag { return None; }
+            // product < 2^255: fits as negative I256
+            let pos = I256::from_u256_or_overflow(product)?;
+            pos.checked_neg()
+        } else {
+            I256::from_u256_or_overflow(product)
+        }
+    }
 
     pub fn checked_add(self, rhs: I256) -> Option<I256> {
         let s_lo = self.lo_u128();

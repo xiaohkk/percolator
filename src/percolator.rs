@@ -1381,6 +1381,7 @@ impl RiskEngine {
             I256::ZERO
         } else {
             let neg = k_diff.is_negative();
+            if k_diff == I256::MIN { return Err(RiskError::Overflow); }
             let abs_k = k_diff.abs_u256();
             let prod_u256 = abs_k.checked_mul(U256::from_u128(FUNDING_DEN))
                 .ok_or(RiskError::Overflow)?;
@@ -1397,6 +1398,7 @@ impl RiskEngine {
         if combined.is_zero() { return Ok(0); }
         // abs_basis * |combined| / (den * FUNDING_DEN), floor toward -inf
         let negative = combined.is_negative();
+        if combined == I256::MIN { return Err(RiskError::Overflow); }
         let abs_combined = combined.abs_u256();
         let abs_basis_u256 = U256::from_u128(abs_basis);
         let den_wide = U256::from_u128(den).checked_mul(U256::from_u128(FUNDING_DEN))
@@ -1641,13 +1643,25 @@ impl RiskEngine {
         let delta_p = (oracle_price as i128).checked_sub(current_price as i128)
             .ok_or(RiskError::Overflow)?;
         if delta_p != 0 {
+            // Compute mark deltas in I256, only fail when final K doesn't fit i128.
+            // This avoids false overflow when delta magnitude > i128::MAX but
+            // current K has opposite sign so the sum still fits.
+            let delta_p_wide = I256::from_i128(delta_p);
             if long_live {
-                let dk = checked_u128_mul_i128(self.adl_mult_long, delta_p)?;
-                k_long = k_long.checked_add(dk).ok_or(RiskError::Overflow)?;
+                let a_long_wide = I256::from_u128(self.adl_mult_long);
+                let dk_wide = a_long_wide.checked_mul_i256(delta_p_wide)
+                    .ok_or(RiskError::Overflow)?;
+                let k_long_wide = I256::from_i128(k_long).checked_add(dk_wide)
+                    .ok_or(RiskError::Overflow)?;
+                k_long = k_long_wide.try_into_i128().ok_or(RiskError::Overflow)?;
             }
             if short_live {
-                let dk = checked_u128_mul_i128(self.adl_mult_short, delta_p)?;
-                k_short = k_short.checked_sub(dk).ok_or(RiskError::Overflow)?;
+                let a_short_wide = I256::from_u128(self.adl_mult_short);
+                let dk_wide = a_short_wide.checked_mul_i256(delta_p_wide)
+                    .ok_or(RiskError::Overflow)?;
+                let k_short_wide = I256::from_i128(k_short).checked_sub(dk_wide)
+                    .ok_or(RiskError::Overflow)?;
+                k_short = k_short_wide.try_into_i128().ok_or(RiskError::Overflow)?;
             }
         }
 
@@ -1660,23 +1674,31 @@ impl RiskEngine {
             let fund_px_0 = self.fund_px_last;
 
             if fund_px_0 > 0 {
-                // Exact computation: fund_num_total = fund_px_0 * rate * dt
-                // fund_px_0 <= MAX_ORACLE_PRICE (1e12), rate <= 1e9, dt <= u64::MAX
-                // Product can exceed i128, so use checked i128 arithmetic with
-                // overflow routing to Err.
-                let fund_num_total: i128 = (fund_px_0 as i128)
-                    .checked_mul(funding_rate_e9)
+                // Exact computation in I256: fund_num_total = fund_px_0 * rate * dt
+                // Only fail when final persisted F doesn't fit i128.
+                let px_wide = I256::from_u128(fund_px_0 as u128);
+                let rate_wide = I256::from_i128(funding_rate_e9);
+                let dt_wide = I256::from_u128(total_dt as u128);
+                let fund_num_total_wide = px_wide.checked_mul_i256(rate_wide)
                     .ok_or(RiskError::Overflow)?
-                    .checked_mul(total_dt as i128)
+                    .checked_mul_i256(dt_wide)
                     .ok_or(RiskError::Overflow)?;
 
                 // F_long -= A_long * fund_num_total
-                let df_long = checked_u128_mul_i128(self.adl_mult_long, fund_num_total)?;
-                f_long = f_long.checked_sub(df_long).ok_or(RiskError::Overflow)?;
+                let a_long_wide = I256::from_u128(self.adl_mult_long);
+                let df_long_wide = a_long_wide.checked_mul_i256(fund_num_total_wide)
+                    .ok_or(RiskError::Overflow)?;
+                let f_long_wide = I256::from_i128(f_long).checked_sub(df_long_wide)
+                    .ok_or(RiskError::Overflow)?;
+                f_long = f_long_wide.try_into_i128().ok_or(RiskError::Overflow)?;
 
                 // F_short += A_short * fund_num_total
-                let df_short = checked_u128_mul_i128(self.adl_mult_short, fund_num_total)?;
-                f_short = f_short.checked_add(df_short).ok_or(RiskError::Overflow)?;
+                let a_short_wide = I256::from_u128(self.adl_mult_short);
+                let df_short_wide = a_short_wide.checked_mul_i256(fund_num_total_wide)
+                    .ok_or(RiskError::Overflow)?;
+                let f_short_wide = I256::from_i128(f_short).checked_add(df_short_wide)
+                    .ok_or(RiskError::Overflow)?;
+                f_short = f_short_wide.try_into_i128().ok_or(RiskError::Overflow)?;
             }
         }
 
