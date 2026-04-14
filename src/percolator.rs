@@ -80,6 +80,7 @@ pub const BITMAP_WORDS: usize = (MAX_ACCOUNTS + 63) / 64;
 pub const MAX_ROUNDING_SLACK: u128 = MAX_ACCOUNTS as u128;
 pub const MAX_ACTIVE_POSITIONS_PER_SIDE: u64 = MAX_ACCOUNTS as u64;
 const ACCOUNT_IDX_MASK: usize = MAX_ACCOUNTS - 1;
+const _: () = assert!(MAX_ACCOUNTS.is_power_of_two());
 
 pub const GC_CLOSE_BUDGET: u32 = 32;
 pub const ACCOUNTS_PER_CRANK: u16 = 128;
