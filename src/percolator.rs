@@ -1636,7 +1636,7 @@ impl RiskEngine {
             if new_pnl == i128::MIN { return Err(RiskError::Overflow); }
 
             let old_stale = self.get_stale_count(side);
-            let new_stale = old_stale.saturating_sub(1);
+            let new_stale = old_stale.checked_sub(1).ok_or(RiskError::CorruptState)?;
 
             // Mutate
             self.set_pnl_with_reserve(idx, new_pnl, ReserveMode::UseHLock(h_lock))?;
@@ -2343,9 +2343,14 @@ impl RiskEngine {
             .unwrap_or(i128::MIN + 1);
 
         // Counterfactual global positive aggregate (using pnl_pos_tot, not matured)
-        let pnl_pos_tot_trade_open = self.pnl_pos_tot
-            .checked_sub(pos_pnl).unwrap_or(0)
-            .checked_add(pos_pnl_trade_open).unwrap_or(self.pnl_pos_tot);
+        // If aggregates are corrupt, return most restrictive equity (blocks trades)
+        let pnl_pos_tot_trade_open = match self.pnl_pos_tot.checked_sub(pos_pnl) {
+            Some(v) => match v.checked_add(pos_pnl_trade_open) {
+                Some(v2) => v2,
+                None => return i128::MIN + 1, // corrupt: blocks all trades
+            },
+            None => return i128::MIN + 1, // corrupt: blocks all trades
+        };
 
         // Counterfactual trade haircut g
         let pnl_eff_trade_open = if pnl_pos_tot_trade_open == 0 {
@@ -2562,24 +2567,31 @@ impl RiskEngine {
             a.pending_created_slot = 0;
         }
 
-        // If sched still absent → return
+        // If sched absent but R > 0 with no pending either -> corrupt
         if self.accounts[idx].sched_present == 0 {
-            return Ok(());
+            // R > 0 but no buckets at all is corrupt
+            return Err(RiskError::CorruptState);
         }
 
         // Step 4: elapsed = current_slot - sched_start_slot
-        let elapsed = self.current_slot.saturating_sub(self.accounts[idx].sched_start_slot) as u128;
+        if self.current_slot < self.accounts[idx].sched_start_slot {
+            return Err(RiskError::CorruptState);
+        }
+        let elapsed = (self.current_slot - self.accounts[idx].sched_start_slot) as u128;
 
         // Step 5: sched_total = min(anchor, floor(anchor * elapsed / horizon))
         let a = &mut self.accounts[idx];
-        let sched_total = if a.sched_horizon == 0 || elapsed >= a.sched_horizon as u128 {
+        if a.sched_horizon == 0 {
+            return Err(RiskError::CorruptState);
+        }
+        let sched_total = if elapsed >= a.sched_horizon as u128 {
             a.sched_anchor_q
         } else {
             mul_div_floor_u128(a.sched_anchor_q, elapsed, a.sched_horizon as u128)
         };
 
         // Step 6: require sched_total >= sched_release_q
-        assert!(sched_total >= a.sched_release_q, "sched_total < sched_release_q");
+        if sched_total < a.sched_release_q { return Err(RiskError::CorruptState); }
 
         // Step 7: sched_increment
         let sched_increment = sched_total - a.sched_release_q;
@@ -2592,7 +2604,7 @@ impl RiskEngine {
             a.sched_remaining_q -= release;
             a.reserved_pnl -= release;
             self.pnl_matured_pos_tot = self.pnl_matured_pos_tot.checked_add(release)
-                .expect("pnl_matured_pos_tot overflow");
+                .ok_or(RiskError::Overflow)?;
         }
 
         // Step 10: sched_release_q = sched_total
@@ -2964,6 +2976,12 @@ impl RiskEngine {
                 self.insurance_fund.balance = self.insurance_fund.balance + required_fee;
                 capital_amount = amount - required_fee; // safe: amount >= total_needed > required_fee
             }
+        }
+
+        // Pre-validate: settle_losses can only fail on i128::MIN PNL (corruption).
+        // Check before any mutation to maintain validate-then-mutate contract.
+        if self.is_used(idx as usize) && self.accounts[idx as usize].pnl == i128::MIN {
+            return Err(RiskError::CorruptState);
         }
 
         // Step 3: current_slot = now_slot

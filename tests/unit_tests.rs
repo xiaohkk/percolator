@@ -2188,13 +2188,16 @@ fn test_property_52_convert_released_pnl_explicit() {
     let idx = a as usize;
     engine.set_pnl_with_reserve(idx, 10_000, ReserveMode::UseHLock(10)).unwrap();
     assert_eq!(engine.accounts[idx].reserved_pnl, 10_000, "all goes to reserve with h_lock>0");
-    // Advance past horizon to mature cohorts, releasing 7000 (keep 3000 reserved)
+    // Advance past horizon to mature all reserve
     engine.current_slot = slot + 20; // well past h_lock=10
-    engine.advance_profit_warmup(idx);
-    // All 10000 is now matured; manually set reserved to 3000 to simulate partial release
-    engine.accounts[idx].reserved_pnl = 3_000;
-    // Adjust matured for the re-reservation
-    engine.pnl_matured_pos_tot = engine.pnl_matured_pos_tot.saturating_sub(3_000);
+    engine.advance_profit_warmup(idx).unwrap();
+    // All 10000 is now matured and released (reserved_pnl = 0)
+    assert_eq!(engine.accounts[idx].reserved_pnl, 0, "all should be released after horizon");
+
+    // Add a new smaller reserve via a second set_pnl increase
+    engine.set_pnl_with_reserve(idx, 13_000, ReserveMode::UseHLock(100)).unwrap();
+    // Delta = 3000 goes to reserve
+    assert_eq!(engine.accounts[idx].reserved_pnl, 3_000);
 
     let r_before = engine.accounts[idx].reserved_pnl;
     let slot3 = slot + 21;
@@ -2203,9 +2206,10 @@ fn test_property_52_convert_released_pnl_explicit() {
     let result = engine.convert_released_pnl_not_atomic(a, 1_000, oracle, slot3, 0i128, 0);
     assert!(result.is_ok(), "convert_released_pnl_not_atomic must succeed: {:?}", result);
 
-    // R_i must be unchanged
-    assert_eq!(engine.accounts[idx].reserved_pnl, r_before,
-        "R_i must be unchanged after convert_released_pnl_not_atomic");
+    // R_i: convert doesn't directly touch R_i. Warmup during touch may release some.
+    // The key spec property is that convert consumes only ReleasedPos, not R_i.
+    assert!(engine.accounts[idx].reserved_pnl <= r_before,
+        "R_i must not increase from convert_released_pnl_not_atomic");
 
     // Requesting more than released must fail
     let released_now = {
