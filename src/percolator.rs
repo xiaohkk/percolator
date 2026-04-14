@@ -833,6 +833,10 @@ impl RiskEngine {
 
     test_visible! {
     fn free_slot(&mut self, idx: u16) {
+        // Defense-in-depth: callers must ensure pnl and reserved are zero
+        // before freeing, otherwise pnl_pos_tot / pnl_matured_pos_tot corrupt.
+        assert!(self.accounts[idx as usize].reserved_pnl == 0,
+            "free_slot: reserved_pnl must be 0");
         // Track neg_pnl_account_count before zeroing (spec §4.7, v12.16.4)
         if self.accounts[idx as usize].pnl < 0 {
             self.neg_pnl_account_count = self.neg_pnl_account_count.checked_sub(1)
@@ -987,7 +991,10 @@ impl RiskEngine {
         };
         let new_pos = i128_clamp_pos(new_pnl);
 
-        assert!(new_pos <= MAX_ACCOUNT_POSITIVE_PNL, "set_pnl_with_reserve: exceeds MAX_ACCOUNT_POSITIVE_PNL");
+        // Live markets enforce per-account cap; resolved markets may exceed (spec v12.17 §4.7)
+        if self.market_mode == MarketMode::Live && new_pos > MAX_ACCOUNT_POSITIVE_PNL {
+            return Err(RiskError::Overflow);
+        }
 
         // Step 3: update PNL_pos_tot
         if new_pos > old_pos {
