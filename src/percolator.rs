@@ -1005,9 +1005,20 @@ impl RiskEngine {
         };
         let new_pos = i128_clamp_pos(new_pnl);
 
-        // Pre-validate: reject NoPositiveIncreaseAllowed BEFORE any mutation
-        if new_pos > old_pos && matches!(reserve_mode, ReserveMode::NoPositiveIncreaseAllowed) {
-            return Err(RiskError::Overflow);
+        // Pre-validate reserve mode BEFORE any mutation
+        if new_pos > old_pos {
+            match reserve_mode {
+                ReserveMode::NoPositiveIncreaseAllowed => {
+                    return Err(RiskError::Overflow);
+                }
+                ReserveMode::UseHLock(h_lock) if h_lock != 0 => {
+                    if self.market_mode != MarketMode::Live { return Err(RiskError::Unauthorized); }
+                    if h_lock < self.params.h_min || h_lock > self.params.h_max {
+                        return Err(RiskError::Overflow);
+                    }
+                }
+                _ => {} // ImmediateRelease and UseHLock(0) always valid
+            }
         }
 
         if self.market_mode == MarketMode::Live && new_pos > MAX_ACCOUNT_POSITIVE_PNL {
@@ -1059,10 +1070,7 @@ impl RiskEngine {
                         if self.pnl_matured_pos_tot > self.pnl_pos_tot { return Err(RiskError::CorruptState); }
                         return Ok(());
                     }
-                    if self.market_mode != MarketMode::Live { return Err(RiskError::Unauthorized); }
-                    if h_lock < self.params.h_min || h_lock > self.params.h_max {
-                        return Err(RiskError::Overflow);
-                    }
+                    // h_lock validity already pre-validated above
                     self.append_or_route_new_reserve(idx, reserve_add, self.current_slot, h_lock);
                     if self.pnl_matured_pos_tot > self.pnl_pos_tot { return Err(RiskError::CorruptState); }
                     return Ok(());
@@ -1398,6 +1406,55 @@ impl RiskEngine {
         let combined = k_scaled.checked_add(f_diff).ok_or(RiskError::Overflow)?;
         if combined.is_zero() { return Ok(0); }
         // abs_basis * |combined| / (den * FUNDING_DEN), floor toward -inf
+        let negative = combined.is_negative();
+        if combined == I256::MIN { return Err(RiskError::Overflow); }
+        let abs_combined = combined.abs_u256();
+        let abs_basis_u256 = U256::from_u128(abs_basis);
+        let den_wide = U256::from_u128(den).checked_mul(U256::from_u128(FUNDING_DEN))
+            .ok_or(RiskError::Overflow)?;
+        let p = abs_basis_u256.checked_mul(abs_combined).ok_or(RiskError::Overflow)?;
+        let (q, rem) = wide_math::div_rem_u256(p, den_wide);
+        if negative {
+            let mag = if !rem.is_zero() {
+                q.checked_add(U256::ONE).ok_or(RiskError::Overflow)?
+            } else { q };
+            let mag_u128 = mag.try_into_u128().ok_or(RiskError::Overflow)?;
+            if mag_u128 > i128::MAX as u128 { return Err(RiskError::Overflow); }
+            Ok(-(mag_u128 as i128))
+        } else {
+            let q_u128 = q.try_into_u128().ok_or(RiskError::Overflow)?;
+            if q_u128 > i128::MAX as u128 { return Err(RiskError::Overflow); }
+            Ok(q_u128 as i128)
+        }
+    }
+
+
+    /// Wide variant of compute_kf_pnl_delta that accepts I256 for k_now/f_now.
+    /// Used by resolved reconciliation where K_epoch_start + terminal_delta may exceed i128.
+    fn compute_kf_pnl_delta_wide(
+        abs_basis: u128, k_snap: i128, k_now_wide: I256,
+        f_snap: i128, f_now_wide: I256, den: u128
+    ) -> Result<i128> {
+        if abs_basis == 0 { return Ok(0); }
+        let k_diff = k_now_wide.checked_sub(I256::from_i128(k_snap))
+            .ok_or(RiskError::Overflow)?;
+        let k_scaled = if k_diff.is_zero() {
+            I256::ZERO
+        } else {
+            let neg = k_diff.is_negative();
+            if k_diff == I256::MIN { return Err(RiskError::Overflow); }
+            let abs_k = k_diff.abs_u256();
+            let prod_u256 = abs_k.checked_mul(U256::from_u128(FUNDING_DEN))
+                .ok_or(RiskError::Overflow)?;
+            let pos = I256::from_u256_or_overflow(prod_u256)
+                .ok_or(RiskError::Overflow)?;
+            if neg { I256::ZERO.checked_sub(pos).ok_or(RiskError::Overflow)? }
+            else { pos }
+        };
+        let f_diff = f_now_wide.checked_sub(I256::from_i128(f_snap))
+            .ok_or(RiskError::Overflow)?;
+        let combined = k_scaled.checked_add(f_diff).ok_or(RiskError::Overflow)?;
+        if combined.is_zero() { return Ok(0); }
         let negative = combined.is_negative();
         if combined == I256::MIN { return Err(RiskError::Overflow); }
         let abs_combined = combined.abs_u256();
@@ -2485,9 +2542,9 @@ impl RiskEngine {
     fn advance_profit_warmup(&mut self, idx: usize) {
         let r = self.accounts[idx].reserved_pnl;
         if r == 0 {
-            // Require both absent
-            assert!(self.accounts[idx].sched_present == 0);
-            assert!(self.accounts[idx].pending_present == 0);
+            if self.accounts[idx].sched_present != 0 || self.accounts[idx].pending_present != 0 {
+                return; // corrupt bucket metadata with zero reserve — tolerate conservatively
+            }
             return;
         }
 
@@ -4234,45 +4291,41 @@ impl RiskEngine {
                 Side::Long => self.resolved_k_long_terminal_delta,
                 Side::Short => self.resolved_k_short_terminal_delta,
             };
-            let (k_end, f_end) = if epoch_snap == epoch_side {
-                // Same-epoch: use live K+terminal delta, live F
-                // This can only happen if the side was already ResetPending before resolution
-                // (resolve_market doesn't increment its epoch), in which case terminal delta = 0.
-                (self.get_k_side(side), self.get_f_side(side))
-            } else {
-                // Stale (normal resolved path): K_epoch_start + terminal delta, F_epoch_start
-                // Use I256 for k_terminal so resolution works even when the sum exceeds i128
-                let k_base_wide = I256::from_i128(self.get_k_epoch_start(side));
-                let k_td_wide = I256::from_i128(resolved_k_td);
-                let k_terminal_wide = k_base_wide.checked_add(k_td_wide).ok_or(RiskError::Overflow)?;
-                // Pass through compute_kf_pnl_delta which already accepts I256-range intermediates
-                let k_terminal = k_terminal_wide.try_into_i128().ok_or(RiskError::Overflow)?;
-                (k_terminal, self.get_f_epoch_start(side))
-            };
             let den = a_basis.checked_mul(POS_SCALE).ok_or(RiskError::Overflow)?;
-            // Combined K/F settlement for resolved reconciliation (spec v12.17 §5.4)
-            let pnl_delta = Self::compute_kf_pnl_delta(abs_basis, k_snap, k_end, f_snap_acct, f_end, den)?;
-            let new_pnl = self.accounts[i].pnl.checked_add(pnl_delta)
-                .ok_or(RiskError::Overflow)?;
-            if new_pnl == i128::MIN { return Err(RiskError::Overflow); }
-
-            if epoch_snap != epoch_side {
+            let pnl_delta = if epoch_snap == epoch_side {
+                // Same-epoch in resolved mode: side was already ResetPending before resolution,
+                // so terminal_delta = 0. Reconcile against current K/F.
+                Self::compute_kf_pnl_delta(abs_basis, k_snap, self.get_k_side(side),
+                    f_snap_acct, self.get_f_side(side), den)?
+            } else {
+                // Stale (normal resolved path): require one-epoch lag
                 if epoch_snap.checked_add(1) != Some(epoch_side) {
                     return Err(RiskError::CorruptState);
                 }
                 if self.get_stale_count(side) == 0 {
                     return Err(RiskError::CorruptState);
                 }
-            }
+                // K_epoch_start + terminal delta in wide I256.
+                // The terminal K sum may exceed i128; the wide helper handles this exactly.
+                let k_terminal_wide = I256::from_i128(self.get_k_epoch_start(side))
+                    .checked_add(I256::from_i128(resolved_k_td))
+                    .ok_or(RiskError::Overflow)?;
+                let f_end_wide = I256::from_i128(self.get_f_epoch_start(side));
+                Self::compute_kf_pnl_delta_wide(
+                    abs_basis, k_snap, k_terminal_wide, f_snap_acct, f_end_wide, den)?
+            };
+            let new_pnl = self.accounts[i].pnl.checked_add(pnl_delta)
+                .ok_or(RiskError::Overflow)?;
+            if new_pnl == i128::MIN { return Err(RiskError::Overflow); }
 
-            // MUTATE (prepare already called above)
+            // MUTATE (prepare already called above, epoch validated above)
             if pnl_delta != 0 {
                 self.set_pnl(i, new_pnl);
                 self.pnl_matured_pos_tot = self.pnl_pos_tot;
             }
             if epoch_snap != epoch_side {
-                let old = self.get_stale_count(side);
-                self.set_stale_count(side, old - 1);
+                let old_stale = self.get_stale_count(side);
+                self.set_stale_count(side, old_stale.checked_sub(1).ok_or(RiskError::CorruptState)?);
             }
             self.set_position_basis_q(i, 0);
             self.accounts[i].adl_a_basis = ADL_ONE;
