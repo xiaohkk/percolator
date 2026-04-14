@@ -983,10 +983,8 @@ impl RiskEngine {
     /// positive increases directly to matured (no reserve queue), and decreases
     /// go through apply_reserve_loss_newest_first — replacing the old saturating_sub.
     test_visible! {
-    fn set_pnl(&mut self, idx: usize, new_pnl: i128) {
-        // Internal-only wrapper. Callers pre-validate inputs.
-        // ImmediateRelease with non-MIN pnl cannot fail under correct state.
-        let _ = self.set_pnl_with_reserve(idx, new_pnl, ReserveMode::ImmediateRelease);
+    fn set_pnl(&mut self, idx: usize, new_pnl: i128) -> Result<()> {
+        self.set_pnl_with_reserve(idx, new_pnl, ReserveMode::ImmediateRelease)
     }
     }
 
@@ -1186,11 +1184,11 @@ impl RiskEngine {
             match s {
                 Side::Long => {
                     self.stored_pos_count_long = self.stored_pos_count_long
-                        .saturating_sub(1);
+                        .checked_sub(1).expect("stored_pos_count_long underflow");
                 }
                 Side::Short => {
                     self.stored_pos_count_short = self.stored_pos_count_short
-                        .saturating_sub(1);
+                        .checked_sub(1).expect("stored_pos_count_short underflow");
                 }
             }
         }
@@ -1200,13 +1198,13 @@ impl RiskEngine {
             match s {
                 Side::Long => {
                     self.stored_pos_count_long = self.stored_pos_count_long
-                        .saturating_add(1);
+                        .checked_add(1).expect("stored_pos_count_long overflow");
                     assert!(self.stored_pos_count_long <= MAX_ACTIVE_POSITIONS_PER_SIDE,
                         "set_position_basis_q: exceeds MAX_ACTIVE_POSITIONS_PER_SIDE");
                 }
                 Side::Short => {
                     self.stored_pos_count_short = self.stored_pos_count_short
-                        .saturating_add(1);
+                        .checked_add(1).expect("stored_pos_count_short overflow");
                     assert!(self.stored_pos_count_short <= MAX_ACTIVE_POSITIONS_PER_SIDE,
                         "set_position_basis_q: exceeds MAX_ACTIVE_POSITIONS_PER_SIDE");
                 }
@@ -1555,7 +1553,7 @@ impl RiskEngine {
         let a_basis = self.accounts[idx].adl_a_basis;
 
         if a_basis == 0 {
-            return 0i128;
+            return 0i128; // missing account or pre-attach state
         }
 
         let abs_basis = basis.unsigned_abs();
@@ -2540,17 +2538,13 @@ impl RiskEngine {
     /// advance_profit_warmup (spec §4.8, two-bucket)
     /// Releases reserve from the scheduled bucket per linear maturity.
     test_visible! {
-    fn advance_profit_warmup(&mut self, idx: usize) {
+    fn advance_profit_warmup(&mut self, idx: usize) -> Result<()> {
         let r = self.accounts[idx].reserved_pnl;
         if r == 0 {
-            // Zero reserve with ghost bucket flags is corrupt state
             if self.accounts[idx].sched_present != 0 || self.accounts[idx].pending_present != 0 {
-                // Cannot return Err here (void fn called from touch paths).
-                // Clear ghost flags defensively to prevent downstream blocking.
-                self.accounts[idx].sched_present = 0;
-                self.accounts[idx].pending_present = 0;
+                return Err(RiskError::CorruptState);
             }
-            return;
+            return Ok(());
         }
 
         // Step 2: if sched absent and pending present → promote
@@ -2570,7 +2564,7 @@ impl RiskEngine {
 
         // If sched still absent → return
         if self.accounts[idx].sched_present == 0 {
-            return;
+            return Ok(());
         }
 
         // Step 4: elapsed = current_slot - sched_start_slot
@@ -2630,12 +2624,15 @@ impl RiskEngine {
 
         // Step 12: if R_i == 0 → require both absent
         if self.accounts[idx].reserved_pnl == 0 {
-            assert!(self.accounts[idx].sched_present == 0);
-            assert!(self.accounts[idx].pending_present == 0);
+            if self.accounts[idx].sched_present != 0 || self.accounts[idx].pending_present != 0 {
+                return Err(RiskError::CorruptState);
+            }
         }
 
-        assert!(self.pnl_matured_pos_tot <= self.pnl_pos_tot,
-            "advance_profit_warmup: pnl_matured_pos_tot > pnl_pos_tot");
+        if self.pnl_matured_pos_tot > self.pnl_pos_tot {
+            return Err(RiskError::CorruptState);
+        }
+        Ok(())
     }
     }
 
@@ -2659,7 +2656,7 @@ impl RiskEngine {
             let new_pnl = pnl.checked_add(pay_i128)
                 .ok_or(RiskError::CorruptState)?;
             if new_pnl == i128::MIN { return Err(RiskError::CorruptState); }
-            self.set_pnl(idx, new_pnl);
+            self.set_pnl(idx, new_pnl)?;
         }
         Ok(())
     }
@@ -2675,7 +2672,7 @@ impl RiskEngine {
             if pnl == i128::MIN { return Err(RiskError::CorruptState); }
             let loss = pnl.unsigned_abs();
             self.absorb_protocol_loss(loss);
-            self.set_pnl(idx, 0i128);
+            self.set_pnl(idx, 0i128)?;
         }
         Ok(())
     }
@@ -2723,17 +2720,17 @@ impl RiskEngine {
         }
 
         // Step 4: advance cohort-based warmup
-        self.advance_profit_warmup(idx);
+        self.advance_profit_warmup(idx)?;
 
         // Step 5: settle side effects with H_lock for reserve routing
         self.settle_side_effects_with_h_lock(idx, ctx.h_lock_shared)?;
 
         // Step 6: settle losses from principal
-        self.settle_losses(idx);
+        self.settle_losses(idx)?;
 
         // Step 7: resolve flat negative
         if self.effective_pos_q(idx) == 0 && self.accounts[idx].pnl < 0 {
-            self.resolve_flat_negative(idx);
+            self.resolve_flat_negative(idx)?;
         }
 
         // Steps 8-9: MUST NOT auto-convert, MUST NOT fee-sweep
@@ -3291,8 +3288,8 @@ impl RiskEngine {
 
         // Step 10: settle post-trade losses from principal for both accounts (spec §10.4 step 18)
         // Loss seniority: losses MUST be settled before explicit fees (spec §0 item 14)
-        self.settle_losses(a as usize);
-        self.settle_losses(b as usize);
+        self.settle_losses(a as usize)?;
+        self.settle_losses(b as usize)?;
 
         // Step 11: charge trading fees (spec §10.4 step 19, §8.1)
         let trade_notional = mul_div_floor_u128(size_q.unsigned_abs(), exec_price as u128, POS_SCALE);
@@ -3739,7 +3736,7 @@ impl RiskEngine {
 
                 // If D > 0, set_pnl(i, 0)
                 if d != 0 {
-                    self.set_pnl(idx as usize, 0i128);
+                    self.set_pnl(idx as usize, 0i128)?;
                 }
 
                 Ok(true)
@@ -3860,8 +3857,7 @@ impl RiskEngine {
         self.finalize_end_of_instruction_resets(&ctx)?;
 
         // Step 12: assert OI balance
-        assert!(self.oi_eff_long_q == self.oi_eff_short_q,
-            "OI_eff_long != OI_eff_short after keeper_crank_not_atomic");
+        if self.oi_eff_long_q != self.oi_eff_short_q { return Err(RiskError::CorruptState); }
 
         Ok(CrankOutcome {
             advanced,
@@ -4326,7 +4322,7 @@ impl RiskEngine {
 
             // MUTATE (prepare already called above, epoch validated above)
             if pnl_delta != 0 {
-                self.set_pnl(i, new_pnl);
+                self.set_pnl(i, new_pnl)?;
                 self.pnl_matured_pos_tot = self.pnl_pos_tot;
             }
             if epoch_snap != epoch_side {
