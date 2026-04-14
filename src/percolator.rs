@@ -1344,23 +1344,47 @@ impl RiskEngine {
     /// result = floor(abs_basis * (f_now - f_snap) / (den * FUNDING_DEN))
     /// Uses I256/U256 wide arithmetic to avoid i128 overflow.
     /// Mirrors the pattern of wide_signed_mul_div_floor_from_k_pair.
-    fn compute_f_pnl_delta(abs_basis: u128, f_snap: i128, f_now: i128, den: u128) -> Result<i128> {
-        // Compute f_diff = f_now - f_snap in wide signed arithmetic
-        let f_diff_wide = I256::from_i128(f_now).checked_sub(I256::from_i128(f_snap))
+    /// Combined K/F settlement helper (spec v12.17 §1.6).
+    /// floor(abs_basis * ((k_now - k_then) * FUNDING_DEN + (f_now - f_then)) / (den * FUNDING_DEN))
+    /// Uses exact 256-bit intermediates. Single floor on the combined numerator.
+    fn compute_kf_pnl_delta(
+        abs_basis: u128, k_snap: i128, k_now: i128,
+        f_snap: i128, f_now: i128, den: u128
+    ) -> Result<i128> {
+        if abs_basis == 0 { return Ok(0); }
+        // K_diff * FUNDING_DEN in I256
+        let k_diff = I256::from_i128(k_now).checked_sub(I256::from_i128(k_snap))
             .ok_or(RiskError::Overflow)?;
-        if f_diff_wide.is_zero() || abs_basis == 0 {
-            return Ok(0i128);
-        }
-        let negative = f_diff_wide.is_negative();
-        let abs_diff = f_diff_wide.abs_u256();
+        let funding_den_wide = I256::from_u128(FUNDING_DEN);
+        // Need I256 * I256. Use the signed multiply we have.
+        // K_diff * FUNDING_DEN: both components fit in i128, but product may not.
+        // Use two I256 multiplications via checked_sub (a*b = a*b_hi*2^128 + a*b_lo).
+        // Simpler: k_diff is i128, FUNDING_DEN is u128 (1e9). Product fits in i128
+        // since |k_diff| <= i128::MAX and FUNDING_DEN = 1e9.
+        // Actually k_diff * 1e9 CAN overflow i128 for large k_diff. Use wide path.
+        let k_diff_i128 = k_diff.try_into_i128().ok_or(RiskError::Overflow)?;
+        let k_scaled = {
+            // k_diff * FUNDING_DEN via checked i128 — if it fits, great; if not, overflow
+            match k_diff_i128.checked_mul(FUNDING_DEN as i128) {
+                Some(v) => I256::from_i128(v),
+                None => return Err(RiskError::Overflow), // K * FUNDING_DEN overflow
+            }
+        };
+        // F_diff
+        let f_diff = I256::from_i128(f_now).checked_sub(I256::from_i128(f_snap))
+            .ok_or(RiskError::Overflow)?;
+        // Combined numerator = K_diff * FUNDING_DEN + F_diff
+        let combined = k_scaled.checked_add(f_diff).ok_or(RiskError::Overflow)?;
+        if combined.is_zero() { return Ok(0); }
+        // abs_basis * |combined| / (den * FUNDING_DEN), floor toward -inf
+        let negative = combined.is_negative();
+        let abs_combined = combined.abs_u256();
         let abs_basis_u256 = U256::from_u128(abs_basis);
         let den_wide = U256::from_u128(den).checked_mul(U256::from_u128(FUNDING_DEN))
             .ok_or(RiskError::Overflow)?;
-        // p = abs_basis * |f_diff|, exact wide product
-        let p = abs_basis_u256.checked_mul(abs_diff).ok_or(RiskError::Overflow)?;
+        let p = abs_basis_u256.checked_mul(abs_combined).ok_or(RiskError::Overflow)?;
         let (q, rem) = wide_math::div_rem_u256(p, den_wide);
         if negative {
-            // floor(-x) = -(x + 1) if remainder != 0, else -x
             let mag = if !rem.is_zero() {
                 q.checked_add(U256::ONE).ok_or(RiskError::Overflow)?
             } else { q };
@@ -1492,14 +1516,10 @@ impl RiskEngine {
             let k_snap = self.accounts[idx].adl_k_snap;
             let q_eff_new = mul_div_floor_u128(abs_basis, a_side, a_basis);
             let den = a_basis.checked_mul(POS_SCALE).ok_or(RiskError::Overflow)?;
-            let pnl_delta_k = wide_signed_mul_div_floor_from_k_pair(abs_basis, k_snap, k_side, den);
-
-            // F-delta PnL (v12.15): floor(abs_basis * f_diff / (den * FUNDING_DEN))
+            // Combined K/F settlement — single floor (spec v12.17 §1.6)
             let f_side = self.get_f_side(side);
             let f_snap = self.accounts[idx].f_snap;
-            let pnl_delta_f = Self::compute_f_pnl_delta(abs_basis, f_snap, f_side, den)?;
-
-            let pnl_delta = pnl_delta_k.checked_add(pnl_delta_f).ok_or(RiskError::Overflow)?;
+            let pnl_delta = Self::compute_kf_pnl_delta(abs_basis, k_snap, k_side, f_snap, f_side, den)?;
 
             let new_pnl = self.accounts[idx].pnl.checked_add(pnl_delta)
                 .ok_or(RiskError::Overflow)?;
@@ -1528,14 +1548,10 @@ impl RiskEngine {
             let k_epoch_start = self.get_k_epoch_start(side);
             let k_snap = self.accounts[idx].adl_k_snap;
             let den = a_basis.checked_mul(POS_SCALE).ok_or(RiskError::Overflow)?;
-            let pnl_delta_k = wide_signed_mul_div_floor_from_k_pair(abs_basis, k_snap, k_epoch_start, den);
-
-            // F-delta PnL for epoch mismatch (v12.15)
+            // Combined K/F settlement for epoch mismatch (spec v12.17 §1.6)
             let f_end = self.get_f_epoch_start(side);
             let f_snap = self.accounts[idx].f_snap;
-            let pnl_delta_f = Self::compute_f_pnl_delta(abs_basis, f_snap, f_end, den)?;
-
-            let pnl_delta = pnl_delta_k.checked_add(pnl_delta_f).ok_or(RiskError::Overflow)?;
+            let pnl_delta = Self::compute_kf_pnl_delta(abs_basis, k_snap, k_epoch_start, f_snap, f_end, den)?;
 
             let new_pnl = self.accounts[idx].pnl.checked_add(pnl_delta)
                 .ok_or(RiskError::Overflow)?;
@@ -3307,10 +3323,26 @@ impl RiskEngine {
         candidate_trade_pnl: i128,
     ) -> Result<()> {
         if *new_eff == 0 {
-            // v12.14.0 §10.5 step 29: flat-close guard uses exact Eq_maint_raw_i >= 0
-            // (not just PNL >= 0). Prevents flat exits with negative net wealth from fee debt.
-            let maint_raw = self.account_equity_maint_raw_wide(&self.accounts[idx]);
-            if maint_raw.is_negative() {
+            // Spec v12.17 §9.4 step 25: fee-neutral shortfall comparison for flat closes.
+            // min(Eq_maint_raw_post + fee_equity_impact, 0) >= min(Eq_maint_raw_pre, 0)
+            // Uses the actual applied fee impact (fee parameter), not nominal requested fee.
+            // buffer_pre = Eq_maint_raw_pre - MM_req_pre; add MM_req_pre back to get Eq_maint_raw_pre.
+            let mm_req_pre_wide = if *old_eff == 0 { I256::ZERO } else {
+                let not_pre = self.notional(idx, oracle_price);
+                I256::from_u128(core::cmp::max(
+                    mul_div_floor_u128(not_pre, self.params.maintenance_margin_bps as u128, 10_000),
+                    self.params.min_nonzero_mm_req))
+            };
+            let eq_maint_raw_pre = buffer_pre.checked_add(mm_req_pre_wide).expect("I256 add");
+            let shortfall_pre = if eq_maint_raw_pre.is_negative() { eq_maint_raw_pre } else { I256::ZERO };
+
+            let eq_maint_raw_post = self.account_equity_maint_raw_wide(&self.accounts[idx]);
+            let fee_wide = I256::from_u128(fee);
+            let maint_raw_fee_neutral = eq_maint_raw_post.checked_add(fee_wide).expect("I256 add");
+            let shortfall_post = if maint_raw_fee_neutral.is_negative() { maint_raw_fee_neutral } else { I256::ZERO };
+
+            // shortfall_post >= shortfall_pre (both <= 0; "worsening" means more negative)
+            if shortfall_post.checked_sub(shortfall_pre).map_or(true, |d| d.is_negative()) {
                 return Err(RiskError::Undercollateralized);
             }
             return Ok(());
@@ -3812,13 +3844,12 @@ impl RiskEngine {
         self.accrue_market_to(now_slot, oracle_price, funding_rate_e9)?;
         self.current_slot = now_slot;
 
-        // Step 3: live local touch (no auto-convert)
+        // Step 3: live local touch (no auto-convert, no finalize yet)
         self.touch_account_live_local(idx as usize, &mut ctx)?;
 
-        // Step 4: finalize (which does whole-only conversion)
-        self.finalize_touched_accounts_post_live(&ctx);
-
-        // Step 5: require 0 < x_req <= ReleasedPos_i
+        // Step 4: check bounds BEFORE finalize (spec v12.17 §9.3.1)
+        // Finalize happens AFTER explicit conversion to avoid auto-convert
+        // consuming the user's released PnL before they can request it.
         let released = self.released_pos(idx as usize);
         if x_req == 0 || x_req > released {
             return Err(RiskError::Overflow);
@@ -3861,7 +3892,10 @@ impl RiskEngine {
             }
         }
 
-        // Steps 11-12: end-of-instruction resets
+        // Step 11: finalize AFTER explicit conversion (spec v12.17 §9.3.1)
+        self.finalize_touched_accounts_post_live(&ctx);
+
+        // Steps 12-13: end-of-instruction resets
         self.schedule_end_of_instruction_resets(&mut ctx)?;
         self.finalize_end_of_instruction_resets(&ctx);
 
@@ -4088,9 +4122,8 @@ impl RiskEngine {
                 (self.get_k_epoch_start(side), self.get_f_epoch_start(side))
             };
             let den = a_basis.checked_mul(POS_SCALE).ok_or(RiskError::Overflow)?;
-            let pnl_delta_k = wide_signed_mul_div_floor_from_k_pair(abs_basis, k_snap, k_end, den);
-            let pnl_delta_f = Self::compute_f_pnl_delta(abs_basis, f_snap_acct, f_end, den)?;
-            let pnl_delta = pnl_delta_k.checked_add(pnl_delta_f).ok_or(RiskError::Overflow)?;
+            // Combined K/F settlement for resolved reconciliation (spec v12.17 §1.6)
+            let pnl_delta = Self::compute_kf_pnl_delta(abs_basis, k_snap, k_end, f_snap_acct, f_end, den)?;
             let new_pnl = self.accounts[i].pnl.checked_add(pnl_delta)
                 .ok_or(RiskError::Overflow)?;
             if new_pnl == i128::MIN { return Err(RiskError::Overflow); }
