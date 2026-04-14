@@ -89,10 +89,10 @@ pub const LIQ_BUDGET_PER_CRANK: u16 = 64;
 pub const POS_SCALE: u128 = 1_000_000;
 
 /// ADL_ONE = 1_000_000 (spec §1.3)
-pub const ADL_ONE: u128 = 1_000_000;
+pub const ADL_ONE: u128 = 1_000_000_000_000_000;
 
 /// MIN_A_SIDE = 1_000 (spec §1.4)
-pub const MIN_A_SIDE: u128 = 1_000;
+pub const MIN_A_SIDE: u128 = 100_000_000_000_000;
 
 /// MAX_ORACLE_PRICE = 1_000_000_000_000 (spec §1.4)
 pub const MAX_ORACLE_PRICE: u64 = 1_000_000_000_000;
