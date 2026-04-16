@@ -1614,7 +1614,7 @@ impl RiskEngine {
             self.set_pnl_with_reserve(idx, new_pnl, ReserveMode::UseHLock(h_lock))?;
 
             if q_eff_new == 0 {
-                self.inc_phantom_dust_bound(side);
+                self.inc_phantom_dust_bound(side)?;
                 self.set_position_basis_q(idx, 0i128)?;
                 self.accounts[idx].adl_a_basis = ADL_ONE;
                 self.accounts[idx].adl_k_snap = 0i128;
@@ -2552,6 +2552,39 @@ impl RiskEngine {
     }
     }
 
+
+    /// Validate reserve-bucket shape consistency.
+    /// Absent bucket => all fields zero. Present scheduled => horizon > 0,
+    /// release <= anchor, remaining <= anchor - release.
+    /// Total: sched_remaining + pending_remaining == reserved_pnl.
+    fn validate_reserve_shape(&self, idx: usize) -> Result<()> {
+        let a = &self.accounts[idx];
+        if a.sched_present == 0 {
+            if a.sched_remaining_q != 0 || a.sched_anchor_q != 0
+                || a.sched_start_slot != 0 || a.sched_horizon != 0
+                || a.sched_release_q != 0
+            {
+                return Err(RiskError::CorruptState);
+            }
+        } else {
+            if a.sched_horizon == 0 { return Err(RiskError::CorruptState); }
+            if a.sched_release_q > a.sched_anchor_q { return Err(RiskError::CorruptState); }
+            if a.sched_remaining_q > a.sched_anchor_q { return Err(RiskError::CorruptState); }
+        }
+        if a.pending_present == 0 {
+            if a.pending_remaining_q != 0 || a.pending_horizon != 0
+                || a.pending_created_slot != 0
+            {
+                return Err(RiskError::CorruptState);
+            }
+        }
+        let sched_r = if a.sched_present != 0 { a.sched_remaining_q } else { 0 };
+        let pend_r = if a.pending_present != 0 { a.pending_remaining_q } else { 0 };
+        let total = sched_r.checked_add(pend_r).ok_or(RiskError::CorruptState)?;
+        if total != a.reserved_pnl { return Err(RiskError::CorruptState); }
+        Ok(())
+    }
+
     /// advance_profit_warmup (spec §4.8, two-bucket)
     /// Releases reserve from the scheduled bucket per linear maturity.
     test_visible! {
@@ -2585,16 +2618,7 @@ impl RiskEngine {
         }
 
 
-        // Reserve-shape consistency: bucket totals must equal reserved_pnl
-        let bucket_total = {
-            let a = &self.accounts[idx];
-            let s = if a.sched_present != 0 { a.sched_remaining_q } else { 0 };
-            let p = if a.pending_present != 0 { a.pending_remaining_q } else { 0 };
-            s.checked_add(p).ok_or(RiskError::CorruptState)?
-        };
-        if bucket_total != r {
-            return Err(RiskError::CorruptState);
-        }
+        self.validate_reserve_shape(idx)?;
 
         // Step 4: elapsed = current_slot - sched_start_slot
         if self.current_slot < self.accounts[idx].sched_start_slot {
@@ -2814,7 +2838,8 @@ impl RiskEngine {
                 let released = self.released_pos(idx);
                 if released > 0 {
                     self.consume_released_pnl(idx, released)?;
-                    let new_cap = add_u128(self.accounts[idx].capital.get(), released);
+                    let new_cap = self.accounts[idx].capital.get()
+                        .checked_add(released).ok_or(RiskError::Overflow)?;
                     self.set_capital(idx, new_cap)?;
                 }
             }
@@ -3013,7 +3038,8 @@ impl RiskEngine {
         self.vault = U128::new(v_candidate);
 
         // Step 6: set_capital(i, C_i + capital_amount)
-        let new_cap = add_u128(self.accounts[idx as usize].capital.get(), capital_amount);
+        let new_cap = self.accounts[idx as usize].capital.get()
+            .checked_add(capital_amount).ok_or(RiskError::Overflow)?;
         self.set_capital(idx as usize, new_cap)?;
 
         // Step 7: settle_losses_from_principal
@@ -3112,7 +3138,7 @@ impl RiskEngine {
         }
 
         // Step 7: commit withdrawal
-        self.set_capital(idx as usize, self.accounts[idx as usize].capital.get() - amount);
+        self.set_capital(idx as usize, self.accounts[idx as usize].capital.get() - amount)?;
         self.vault = U128::new(self.vault.get().checked_sub(amount).ok_or(RiskError::CorruptState)?);
 
         // Steps 8-9: end-of-instruction resets
@@ -4053,7 +4079,8 @@ impl RiskEngine {
         self.consume_released_pnl(idx as usize, x_req)?;
 
         // Step 8: set_capital(i, C_i + y)
-        let new_cap = add_u128(self.accounts[idx as usize].capital.get(), y);
+        let new_cap = self.accounts[idx as usize].capital.get()
+            .checked_add(y).ok_or(RiskError::Overflow)?;
         self.set_capital(idx as usize, new_cap)?;
 
         // Step 9: sweep fee debt
@@ -4443,7 +4470,8 @@ impl RiskEngine {
                 let y = wide_mul_div_floor_u128(released,
                     self.resolved_payout_h_num, self.resolved_payout_h_den);
                 self.consume_released_pnl(i, released)?;
-                let new_cap = add_u128(self.accounts[i].capital.get(), y);
+                let new_cap = self.accounts[i].capital.get()
+                    .checked_add(y).ok_or(RiskError::Overflow)?;
                 self.set_capital(i, new_cap)?;
             }
         }
