@@ -996,6 +996,10 @@ impl RiskEngine {
 
         let old = self.accounts[idx].pnl;
         let old_pos = i128_clamp_pos(old);
+        // Entry invariant: R_i <= max(PNL_i, 0) (spec §2.1). Reject before any mutation.
+        if self.accounts[idx].reserved_pnl > old_pos {
+            return Err(RiskError::CorruptState);
+        }
         let old_rel = if self.market_mode == MarketMode::Live {
             old_pos.checked_sub(self.accounts[idx].reserved_pnl).ok_or(RiskError::CorruptState)?
         } else {
@@ -3439,7 +3443,9 @@ impl RiskEngine {
         let fee_paid = core::cmp::min(fee, cap);
         if fee_paid > 0 {
             self.set_capital(idx, cap - fee_paid)?;
-            self.insurance_fund.balance = self.insurance_fund.balance + fee_paid;
+            self.insurance_fund.balance = U128::new(
+                self.insurance_fund.balance.get().checked_add(fee_paid)
+                    .ok_or(RiskError::Overflow)?);
         }
         let fee_shortfall = fee - fee_paid;
         if fee_shortfall > 0 {
@@ -3810,7 +3816,9 @@ impl RiskEngine {
 
                 // If D > 0, set_pnl(i, 0)
                 if d != 0 {
-                    self.set_pnl(idx as usize, 0i128)?;
+                    // Spec §8.5 step 8: NoPositiveIncreaseAllowed for defense-in-depth
+                    self.set_pnl_with_reserve(idx as usize, 0i128,
+                        ReserveMode::NoPositiveIncreaseAllowed)?;
                 }
 
                 Ok(true)
@@ -4527,7 +4535,7 @@ impl RiskEngine {
             return Err(RiskError::Undercollateralized);
         }
         if account.fee_credits.get() > 0 {
-            return Err(RiskError::Undercollateralized);
+            return Err(RiskError::CorruptState);
         }
 
         // Step 4: anchor current_slot
