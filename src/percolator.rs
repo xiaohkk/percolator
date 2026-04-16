@@ -2203,11 +2203,9 @@ impl RiskEngine {
         match wide.try_into_i128() {
             Some(v) => v,
             None => {
-                // Positive overflow: unreachable under configured bounds (spec §3.4),
-                // but MUST fail conservatively — account is over-collateralized,
-                // so project to i128::MAX to prevent false liquidation.
-                // Negative overflow: project to i128::MIN + 1 per spec §3.4.
-                if wide.is_negative() { i128::MIN + 1 } else { i128::MAX }
+                // Overflow in either direction: fail conservative (spec §3.4).
+                // i128::MIN + 1 fails every > 0 and > MM_req gate.
+                i128::MIN + 1
             }
         }
     }
@@ -2247,10 +2245,8 @@ impl RiskEngine {
         match sum.try_into_i128() {
             Some(v) => v,
             None => {
-                // Positive overflow: unreachable under configured bounds (spec §3.4),
-                // but MUST fail conservatively — project to i128::MAX.
-                // Negative overflow: project to i128::MIN + 1 per spec §3.4.
-                if sum.is_negative() { i128::MIN + 1 } else { i128::MAX }
+                // Overflow in either direction: fail conservative.
+                i128::MIN + 1
             }
         }
     }
@@ -2273,7 +2269,7 @@ impl RiskEngine {
             .checked_sub(fee_debt).expect("I256 sub");
         match sum.try_into_i128() {
             Some(v) => v,
-            None => if sum.is_negative() { i128::MIN + 1 } else { i128::MAX },
+            None => i128::MIN + 1, // fail conservative on any overflow
         }
     }
 
@@ -2389,7 +2385,7 @@ impl RiskEngine {
 
         match result.try_into_i128() {
             Some(v) => v,
-            None => if result.is_negative() { i128::MIN + 1 } else { i128::MAX },
+            None => i128::MIN + 1, // fail conservative on any overflow
         }
     }
 
@@ -4297,13 +4293,13 @@ impl RiskEngine {
             && self.stale_account_count_long == 0
             && self.stored_pos_count_long == 0
         {
-            let _ = self.finalize_side_reset(Side::Long);
+            self.finalize_side_reset(Side::Long)?;
         }
         if self.side_mode_short == SideMode::ResetPending
             && self.stale_account_count_short == 0
             && self.stored_pos_count_short == 0
         {
-            let _ = self.finalize_side_reset(Side::Short);
+            self.finalize_side_reset(Side::Short)?;
         }
 
         // Step 21
@@ -4624,7 +4620,9 @@ impl RiskEngine {
             let dust_cap = self.accounts[idx].capital.get();
             if dust_cap > 0 {
                 self.set_capital(idx, 0)?;
-                self.insurance_fund.balance = self.insurance_fund.balance + dust_cap;
+                self.insurance_fund.balance = U128::new(
+                    self.insurance_fund.balance.get().checked_add(dust_cap)
+                        .ok_or(RiskError::Overflow)?);
             }
 
             // Forgive uncollectible fee debt (spec §2.6)
