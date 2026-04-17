@@ -437,6 +437,77 @@ fn in1_no_live_immediate_release() {
 }
 
 // ============================================================================
+// AH-7 (strengthened): admit_fresh_reserve_h_lock returns Err when the
+// sticky list is exhausted and the admission decision requires h_max.
+//
+// Prevents silent-drop regression: under the pre-item-5 code the discarded
+// bool from mark_h_max_sticky meant a full sticky list would leave the
+// account not-recorded, and a subsequent call could re-admit at h_min
+// violating the sticky-h_max invariant.
+// ============================================================================
+
+#[kani::proof]
+#[kani::unwind(70)]
+#[kani::solver(cadical)]
+fn ah7_sticky_capacity_exhausted_fails() {
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let idx = add_user_test(&mut engine, 0).unwrap();
+    // Zero residual: admission MUST choose h_max.
+    engine.vault = U128::new(0);
+    engine.c_tot = U128::new(0);
+    engine.pnl_matured_pos_tot = 0;
+
+    let mut ctx = InstructionContext::new_with_admission(0, 100);
+    // Fill the sticky list to capacity with foreign account indices
+    // (not idx), so the new call hits the capacity-exhausted branch.
+    ctx.h_max_sticky_count = MAX_TOUCHED_PER_INSTRUCTION as u8;
+    for i in 0..MAX_TOUCHED_PER_INSTRUCTION {
+        // Use indices different from idx (= 0) to avoid already-sticky short
+        // circuit. Index 0 is the only materialized account; fill with 1..N.
+        ctx.h_max_sticky_accounts[i] = (i + 1) as u16;
+    }
+
+    let fresh: u8 = kani::any();
+    kani::assume(fresh > 0);
+
+    let r = engine.admit_fresh_reserve_h_lock(
+        idx as usize, fresh as u128, &mut ctx, 0u64, 100u64);
+    // Admission needs h_max (residual=0 < fresh); sticky list full; MUST err.
+    assert!(r.is_err(),
+        "sticky-capacity exhaustion while h_max is required must return Err");
+}
+
+// ============================================================================
+// AH-8 (strengthened): admit_fresh_reserve_h_lock fail-closed on broken
+// V >= C_tot + I invariant.
+//
+// Previous saturating_sub would silently return residual=0 when V < senior;
+// checked_sub now fails with CorruptState. This proof verifies the behavior.
+// ============================================================================
+
+#[kani::proof]
+#[kani::unwind(4)]
+#[kani::solver(cadical)]
+fn ah8_broken_conservation_fails() {
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let idx = add_user_test(&mut engine, 0).unwrap();
+    // Break the conservation invariant: V < C_tot + I.
+    engine.vault = U128::new(10);
+    engine.c_tot = U128::new(100);
+    engine.insurance_fund.balance = U128::new(0);
+
+    let mut ctx = InstructionContext::new_with_admission(0, 100);
+    let fresh: u8 = kani::any();
+    kani::assume(fresh > 0);
+
+    let r = engine.admit_fresh_reserve_h_lock(
+        idx as usize, fresh as u128, &mut ctx, 0u64, 100u64);
+    // vault.checked_sub(senior) -> None -> Err(CorruptState).
+    assert!(r.is_err(),
+        "admission MUST refuse when V < C_tot + I (broken conservation)");
+}
+
+// ============================================================================
 // K-9: validate_admission_pair rejects admit_h_max == 0 (Bug 9)
 // Prevents wrapper bypass of admission by passing (0, 0).
 // ============================================================================
@@ -538,6 +609,52 @@ fn k71_neg_pnl_count_tracks_actual() {
         }
     }
     assert!(engine.neg_pnl_account_count == actual);
+}
+
+// ============================================================================
+// K-201 (strengthened): keeper_crank rejects max_revalidations > MAX_TOUCHED.
+// Prevents silent-clamp regression (item 9): previously requests larger than
+// the finalize budget were silently clamped; now they must return Err.
+// ============================================================================
+
+#[kani::proof]
+#[kani::unwind(4)]
+#[kani::solver(cadical)]
+fn k201_keeper_crank_rejects_oversized_budget() {
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let _a = add_user_test(&mut engine, 0).unwrap();
+    // Symbolic over-budget request
+    let over: u8 = kani::any();
+    kani::assume(over > 0);
+    let req = (MAX_TOUCHED_PER_INSTRUCTION as u16).saturating_add(over as u16);
+
+    let r = engine.keeper_crank_not_atomic(
+        DEFAULT_SLOT, DEFAULT_ORACLE, &[], req, 0i128, 0, 100);
+    assert!(r.is_err(),
+        "max_revalidations > MAX_TOUCHED_PER_INSTRUCTION MUST reject, not clamp");
+}
+
+// ============================================================================
+// K-202 (strengthened): public postcondition fires on broken conservation.
+// Exercises the defense-in-depth assert_public_postconditions (item 7).
+// ============================================================================
+
+#[kani::proof]
+#[kani::unwind(4)]
+#[kani::solver(cadical)]
+fn k202_postcondition_detects_broken_conservation() {
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let _a = add_user_test(&mut engine, 0).unwrap();
+    // Forcibly break conservation: inflate c_tot past vault.
+    engine.c_tot = U128::new(10_000);
+    engine.vault = U128::new(5_000);
+    assert!(!engine.check_conservation());
+
+    // Any public entrypoint must fail via postcondition check.
+    let r = engine.keeper_crank_not_atomic(
+        DEFAULT_SLOT, DEFAULT_ORACLE, &[], 0, 0i128, 0, 100);
+    assert!(r.is_err(),
+        "broken conservation MUST surface as Err from a public entrypoint");
 }
 
 // ============================================================================
