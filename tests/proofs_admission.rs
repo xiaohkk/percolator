@@ -658,6 +658,81 @@ fn k202_postcondition_detects_broken_conservation() {
 }
 
 // ============================================================================
+// AC-5 (strengthened): admit_outstanding_reserve_on_touch is atomic on Err.
+// If the pre-commit global-invariant check (new_matured > pnl_pos_tot)
+// fires, no reserve bucket nor aggregate has been mutated.
+// ============================================================================
+
+#[kani::proof]
+#[kani::unwind(4)]
+#[kani::solver(cadical)]
+fn ac5_admit_outstanding_atomic_on_err() {
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let idx = add_user_test(&mut engine, 0).unwrap() as usize;
+
+    // Plenty of residual so admission chooses to accelerate.
+    engine.vault = U128::new(10_000);
+    engine.c_tot = U128::new(0);
+    // Put the account in a state where acceleration would trigger but
+    // pnl_matured_pos_tot + reserve_total > pnl_pos_tot (invariant break).
+    let r: u8 = kani::any();
+    kani::assume(r > 0);
+    engine.accounts[idx].reserved_pnl = r as u128;
+    engine.accounts[idx].pnl = r as i128;
+    engine.pnl_pos_tot = r as u128; // exact; matured + r > r → must fail
+    engine.pnl_matured_pos_tot = 1;
+    engine.accounts[idx].sched_present = 1;
+    engine.accounts[idx].sched_remaining_q = r as u128;
+    engine.accounts[idx].sched_anchor_q = r as u128;
+    engine.accounts[idx].sched_horizon = 10;
+
+    // Snapshot
+    let reserved_before = engine.accounts[idx].reserved_pnl;
+    let sched_remaining_before = engine.accounts[idx].sched_remaining_q;
+    let sched_present_before = engine.accounts[idx].sched_present;
+    let matured_before = engine.pnl_matured_pos_tot;
+
+    let result = engine.admit_outstanding_reserve_on_touch(idx);
+
+    // Invariant violation → Err; state unchanged.
+    if result.is_err() {
+        assert!(engine.accounts[idx].reserved_pnl == reserved_before);
+        assert!(engine.accounts[idx].sched_remaining_q == sched_remaining_before);
+        assert!(engine.accounts[idx].sched_present == sched_present_before);
+        assert!(engine.pnl_matured_pos_tot == matured_before);
+    }
+}
+
+// ============================================================================
+// RS-1 (strengthened): reserve validation rejects reserved_pnl > max(pnl, 0).
+// Prevents corrupt accounts with reserve exceeding positive PnL from being
+// processed by downstream helpers.
+// ============================================================================
+
+#[kani::proof]
+#[kani::unwind(4)]
+#[kani::solver(cadical)]
+fn rs1_validate_rejects_reserved_exceeding_pos_pnl() {
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let idx = add_user_test(&mut engine, 0).unwrap() as usize;
+
+    // Set up a valid sched bucket but with reserved_pnl > pnl.
+    let bad_reserve: u8 = kani::any();
+    kani::assume(bad_reserve > 0);
+    engine.accounts[idx].pnl = 0; // zero pnl
+    engine.accounts[idx].reserved_pnl = bad_reserve as u128;
+    engine.accounts[idx].sched_present = 1;
+    engine.accounts[idx].sched_remaining_q = bad_reserve as u128;
+    engine.accounts[idx].sched_anchor_q = bad_reserve as u128;
+    engine.accounts[idx].sched_horizon = engine.params.h_max; // valid horizon
+
+    // append_or_route validates shape at entry — MUST reject the corrupt state.
+    let r = engine.append_or_route_new_reserve(idx, 100, 100, 10);
+    assert!(r.is_err(),
+        "reserved_pnl > max(pnl, 0) MUST be rejected (spec §2.1)");
+}
+
+// ============================================================================
 // K-104: OI >= sum of effective positions per side
 // ============================================================================
 

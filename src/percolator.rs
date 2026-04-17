@@ -488,7 +488,15 @@ pub struct RiskEngine {
     pub used: [u64; BITMAP_WORDS],
     pub num_used_accounts: u16,
     pub free_head: u16,
+    /// Forward pointer in the doubly-linked free list. Only meaningful when
+    /// the slot is free. u16::MAX terminates the list.
     pub next_free: [u16; MAX_ACCOUNTS],
+    /// Backward pointer — mirror of next_free. Enables O(1) removal at any
+    /// position (used by materialize_at, which unlinks an arbitrary free
+    /// slot rather than the head). Previously materialize_at did a linear
+    /// scan over the full list; doubly-linked fix makes missing-account
+    /// deposit O(1) worst-case.
+    pub prev_free: [u16; MAX_ACCOUNTS],
     pub accounts: [Account; MAX_ACCOUNTS],
 }
 
@@ -794,11 +802,15 @@ impl RiskEngine {
             num_used_accounts: 0,
             free_head: 0,
             next_free: [0; MAX_ACCOUNTS],
+            prev_free: [0; MAX_ACCOUNTS],
             accounts: [empty_account(); MAX_ACCOUNTS],
         };
 
+        // Build the doubly-linked free list 0 → 1 → ... → N-1 → NIL.
+        engine.prev_free[0] = u16::MAX; // head has no prev
         for i in 0..MAX_ACCOUNTS - 1 {
             engine.next_free[i] = (i + 1) as u16;
+            engine.prev_free[i + 1] = i as u16;
         }
         engine.next_free[MAX_ACCOUNTS - 1] = u16::MAX;
 
@@ -868,8 +880,10 @@ impl RiskEngine {
         for i in 0..MAX_ACCOUNTS {
             self.accounts[i].adl_a_basis = ADL_ONE;
         }
+        self.prev_free[0] = u16::MAX;
         for i in 0..MAX_ACCOUNTS - 1 {
             self.next_free[i] = (i + 1) as u16;
+            self.prev_free[i + 1] = i as u16;
         }
         self.next_free[MAX_ACCOUNTS - 1] = u16::MAX;
     }
@@ -923,7 +937,12 @@ impl RiskEngine {
             return Err(RiskError::Overflow);
         }
         let idx = self.free_head;
-        self.free_head = self.next_free[idx as usize];
+        let next = self.next_free[idx as usize];
+        self.free_head = next;
+        // Maintain doubly-linked list: new head has no predecessor.
+        if next != u16::MAX {
+            self.prev_free[next as usize] = u16::MAX;
+        }
         self.set_used(idx as usize);
         self.num_used_accounts = self.num_used_accounts.checked_add(1)
             .expect("num_used_accounts overflow — slot leak corruption");
@@ -964,7 +983,12 @@ impl RiskEngine {
         a.pending_horizon = 0;
         a.pending_created_slot = 0;
         self.clear_used(i);
+        // Push to head of doubly-linked free list.
         self.next_free[i] = self.free_head;
+        self.prev_free[i] = u16::MAX;
+        if self.free_head != u16::MAX {
+            self.prev_free[self.free_head as usize] = idx;
+        }
         self.free_head = idx;
         self.num_used_accounts = self.num_used_accounts.checked_sub(1)
             .ok_or(RiskError::CorruptState)?;
@@ -996,29 +1020,26 @@ impl RiskEngine {
             return Err(RiskError::Overflow);
         }
 
-        // Remove idx from free list. Must succeed — if idx is not in the
-        // freelist, the state is corrupt and we must not proceed.
-        let mut found = false;
-        if self.free_head == idx {
-            self.free_head = self.next_free[idx as usize];
-            found = true;
-        } else {
-            let mut prev = self.free_head;
-            let mut steps = 0usize;
-            while prev != u16::MAX && steps < MAX_ACCOUNTS {
-                if self.next_free[prev as usize] == idx {
-                    self.next_free[prev as usize] = self.next_free[idx as usize];
-                    found = true;
-                    break;
-                }
-                prev = self.next_free[prev as usize];
-                steps += 1;
-            }
-        }
-        if !found {
-            // Roll back materialized_account_count
+        // O(1) unlink from doubly-linked free list. If idx is not actually
+        // free (no prev/next pointers in a consistent free-list state AND
+        // bitmap says used), the pre-check above via !is_used in callers
+        // should have already prevented this path. We require idx to be
+        // marked unused (i.e., currently in the free list).
+        if self.is_used(idx as usize) {
             self.materialized_account_count -= 1;
             return Err(RiskError::CorruptState);
+        }
+        let i = idx as usize;
+        let next = self.next_free[i];
+        let prev = self.prev_free[i];
+        if prev == u16::MAX {
+            // idx is the head — advance head to next.
+            self.free_head = next;
+        } else {
+            self.next_free[prev as usize] = next;
+        }
+        if next != u16::MAX {
+            self.prev_free[next as usize] = prev;
         }
 
         self.set_used(idx as usize);
@@ -1118,32 +1139,52 @@ impl RiskEngine {
     test_visible! {
     fn admit_outstanding_reserve_on_touch(&mut self, idx: usize) -> Result<()> {
         if self.market_mode != MarketMode::Live { return Ok(()); }
+
+        // Phase 1: compute everything with checked arithmetic. No mutation yet.
+        // Previously used saturating_add/saturating_sub which could mask
+        // overflow or a broken V >= C_tot + I invariant. Also, the
+        // matured > pnl_pos_tot check ran AFTER state mutations, violating
+        // the validate-then-mutate contract for no-_not_atomic public helpers.
         let a = &self.accounts[idx];
         let sched_r = if a.sched_present != 0 { a.sched_remaining_q } else { 0 };
         let pend_r = if a.pending_present != 0 { a.pending_remaining_q } else { 0 };
         let reserve_total = sched_r.checked_add(pend_r).ok_or(RiskError::CorruptState)?;
         if reserve_total == 0 { return Ok(()); }
-        let senior = self.c_tot.get().saturating_add(self.insurance_fund.balance.get());
-        let residual = self.vault.get().saturating_sub(senior);
-        let matured_plus_reserve = self.pnl_matured_pos_tot.saturating_add(reserve_total);
-        if matured_plus_reserve <= residual {
-            // Accelerate: release all reserve immediately
-            self.pnl_matured_pos_tot = self.pnl_matured_pos_tot.checked_add(reserve_total)
-                .ok_or(RiskError::Overflow)?;
-            let a = &mut self.accounts[idx];
-            a.sched_present = 0;
-            a.sched_remaining_q = 0;
-            a.sched_anchor_q = 0;
-            a.sched_start_slot = 0;
-            a.sched_horizon = 0;
-            a.sched_release_q = 0;
-            a.pending_present = 0;
-            a.pending_remaining_q = 0;
-            a.pending_horizon = 0;
-            a.pending_created_slot = 0;
-            a.reserved_pnl = 0;
-            if self.pnl_matured_pos_tot > self.pnl_pos_tot { return Err(RiskError::CorruptState); }
+
+        let senior = self.c_tot.get()
+            .checked_add(self.insurance_fund.balance.get())
+            .ok_or(RiskError::Overflow)?;
+        let residual = self.vault.get()
+            .checked_sub(senior)
+            .ok_or(RiskError::CorruptState)?;
+        let new_matured = self.pnl_matured_pos_tot
+            .checked_add(reserve_total)
+            .ok_or(RiskError::Overflow)?;
+
+        if new_matured > residual {
+            // Does not admit — no mutation.
+            return Ok(());
         }
+
+        // Pre-validate the global invariant BEFORE any mutation.
+        if new_matured > self.pnl_pos_tot {
+            return Err(RiskError::CorruptState);
+        }
+
+        // Phase 2: all checks passed — commit.
+        self.pnl_matured_pos_tot = new_matured;
+        let a = &mut self.accounts[idx];
+        a.sched_present = 0;
+        a.sched_remaining_q = 0;
+        a.sched_anchor_q = 0;
+        a.sched_start_slot = 0;
+        a.sched_horizon = 0;
+        a.sched_release_q = 0;
+        a.pending_present = 0;
+        a.pending_remaining_q = 0;
+        a.pending_horizon = 0;
+        a.pending_created_slot = 0;
+        a.reserved_pnl = 0;
         Ok(())
     }
     }
@@ -2719,26 +2760,41 @@ impl RiskEngine {
     /// apply_reserve_loss_newest_first (spec §4.4) — consume from pending first, then scheduled.
     test_visible! {
     fn apply_reserve_loss_newest_first(&mut self, idx: usize, reserve_loss: u128) -> Result<()> {
-        let a = &mut self.accounts[idx];
-        let mut remaining = reserve_loss;
+        // Phase 1: compute per-bucket takes WITHOUT mutating. Validates
+        // feasibility (reserve_loss <= total available, reserve_loss <=
+        // reserved_pnl). Previously mutated step-by-step and only checked
+        // "remaining != 0" at the end, which left partial consumption on
+        // Err paths.
+        let a = &self.accounts[idx];
+        let pend_avail = if a.pending_present != 0 { a.pending_remaining_q } else { 0 };
+        let sched_avail = if a.sched_present != 0 { a.sched_remaining_q } else { 0 };
+        let total_avail = pend_avail
+            .checked_add(sched_avail)
+            .ok_or(RiskError::CorruptState)?;
+        if reserve_loss > total_avail { return Err(RiskError::CorruptState); }
+        // Pre-validate R_i decrement.
+        let new_reserved_pnl = a.reserved_pnl
+            .checked_sub(reserve_loss)
+            .ok_or(RiskError::CorruptState)?;
 
-        // Step 1: consume from pending first
-        if a.pending_present != 0 && remaining > 0 {
-            let take = core::cmp::min(remaining, a.pending_remaining_q);
-            a.pending_remaining_q -= take;
-            remaining -= take;
+        // Newest-first order: pending → scheduled.
+        let take_pend = core::cmp::min(reserve_loss, pend_avail);
+        // Safe: take_pend <= reserve_loss.
+        let take_sched = reserve_loss - take_pend;
+        // Safe: take_sched = reserve_loss - take_pend <= total_avail - pend_avail = sched_avail.
+
+        // Phase 2: commit.
+        let a = &mut self.accounts[idx];
+        if take_pend > 0 {
+            a.pending_remaining_q -= take_pend;
             if a.pending_remaining_q == 0 {
                 a.pending_present = 0;
                 a.pending_horizon = 0;
                 a.pending_created_slot = 0;
             }
         }
-
-        // Step 2: consume from scheduled
-        if a.sched_present != 0 && remaining > 0 {
-            let take = core::cmp::min(remaining, a.sched_remaining_q);
-            a.sched_remaining_q -= take;
-            remaining -= take;
+        if take_sched > 0 {
+            a.sched_remaining_q -= take_sched;
             if a.sched_remaining_q == 0 {
                 a.sched_present = 0;
                 a.sched_anchor_q = 0;
@@ -2747,13 +2803,7 @@ impl RiskEngine {
                 a.sched_release_q = 0;
             }
         }
-
-        // Step 3: require full consumption
-        if remaining != 0 { return Err(RiskError::CorruptState); }
-
-        // Step 4-5: R_i -= consumed, empty buckets cleared above
-        a.reserved_pnl = a.reserved_pnl.checked_sub(reserve_loss)
-            .ok_or(RiskError::CorruptState)?;
+        a.reserved_pnl = new_reserved_pnl;
         Ok(())
     }
 
@@ -2826,6 +2876,14 @@ impl RiskEngine {
         let pend_r = if a.pending_present != 0 { a.pending_remaining_q } else { 0 };
         let total = sched_r.checked_add(pend_r).ok_or(RiskError::CorruptState)?;
         if total != a.reserved_pnl { return Err(RiskError::CorruptState); }
+
+        // Spec §2.1: R_i <= max(PNL_i, 0). Without this, a corrupt account
+        // with reserved_pnl > max(pnl, 0) would pass shape validation and
+        // subsequent helpers (apply_reserve_loss, admit_outstanding) would
+        // mutate on top of an invalid state.
+        let pos_pnl: u128 = if a.pnl > 0 { a.pnl as u128 } else { 0 };
+        if a.reserved_pnl > pos_pnl { return Err(RiskError::CorruptState); }
+
         Ok(())
     }
 
@@ -4963,10 +5021,10 @@ impl RiskEngine {
             return Err(RiskError::Unauthorized);
         }
         if idx as usize >= MAX_ACCOUNTS || !self.is_used(idx as usize) {
-            return Err(RiskError::Unauthorized);
+            return Err(RiskError::AccountNotFound);
         }
         if now_slot < self.current_slot {
-            return Err(RiskError::Unauthorized);
+            return Err(RiskError::Overflow);
         }
         // Cap at outstanding debt to enforce spec §2.1 invariant: fee_credits <= 0
         let debt = fee_debt_u128_checked(self.accounts[idx as usize].fee_credits.get());

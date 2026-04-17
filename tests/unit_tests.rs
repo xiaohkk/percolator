@@ -1026,10 +1026,20 @@ fn test_i128_size_q_construction() {
 }
 
 #[test]
-fn test_deposit_fee_credits_invalid_account() {
+fn test_deposit_fee_credits_missing_account_returns_account_not_found() {
     let mut engine = RiskEngine::new(default_params());
     let result = engine.deposit_fee_credits(99, 1000, 1);
-    assert_eq!(result, Err(RiskError::Unauthorized));
+    assert_eq!(result, Err(RiskError::AccountNotFound));
+}
+
+#[test]
+fn test_deposit_fee_credits_backwards_time_returns_overflow() {
+    let mut engine = RiskEngine::new(default_params());
+    let idx = engine.free_head;
+    engine.deposit_not_atomic(idx, 5000, 1000, 100).unwrap();
+    // current_slot is 100; try to deposit at an earlier slot
+    let result = engine.deposit_fee_credits(idx, 1000, 50);
+    assert_eq!(result, Err(RiskError::Overflow));
 }
 
 #[test]
@@ -2823,6 +2833,10 @@ fn test_append_reserve_merges_same_slot_horizon() {
     let idx = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(idx, 100_000, 1000, 100).unwrap();
     engine.current_slot = 100;
+    // Spec §2.1: reserved_pnl <= max(pnl, 0). Set pnl + aggregate tracker
+    // to back the reserve being appended (test exercises helper in isolation).
+    engine.accounts[idx as usize].pnl = 8_000;
+    engine.pnl_pos_tot = 8_000;
 
     engine.append_or_route_new_reserve(idx as usize, 5_000, 100, 50);
     engine.append_or_route_new_reserve(idx as usize, 3_000, 100, 50);
@@ -2841,6 +2855,9 @@ fn test_append_reserve_different_horizon_creates_pending() {
     let idx = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(idx, 100_000, 1000, 100).unwrap();
     engine.current_slot = 100;
+    // Back reserve with matching pnl (spec §2.1).
+    engine.accounts[idx as usize].pnl = 8_000;
+    engine.pnl_pos_tot = 8_000;
 
     engine.append_or_route_new_reserve(idx as usize, 5_000, 100, 50);
     engine.append_or_route_new_reserve(idx as usize, 3_000, 100, 100); // different horizon
@@ -2858,6 +2875,9 @@ fn test_apply_reserve_loss_newest_first() {
     let idx = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(idx, 100_000, 1000, 100).unwrap();
     engine.current_slot = 100;
+    // Back reserve with matching pnl (spec §2.1).
+    engine.accounts[idx as usize].pnl = 8_000;
+    engine.pnl_pos_tot = 8_000;
 
     // Create sched (5k) then pending (3k at different slot)
     engine.append_or_route_new_reserve(idx as usize, 5_000, 100, 50);
