@@ -38,7 +38,7 @@ fn ah1_single_admission_range() {
 
     let h_eff = engine.admit_fresh_reserve_h_lock(
         idx as usize, fresh as u128, &mut ctx,
-        admit_h_min as u64, admit_h_max as u64);
+        admit_h_min as u64, admit_h_max as u64).unwrap();
 
     // Returned horizon is exactly one of the two inputs
     assert!(h_eff == admit_h_min as u64 || h_eff == admit_h_max as u64);
@@ -83,7 +83,7 @@ fn ah2_sticky_is_absorbing() {
 
     let h_eff = engine.admit_fresh_reserve_h_lock(
         idx as usize, fresh as u128, &mut ctx,
-        admit_h_min as u64, admit_h_max as u64);
+        admit_h_min as u64, admit_h_max as u64).unwrap();
 
     // Sticky forces h_max regardless of residual
     assert!(h_eff == admit_h_max as u64);
@@ -121,7 +121,7 @@ fn ah3_no_under_admission() {
     kani::assume(fresh1 > 0);
     let h1 = engine.admit_fresh_reserve_h_lock(
         idx as usize, fresh1 as u128, &mut ctx,
-        admit_h_min as u64, admit_h_max as u64);
+        admit_h_min as u64, admit_h_max as u64).unwrap();
     assert!(h1 == admit_h_max as u64);
     assert!(ctx.is_h_max_sticky(idx));
 
@@ -133,7 +133,7 @@ fn ah3_no_under_admission() {
     kani::assume(fresh2 > 0);
     let h2 = engine.admit_fresh_reserve_h_lock(
         idx as usize, fresh2 as u128, &mut ctx,
-        admit_h_min as u64, admit_h_max as u64);
+        admit_h_min as u64, admit_h_max as u64).unwrap();
     assert!(h2 == admit_h_max as u64);
 }
 
@@ -173,7 +173,7 @@ fn ah4_hmin_zero_preserves_h_equals_one() {
 
     let h_eff = engine.admit_fresh_reserve_h_lock(
         idx as usize, fresh as u128, &mut ctx,
-        admit_h_min, admit_h_max as u64);
+        admit_h_min, admit_h_max as u64).unwrap();
 
     if h_eff == 0 {
         // Simulate §4.8 clause 10: instant release
@@ -219,7 +219,7 @@ fn ah5_cross_account_sticky_isolation() {
 
     let h_b = engine.admit_fresh_reserve_h_lock(
         b as usize, fresh_b as u128, &mut ctx,
-        admit_h_min as u64, admit_h_max as u64);
+        admit_h_min as u64, admit_h_max as u64).unwrap();
     assert!(h_b == admit_h_min as u64);
     // b not sticky (h_min was returned)
     assert!(!ctx.is_h_max_sticky(b));
@@ -250,7 +250,7 @@ fn ah6_positive_hmin_floor() {
 
     let h_eff = engine.admit_fresh_reserve_h_lock(
         idx as usize, fresh as u128, &mut ctx,
-        admit_h_min as u64, admit_h_max as u64);
+        admit_h_min as u64, admit_h_max as u64).unwrap();
 
     // Result >= admit_h_min (never below the floor)
     assert!(h_eff >= admit_h_min as u64);

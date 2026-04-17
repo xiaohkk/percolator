@@ -1070,23 +1070,41 @@ impl RiskEngine {
     pub fn admit_fresh_reserve_h_lock(
         &self, idx: usize, fresh_positive_pnl: u128,
         ctx: &mut InstructionContext, admit_h_min: u64, admit_h_max: u64,
-    ) -> u64 {
+    ) -> Result<u64> {
         // Step 1: sticky check
-        if ctx.is_h_max_sticky(idx as u16) { return admit_h_max; }
-        // Step 2: headroom check
-        let senior = self.c_tot.get().saturating_add(self.insurance_fund.balance.get());
-        let residual = self.vault.get().saturating_sub(senior);
-        let matured_plus_fresh = self.pnl_matured_pos_tot.saturating_add(fresh_positive_pnl);
+        if ctx.is_h_max_sticky(idx as u16) { return Ok(admit_h_max); }
+
+        // Step 2: headroom check. Use checked arithmetic; saturating would
+        // mask overflows or a broken V >= C_tot + I invariant, producing a
+        // wrong residual and a wrong admission decision.
+        let senior = self.c_tot.get()
+            .checked_add(self.insurance_fund.balance.get())
+            .ok_or(RiskError::Overflow)?;
+        // Residual requires V >= senior (engine invariant). Anything less is
+        // corruption; fail rather than return 0.
+        let residual = self.vault.get()
+            .checked_sub(senior)
+            .ok_or(RiskError::CorruptState)?;
+        let matured_plus_fresh = self.pnl_matured_pos_tot
+            .checked_add(fresh_positive_pnl)
+            .ok_or(RiskError::Overflow)?;
+
         let admitted_h_eff = if matured_plus_fresh <= residual {
             admit_h_min
         } else {
             admit_h_max
         };
-        // Step 3: mark sticky if h_max
+
+        // Step 3: mark sticky if h_max. mark_h_max_sticky returns false on
+        // capacity exhaustion; propagate as failure rather than silently
+        // skipping the sticky — later calls would otherwise not see this
+        // account as sticky and could re-admit at h_min.
         if admitted_h_eff == admit_h_max {
-            ctx.mark_h_max_sticky(idx as u16);
+            if !ctx.mark_h_max_sticky(idx as u16) {
+                return Err(RiskError::Overflow);
+            }
         }
-        admitted_h_eff
+        Ok(admitted_h_eff)
     }
 
     /// admit_outstanding_reserve_on_touch (spec §4.9): accelerate existing reserve if h=1 holds.
@@ -1218,7 +1236,7 @@ impl RiskEngine {
                     // Admission-pair: engine decides effective horizon (spec §4.7)
                     let ctx = ctx.ok_or(RiskError::CorruptState)?;
                     let admitted_h_eff = self.admit_fresh_reserve_h_lock(
-                        idx, reserve_add, ctx, admit_h_min, admit_h_max);
+                        idx, reserve_add, ctx, admit_h_min, admit_h_max)?;
                     if admitted_h_eff == 0 {
                         self.pnl_matured_pos_tot = self.pnl_matured_pos_tot.checked_add(reserve_add)
                             .ok_or(RiskError::Overflow)?;
