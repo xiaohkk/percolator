@@ -3342,7 +3342,10 @@ fn audit_6_deposit_materialize_needs_live_gate() {
     // Try to deposit into an unused slot on a Resolved market — must reject.
     let unused_idx = engine.free_head;
     let result = engine.deposit_not_atomic(unused_idx, 10_000, 1000, 101);
-    assert!(result.is_err(), "deposit must be blocked on resolved markets");
+    assert_eq!(result, Err(RiskError::Unauthorized),
+        "deposit must be blocked on resolved markets with Unauthorized");
+    assert!(!engine.is_used(unused_idx as usize),
+        "no materialization on Resolved-mode deposit reject");
 }
 
 #[test]
@@ -3470,13 +3473,16 @@ fn fix5_deposit_materialize_requires_min_deposit() {
     // min_initial_deposit = 1000 in default_params.
     let unused_idx = engine.free_head;
     let result = engine.deposit_not_atomic(unused_idx, 999, 1000, 100);
-    assert!(result.is_err(),
-        "deposit into missing account with amount < min_initial_deposit must reject");
+    // Specific error type — not any Err — to avoid passing for wrong reason.
+    assert_eq!(result, Err(RiskError::InsufficientBalance),
+        "deposit into missing account with amount < min_initial_deposit must reject InsufficientBalance");
+    assert!(!engine.is_used(unused_idx as usize), "failed deposit must not materialize");
 
     // Exactly min_initial_deposit must succeed and materialize.
     let result2 = engine.deposit_not_atomic(unused_idx, 1000, 1000, 100);
     assert!(result2.is_ok(), "deposit == min_initial_deposit must materialize");
     assert!(engine.is_used(unused_idx as usize));
+    assert_eq!(engine.accounts[unused_idx as usize].capital.get(), 1000);
 }
 
 // ============================================================================
@@ -3490,7 +3496,8 @@ fn blocker2_deposit_dust_amount_rejected() {
     let mut engine = RiskEngine::new(default_params());
     let unused_idx = engine.free_head;
     let result = engine.deposit_not_atomic(unused_idx, 500, 1000, 100);
-    assert!(result.is_err(), "dust deposit into missing account must reject");
+    assert_eq!(result, Err(RiskError::InsufficientBalance),
+        "dust deposit into missing account must reject InsufficientBalance specifically");
     assert!(!engine.is_used(unused_idx as usize),
         "missing account must not be materialized on failed deposit");
 }

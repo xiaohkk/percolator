@@ -694,13 +694,17 @@ fn ac5_admit_outstanding_atomic_on_err() {
 
     let result = engine.admit_outstanding_reserve_on_touch(idx);
 
-    // Invariant violation → Err; state unchanged.
-    if result.is_err() {
-        assert!(engine.accounts[idx].reserved_pnl == reserved_before);
-        assert!(engine.accounts[idx].sched_remaining_q == sched_remaining_before);
-        assert!(engine.accounts[idx].sched_present == sched_present_before);
-        assert!(engine.pnl_matured_pos_tot == matured_before);
-    }
+    // Deterministic setup: matured=1, reserve=r, pnl_pos_tot=r forces
+    // new_matured = 1+r > pnl_pos_tot = r → invariant check returns Err.
+    // Asserting Err unconditionally (not `if result.is_err()`) avoids
+    // vacuous pass if the result were Ok.
+    assert!(result.is_err(),
+        "atomicity check MUST fire: new_matured > pnl_pos_tot");
+    // And state MUST be unchanged (validate-then-mutate contract).
+    assert!(engine.accounts[idx].reserved_pnl == reserved_before);
+    assert!(engine.accounts[idx].sched_remaining_q == sched_remaining_before);
+    assert!(engine.accounts[idx].sched_present == sched_present_before);
+    assert!(engine.pnl_matured_pos_tot == matured_before);
 }
 
 // ============================================================================
