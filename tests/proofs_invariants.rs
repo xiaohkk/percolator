@@ -328,17 +328,26 @@ fn proof_set_pnl_maintains_pnl_pos_tot() {
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
 fn proof_set_pnl_underflow_safety() {
+    // Substantive: pnl_pos_tot tracks sum of max(pnl, 0) correctly across
+    // arbitrary set_pnl_with_reserve transitions.
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap();
+    engine.vault = U128::new(10_000); // positive residual for admission
+    let idx = engine.add_user(0).unwrap() as usize;
 
-    engine.set_pnl(idx as usize, 1000i128);
-    assert!(engine.pnl_pos_tot == 1000u128);
+    // Symbolic positive initial PnL via admission pair
+    let pnl1: u8 = kani::any();
+    let mut ctx = InstructionContext::new_with_admission(0, 100);
+    let _ = engine.set_pnl_with_reserve(idx, pnl1 as i128,
+        ReserveMode::UseAdmissionPair(0, 100), Some(&mut ctx));
+    assert!(engine.pnl_pos_tot == pnl1 as u128);
 
-    engine.set_pnl(idx as usize, -500i128);
-    assert!(engine.pnl_pos_tot == 0u128);
-
-    engine.set_pnl(idx as usize, 0i128);
-    assert!(engine.pnl_pos_tot == 0u128);
+    // Decrease to symbolic smaller or negative value
+    let pnl2: i8 = kani::any();
+    kani::assume(pnl2 <= pnl1 as i8);
+    let _ = engine.set_pnl_with_reserve(idx, pnl2 as i128,
+        ReserveMode::NoPositiveIncreaseAllowed, None);
+    let expected = core::cmp::max(pnl2 as i128, 0) as u128;
+    assert!(engine.pnl_pos_tot == expected);
 }
 
 #[kani::proof]
@@ -397,15 +406,19 @@ fn proof_set_capital_maintains_c_tot() {
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
 fn proof_check_conservation_basic() {
+    // Substantive: check_conservation returns exactly V >= C + I across symbolic V/C/I.
     let mut engine = RiskEngine::new(zero_fee_params());
 
-    engine.vault = U128::new(100);
-    engine.c_tot = U128::new(60);
-    engine.insurance_fund.balance = U128::new(30);
-    assert!(engine.check_conservation());
+    let v: u16 = kani::any();
+    let c: u16 = kani::any();
+    let i: u16 = kani::any();
 
-    engine.insurance_fund.balance = U128::new(50);
-    assert!(!engine.check_conservation());
+    engine.vault = U128::new(v as u128);
+    engine.c_tot = U128::new(c as u128);
+    engine.insurance_fund.balance = U128::new(i as u128);
+
+    let expected = (v as u128) >= (c as u128) + (i as u128);
+    assert!(engine.check_conservation() == expected);
 }
 
 #[kani::proof]
@@ -570,12 +583,21 @@ fn proof_effective_pos_q_epoch_mismatch_returns_zero() {
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
 fn proof_effective_pos_q_flat_is_zero() {
+    // Substantive: after attaching a symbolic nonzero position and then
+    // detaching (attach 0), effective_pos_q returns 0.
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap();
+    let idx = engine.add_user(0).unwrap() as usize;
 
-    assert!(engine.accounts[idx as usize].position_basis_q == 0);
-    let eff = engine.effective_pos_q(idx as usize);
-    assert!(eff == 0);
+    // Attach a symbolic nonzero position via the proper path
+    let basis: i8 = kani::any();
+    kani::assume(basis != 0);
+    engine.attach_effective_position(idx, basis as i128).unwrap();
+    assert!(engine.effective_pos_q(idx) != 0);
+
+    // Detach by attaching 0
+    engine.attach_effective_position(idx, 0).unwrap();
+    assert!(engine.accounts[idx].position_basis_q == 0);
+    assert!(engine.effective_pos_q(idx) == 0);
 }
 
 #[kani::proof]

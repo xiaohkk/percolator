@@ -481,11 +481,24 @@ fn proof_k_pair_variant_zero_diff() {
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
 fn proof_wide_signed_mul_div_floor_zero_inputs() {
-    // Zero basis → zero result
-    let result = wide_signed_mul_div_floor(U256::ZERO, I256::from_i128(42), U256::from_u128(1));
-    assert!(result == I256::ZERO);
+    // Substantive: zero-factor short-circuit holds across all symbolic values
+    // of the *other* inputs.
+    let basis_any: u8 = kani::any();
+    let k_any: i8 = kani::any();
+    let den_any: u8 = kani::any();
+    kani::assume(den_any > 0); // denominator must be nonzero
 
-    // Zero k_diff → zero result
-    let result2 = wide_signed_mul_div_floor(U256::from_u128(42), I256::ZERO, U256::from_u128(1));
-    assert!(result2 == I256::ZERO);
+    // Zero basis → zero result regardless of k or den
+    let r1 = wide_signed_mul_div_floor(
+        U256::ZERO,
+        I256::from_i128(k_any as i128),
+        U256::from_u128(den_any as u128));
+    assert!(r1 == I256::ZERO);
+
+    // Zero k_diff → zero result regardless of basis or den
+    let r2 = wide_signed_mul_div_floor(
+        U256::from_u128(basis_any as u128),
+        I256::ZERO,
+        U256::from_u128(den_any as u128));
+    assert!(r2 == I256::ZERO);
 }

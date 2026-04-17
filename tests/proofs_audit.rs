@@ -197,19 +197,28 @@ fn proof_flat_account_initial_margin_healthy() {
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
 fn proof_flat_zero_equity_not_maintenance_healthy() {
+    // Substantive: symbolic fee_debt pushes equity to exactly 0 or negative;
+    // flat account with Eq_net = 0 (or negative) is NOT maintenance-healthy.
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap();
-    // No deposit, capital = 0, pnl = 0 → equity = 0
+    let idx = engine.add_user(0).unwrap() as usize;
 
-    assert!(engine.effective_pos_q(idx as usize) == 0);
+    let cap: u8 = kani::any();
+    kani::assume(cap <= 100);
+    let fee_debt: u8 = kani::any();
+    kani::assume(fee_debt >= cap); // fee_debt >= cap means Eq_net <= 0
+
+    engine.accounts[idx].capital = U128::new(cap as u128);
+    engine.c_tot = U128::new(cap as u128);
+    engine.accounts[idx].fee_credits = I128::new(-(fee_debt as i128));
+
+    assert!(engine.effective_pos_q(idx) == 0);
 
     let healthy = engine.is_above_maintenance_margin(
-        &engine.accounts[idx as usize].clone(),
-        idx as usize,
+        &engine.accounts[idx].clone(),
+        idx,
         DEFAULT_ORACLE,
     );
-    // Eq_net = 0, MM_req = 0, 0 > 0 is false → not healthy
-    assert!(!healthy, "flat account with zero equity is NOT maintenance-healthy");
+    assert!(!healthy, "flat account with Eq_net <= 0 is not maintenance-healthy");
 }
 
 // ############################################################################
