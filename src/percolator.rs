@@ -78,7 +78,6 @@ pub const MAX_ACCOUNTS: usize = 4096;
 
 pub const BITMAP_WORDS: usize = (MAX_ACCOUNTS + 63) / 64;
 pub const MAX_ROUNDING_SLACK: u128 = MAX_ACCOUNTS as u128;
-pub const MAX_ACTIVE_POSITIONS_PER_SIDE: u64 = MAX_ACCOUNTS as u64;
 const ACCOUNT_IDX_MASK: usize = MAX_ACCOUNTS - 1;
 const _: () = assert!(MAX_ACCOUNTS.is_power_of_two());
 
@@ -397,6 +396,9 @@ pub struct RiskParams {
     pub max_accrual_dt_slots: u64,
     /// Max |funding_rate_e9_per_slot| allowed (spec §1.4).
     pub max_abs_funding_e9_per_slot: u64,
+    /// Per-market active-positions cap per side (spec §1.4).
+    /// Invariant: max_active_positions_per_side <= max_accounts <= MAX_ACCOUNTS.
+    pub max_active_positions_per_side: u64,
 }
 
 /// Main risk engine state (spec §2.2)
@@ -608,6 +610,17 @@ impl RiskEngine {
         assert!(
             (params.max_accounts as usize) <= MAX_ACCOUNTS && params.max_accounts > 0,
             "max_accounts must be in 1..=MAX_ACCOUNTS"
+        );
+
+        // Per-market active-positions cap (spec §1.4):
+        // 0 < max_active_positions_per_side <= max_accounts.
+        assert!(
+            params.max_active_positions_per_side > 0,
+            "max_active_positions_per_side must be > 0 (spec §1.4)"
+        );
+        assert!(
+            params.max_active_positions_per_side <= params.max_accounts,
+            "max_active_positions_per_side must be <= max_accounts (spec §1.4)"
         );
 
         // Margin ordering: 0 <= maintenance_bps <= initial_bps <= 10_000 (spec §1.4)
@@ -1340,14 +1353,14 @@ impl RiskEngine {
                 Side::Long => {
                     self.stored_pos_count_long = self.stored_pos_count_long
                         .checked_add(1).ok_or(RiskError::CorruptState)?;
-                    if self.stored_pos_count_long > MAX_ACTIVE_POSITIONS_PER_SIDE {
+                    if self.stored_pos_count_long > self.params.max_active_positions_per_side {
                         return Err(RiskError::Overflow);
                     }
                 }
                 Side::Short => {
                     self.stored_pos_count_short = self.stored_pos_count_short
                         .checked_add(1).ok_or(RiskError::CorruptState)?;
-                    if self.stored_pos_count_short > MAX_ACTIVE_POSITIONS_PER_SIDE {
+                    if self.stored_pos_count_short > self.params.max_active_positions_per_side {
                         return Err(RiskError::Overflow);
                     }
                 }

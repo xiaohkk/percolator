@@ -190,6 +190,7 @@ fn params_regime_a() -> RiskParams {
         resolve_price_deviation_bps: 1000,
         max_accrual_dt_slots: 1_000,
         max_abs_funding_e9_per_slot: 100_000_000,
+        max_active_positions_per_side: MAX_ACCOUNTS as u64,
     }
 }
 
@@ -213,6 +214,7 @@ fn params_regime_b() -> RiskParams {
         resolve_price_deviation_bps: 1000,
         max_accrual_dt_slots: 1_000,
         max_abs_funding_e9_per_slot: 100_000_000,
+        max_active_positions_per_side: MAX_ACCOUNTS as u64,
     }
 }
 
