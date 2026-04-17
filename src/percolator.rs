@@ -1883,12 +1883,19 @@ impl RiskEngine {
     }
 
     /// Validate h_lock before any state mutation.
-    fn validate_admission_pair(admit_h_min: u64, admit_h_max: u64, params: &RiskParams) -> Result<()> {
-        // spec §1.4: 0 <= admit_h_min <= admit_h_max <= cfg_h_max
+    #[cfg_attr(any(feature = "test", feature = "stress", kani), doc(hidden))]
+    pub fn validate_admission_pair(admit_h_min: u64, admit_h_max: u64, params: &RiskParams) -> Result<()> {
+        // spec §1.4: for live instructions that may create fresh reserve,
+        // admit_h_max > 0 and admit_h_max >= cfg_h_min.
+        // admit_h_max == 0 would bypass admission entirely (0 returned regardless
+        // of state), breaking the h=1 invariant. Reject.
+        if admit_h_max == 0 { return Err(RiskError::Overflow); }
+        if admit_h_max < params.h_min { return Err(RiskError::Overflow); }
+        // 0 <= admit_h_min <= admit_h_max <= cfg_h_max
         if admit_h_min > admit_h_max { return Err(RiskError::Overflow); }
         if admit_h_max > params.h_max { return Err(RiskError::Overflow); }
+        // if admit_h_min > 0, then admit_h_min >= cfg_h_min
         if admit_h_min > 0 && admit_h_min < params.h_min { return Err(RiskError::Overflow); }
-        if admit_h_max > 0 && admit_h_max < params.h_min { return Err(RiskError::Overflow); }
         Ok(())
     }
 

@@ -61,7 +61,7 @@ fn t11_44_trade_path_reopens_ready_reset_side() {
     engine.last_crank_slot = 1;
 
     let size_q = POS_SCALE as i128;
-    let result = engine.execute_trade_not_atomic(a, b, 100, 1, size_q, 100, 0i128, 0, 0);
+    let result = engine.execute_trade_not_atomic(a, b, 100, 1, size_q, 100, 0i128, 0, 100);
 
     assert!(result.is_ok(), "trade must succeed after auto-finalization of ready reset side");
     assert!(engine.side_mode_long == SideMode::Normal);
@@ -253,7 +253,7 @@ fn t11_53_keeper_crank_quiesces_after_pending_reset() {
     let c_cap_before = engine.accounts[c as usize].capital.get();
     let c_pnl_before = engine.accounts[c as usize].pnl;
 
-    let result = engine.keeper_crank_not_atomic(1, 100, &[(a, Some(LiquidationPolicy::FullClose))], 1, 0i128, 0, 0);
+    let result = engine.keeper_crank_not_atomic(1, 100, &[(a, Some(LiquidationPolicy::FullClose))], 1, 0i128, 0, 100);
     assert!(result.is_ok());
 
     assert!(engine.accounts[c as usize].capital.get() == c_cap_before,
@@ -333,7 +333,7 @@ fn proof_keeper_reset_lifecycle_last_stale_triggers_finalize() {
 
     assert!(engine.side_mode_long == SideMode::ResetPending);
 
-    let result = engine.keeper_crank_not_atomic(1, 100, &[(a, None), (b, None)], 2, 0i128, 0, 0);
+    let result = engine.keeper_crank_not_atomic(1, 100, &[(a, None), (b, None)], 2, 0i128, 0, 100);
     assert!(result.is_ok());
 
     assert!(engine.side_mode_long == SideMode::Normal,
@@ -402,7 +402,7 @@ fn proof_adl_pipeline_trade_liquidate_reopen() {
 
     // Step 1: a goes long, b goes short (bilateral position)
     let size = (500 * POS_SCALE) as i128;
-    engine.execute_trade_not_atomic(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size, DEFAULT_ORACLE, 0i128, 0, 0).unwrap();
+    engine.execute_trade_not_atomic(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size, DEFAULT_ORACLE, 0i128, 0, 100).unwrap();
     assert!(engine.oi_eff_long_q == engine.oi_eff_short_q, "OI must balance after trade");
 
     // Step 2: make a deeply bankrupt (loss exceeds capital)
@@ -411,7 +411,7 @@ fn proof_adl_pipeline_trade_liquidate_reopen() {
     // Step 3: liquidate a via keeper_crank_not_atomic
     let slot2 = DEFAULT_SLOT + 1;
     let candidates = [(a, Some(LiquidationPolicy::FullClose)), (b, Some(LiquidationPolicy::FullClose)), (c, Some(LiquidationPolicy::FullClose))];
-    let result = engine.keeper_crank_not_atomic(slot2, DEFAULT_ORACLE, &candidates, 10, 0i128, 0, 0);
+    let result = engine.keeper_crank_not_atomic(slot2, DEFAULT_ORACLE, &candidates, 10, 0i128, 0, 100);
     assert!(result.is_ok());
     let outcome = result.unwrap();
     assert!(engine.oi_eff_long_q == engine.oi_eff_short_q, "OI must balance after liquidation+ADL");
@@ -425,7 +425,7 @@ fn proof_adl_pipeline_trade_liquidate_reopen() {
     let new_size = (100 * POS_SCALE) as i128;
     let slot3 = slot2 + 1;
     engine.last_crank_slot = slot3;
-    let result2 = engine.execute_trade_not_atomic(c, b, DEFAULT_ORACLE, slot3, new_size, DEFAULT_ORACLE, 0i128, 0, 0);
+    let result2 = engine.execute_trade_not_atomic(c, b, DEFAULT_ORACLE, slot3, new_size, DEFAULT_ORACLE, 0i128, 0, 100);
 
     // Trade may or may not succeed (b's equity may be impaired from ADL)
     // but OI balance must hold regardless

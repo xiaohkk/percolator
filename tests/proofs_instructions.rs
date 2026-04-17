@@ -44,10 +44,10 @@ fn t3_16_reset_pending_counter_invariant() {
     assert!(engine.side_mode_long == SideMode::ResetPending);
     assert!(engine.stale_account_count_long == 2);
 
-    let _ = { let mut _ctx = InstructionContext::new_with_admission(0, 0); engine.settle_side_effects_live(a as usize, &mut _ctx) };
+    let _ = { let mut _ctx = InstructionContext::new_with_admission(0, 100); engine.settle_side_effects_live(a as usize, &mut _ctx) };
     assert!(engine.stale_account_count_long == 1);
 
-    let _ = { let mut _ctx = InstructionContext::new_with_admission(0, 0); engine.settle_side_effects_live(b as usize, &mut _ctx) };
+    let _ = { let mut _ctx = InstructionContext::new_with_admission(0, 100); engine.settle_side_effects_live(b as usize, &mut _ctx) };
     assert!(engine.stale_account_count_long == 0);
 }
 
@@ -85,9 +85,9 @@ fn t3_16b_reset_counter_with_nonzero_k_diff() {
     assert!(engine.adl_epoch_start_k_long == k_long);
     assert!(engine.stale_account_count_long == 2);
 
-    let _ = { let mut _ctx = InstructionContext::new_with_admission(0, 0); engine.settle_side_effects_live(a as usize, &mut _ctx) };
+    let _ = { let mut _ctx = InstructionContext::new_with_admission(0, 100); engine.settle_side_effects_live(a as usize, &mut _ctx) };
     assert!(engine.stale_account_count_long == 1);
-    let _ = { let mut _ctx = InstructionContext::new_with_admission(0, 0); engine.settle_side_effects_live(b as usize, &mut _ctx) };
+    let _ = { let mut _ctx = InstructionContext::new_with_admission(0, 100); engine.settle_side_effects_live(b as usize, &mut _ctx) };
     assert!(engine.stale_account_count_long == 0);
 }
 
@@ -174,7 +174,7 @@ fn t6_26b_full_drain_reset_nonzero_k_diff() {
     assert!(engine.adl_epoch_long == 1);
     assert!(engine.stale_account_count_long == 1);
 
-    let result = { let mut _ctx = InstructionContext::new_with_admission(0, 0); engine.settle_side_effects_live(idx as usize, &mut _ctx) };
+    let result = { let mut _ctx = InstructionContext::new_with_admission(0, 100); engine.settle_side_effects_live(idx as usize, &mut _ctx) };
     assert!(result.is_ok());
 
     assert!(engine.accounts[idx as usize].position_basis_q == 0);
@@ -249,7 +249,7 @@ fn t9_36_fee_seniority_after_restart() {
     engine.stale_account_count_long = 1;
     engine.adl_coeff_long = 0i128;
 
-    let _ = { let mut _ctx = InstructionContext::new_with_admission(0, 0); engine.settle_side_effects_live(idx as usize, &mut _ctx) };
+    let _ = { let mut _ctx = InstructionContext::new_with_admission(0, 100); engine.settle_side_effects_live(idx as usize, &mut _ctx) };
 
     let fc_after = engine.accounts[idx as usize].fee_credits;
     assert!(fc_after == fc_before, "fee_credits must be preserved across epoch restart");
@@ -371,12 +371,12 @@ fn t11_39_same_epoch_settle_idempotent_real_engine() {
 
     engine.adl_coeff_long = 100i128;
 
-    let r1 = { let mut _ctx = InstructionContext::new_with_admission(0, 0); engine.settle_side_effects_live(idx as usize, &mut _ctx) };
+    let r1 = { let mut _ctx = InstructionContext::new_with_admission(0, 100); engine.settle_side_effects_live(idx as usize, &mut _ctx) };
     assert!(r1.is_ok());
     let pnl_after_first = engine.accounts[idx as usize].pnl;
     assert!(engine.accounts[idx as usize].adl_k_snap == 100i128);
 
-    let r2 = { let mut _ctx = InstructionContext::new_with_admission(0, 0); engine.settle_side_effects_live(idx as usize, &mut _ctx) };
+    let r2 = { let mut _ctx = InstructionContext::new_with_admission(0, 100); engine.settle_side_effects_live(idx as usize, &mut _ctx) };
     assert!(r2.is_ok());
     let pnl_after_second = engine.accounts[idx as usize].pnl;
 
@@ -403,14 +403,14 @@ fn t11_40_non_compounding_quantity_basis_two_touches() {
     engine.oi_eff_long_q = POS_SCALE;
 
     engine.adl_coeff_long = 50i128;
-    let _ = { let mut _ctx = InstructionContext::new_with_admission(0, 0); engine.settle_side_effects_live(idx as usize, &mut _ctx) };
+    let _ = { let mut _ctx = InstructionContext::new_with_admission(0, 100); engine.settle_side_effects_live(idx as usize, &mut _ctx) };
 
     assert!(engine.accounts[idx as usize].position_basis_q == pos);
     assert!(engine.accounts[idx as usize].adl_a_basis == ADL_ONE);
     assert!(engine.accounts[idx as usize].adl_k_snap == 50i128);
 
     engine.adl_coeff_long = 120i128;
-    let _ = { let mut _ctx = InstructionContext::new_with_admission(0, 0); engine.settle_side_effects_live(idx as usize, &mut _ctx) };
+    let _ = { let mut _ctx = InstructionContext::new_with_admission(0, 100); engine.settle_side_effects_live(idx as usize, &mut _ctx) };
 
     assert!(engine.accounts[idx as usize].position_basis_q == pos);
     assert!(engine.accounts[idx as usize].adl_a_basis == ADL_ONE);
@@ -476,11 +476,11 @@ fn t11_42_dynamic_dust_bound_inductive() {
 
     engine.adl_mult_long = 1;
 
-    let _ = { let mut _ctx = InstructionContext::new_with_admission(0, 0); engine.settle_side_effects_live(a as usize, &mut _ctx) };
+    let _ = { let mut _ctx = InstructionContext::new_with_admission(0, 100); engine.settle_side_effects_live(a as usize, &mut _ctx) };
     assert!(engine.accounts[a as usize].position_basis_q == 0);
     assert!(engine.phantom_dust_bound_long_q == 1u128);
 
-    let _ = { let mut _ctx = InstructionContext::new_with_admission(0, 0); engine.settle_side_effects_live(b as usize, &mut _ctx) };
+    let _ = { let mut _ctx = InstructionContext::new_with_admission(0, 100); engine.settle_side_effects_live(b as usize, &mut _ctx) };
     assert!(engine.accounts[b as usize].position_basis_q == 0);
     assert!(engine.phantom_dust_bound_long_q == 2u128);
 }
@@ -500,13 +500,13 @@ fn t11_50_execute_trade_atomic_oi_update_sign_flip() {
     engine.last_crank_slot = 1;
 
     let size_q = POS_SCALE as i128;
-    let r1 = engine.execute_trade_not_atomic(a, b, 100, 1, size_q, 100, 0i128, 0, 0);
+    let r1 = engine.execute_trade_not_atomic(a, b, 100, 1, size_q, 100, 0i128, 0, 100);
     assert!(r1.is_ok());
     assert!(engine.oi_eff_long_q == engine.oi_eff_short_q);
 
     // Swap a,b to reverse direction (size_q must be > 0)
     let flip_size = (2 * POS_SCALE) as i128;
-    let r2 = engine.execute_trade_not_atomic(b, a, 100, 2, flip_size, 100, 0i128, 0, 0);
+    let r2 = engine.execute_trade_not_atomic(b, a, 100, 2, flip_size, 100, 0i128, 0, 100);
     assert!(r2.is_ok());
 
     assert!(engine.oi_eff_long_q == engine.oi_eff_short_q, "OI must be balanced after sign flip");
@@ -529,7 +529,7 @@ fn t11_51_execute_trade_slippage_zero_sum() {
     let vault_before = engine.vault.get();
 
     let size_q = POS_SCALE as i128;
-    let result = engine.execute_trade_not_atomic(a, b, 100, 1, size_q, 100, 0i128, 0, 0);
+    let result = engine.execute_trade_not_atomic(a, b, 100, 1, size_q, 100, 0i128, 0, 100);
     assert!(result.is_ok());
 
     let vault_after = engine.vault.get();
@@ -569,7 +569,7 @@ fn t11_52_touch_account_full_restart_fee_seniority() {
 
     // New touch pattern: accrue market, then touch_account_live_local + finalize
     {
-        let mut ctx = InstructionContext::new_with_admission(0, 0);
+        let mut ctx = InstructionContext::new_with_admission(0, 100);
         engine.accrue_market_to(100, 100, 0).unwrap();
         engine.current_slot = 100;
         engine.touch_account_live_local(idx as usize, &mut ctx).unwrap();
@@ -603,7 +603,7 @@ fn t11_54_worked_example_regression() {
     engine.last_crank_slot = 1;
 
     let size_q = (2 * POS_SCALE) as i128;
-    let r1 = engine.execute_trade_not_atomic(a, b, 100, 1, size_q, 100, 0i128, 0, 0);
+    let r1 = engine.execute_trade_not_atomic(a, b, 100, 1, size_q, 100, 0i128, 0, 100);
     assert!(r1.is_ok());
     assert!(engine.oi_eff_long_q == engine.oi_eff_short_q);
 
@@ -617,7 +617,7 @@ fn t11_54_worked_example_regression() {
     assert!(engine.oi_eff_long_q == POS_SCALE);
     assert!(engine.adl_coeff_long != 0i128);
 
-    let _ = { let mut _ctx = InstructionContext::new_with_admission(0, 0); engine.settle_side_effects_live(a as usize, &mut _ctx) };
+    let _ = { let mut _ctx = InstructionContext::new_with_admission(0, 100); engine.settle_side_effects_live(a as usize, &mut _ctx) };
 
     assert!(engine.accounts[a as usize].adl_k_snap == engine.adl_coeff_long);
     assert!(engine.check_conservation());
@@ -650,10 +650,10 @@ fn t5_24_dynamic_dust_bound_sufficient() {
     engine.adl_mult_long = 1;
     engine.adl_coeff_long = 0i128;
 
-    let _ = { let mut _ctx = InstructionContext::new_with_admission(0, 0); engine.settle_side_effects_live(a as usize, &mut _ctx) };
+    let _ = { let mut _ctx = InstructionContext::new_with_admission(0, 100); engine.settle_side_effects_live(a as usize, &mut _ctx) };
     assert!(engine.phantom_dust_bound_long_q == 1u128);
 
-    let _ = { let mut _ctx = InstructionContext::new_with_admission(0, 0); engine.settle_side_effects_live(b as usize, &mut _ctx) };
+    let _ = { let mut _ctx = InstructionContext::new_with_admission(0, 100); engine.settle_side_effects_live(b as usize, &mut _ctx) };
     assert!(engine.phantom_dust_bound_long_q == 2u128);
 }
 
@@ -877,7 +877,7 @@ fn t12_53_adl_truncation_dust_must_not_deadlock() {
     assert!(engine.oi_eff_short_q == 9 * POS_SCALE);
 
     // Settle account a to get actual effective position under new A
-    let settle_a = { let mut _ctx = InstructionContext::new_with_admission(0, 0); engine.settle_side_effects_live(a as usize, &mut _ctx) };
+    let settle_a = { let mut _ctx = InstructionContext::new_with_admission(0, 100); engine.settle_side_effects_live(a as usize, &mut _ctx) };
     assert!(settle_a.is_ok());
 
     // eff_a = floor(10_000_000 * 6 / 7) = 8_571_428 (< 9_000_000)
@@ -967,7 +967,7 @@ fn t14_62_dust_bound_same_epoch_zeroing() {
 
     let dust_before = engine.phantom_dust_bound_long_q;
 
-    let result = { let mut _ctx = InstructionContext::new_with_admission(0, 0); engine.settle_side_effects_live(idx as usize, &mut _ctx) };
+    let result = { let mut _ctx = InstructionContext::new_with_admission(0, 100); engine.settle_side_effects_live(idx as usize, &mut _ctx) };
     assert!(result.is_ok());
 
     // Position must be zeroed
@@ -1084,9 +1084,9 @@ fn t14_65_dust_bound_end_to_end_clearance() {
     assert!(engine.phantom_dust_bound_long_q != 0);
 
     // Settle long accounts to get actual effective positions under new A
-    let sa = { let mut _ctx = InstructionContext::new_with_admission(0, 0); engine.settle_side_effects_live(a_idx as usize, &mut _ctx) };
+    let sa = { let mut _ctx = InstructionContext::new_with_admission(0, 100); engine.settle_side_effects_live(a_idx as usize, &mut _ctx) };
     assert!(sa.is_ok());
-    let sb = { let mut _ctx = InstructionContext::new_with_admission(0, 0); engine.settle_side_effects_live(b_idx as usize, &mut _ctx) };
+    let sb = { let mut _ctx = InstructionContext::new_with_admission(0, 100); engine.settle_side_effects_live(b_idx as usize, &mut _ctx) };
     assert!(sb.is_ok());
 
     // Compute sum of actual effective positions
@@ -1136,7 +1136,7 @@ fn proof_fee_shortfall_routes_to_fee_credits() {
 
     // Open a position: a goes long, b goes short
     let size = POS_SCALE as i128;
-    let result = engine.execute_trade_not_atomic(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size, DEFAULT_ORACLE, 0i128, 0, 0);
+    let result = engine.execute_trade_not_atomic(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size, DEFAULT_ORACLE, 0i128, 0, 100);
     assert!(result.is_ok());
 
     // Zero a's capital so the fee can't be paid from principal.
@@ -1152,7 +1152,7 @@ fn proof_fee_shortfall_routes_to_fee_credits() {
     // Close position: a sells back (trade fee will be charged).
     // Capital is 0, so the entire fee must be shortfall → fee_credits.
     let pos_size = POS_SCALE as i128;
-    let result2 = engine.execute_trade_not_atomic(b, a, DEFAULT_ORACLE, DEFAULT_SLOT, pos_size, DEFAULT_ORACLE, 0i128, 0, 0);
+    let result2 = engine.execute_trade_not_atomic(b, a, DEFAULT_ORACLE, DEFAULT_SLOT, pos_size, DEFAULT_ORACLE, 0i128, 0, 100);
 
     match result2 {
         Ok(()) => {
@@ -1182,7 +1182,7 @@ fn proof_organic_close_bankruptcy_guard() {
     engine.deposit_not_atomic(b, 10_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
     let size = (90 * POS_SCALE) as i128;
-    let result = engine.execute_trade_not_atomic(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size, DEFAULT_ORACLE, 0i128, 0, 0);
+    let result = engine.execute_trade_not_atomic(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size, DEFAULT_ORACLE, 0i128, 0, 100);
     assert!(result.is_ok());
 
     let crash_price = 800u64;
@@ -1190,7 +1190,7 @@ fn proof_organic_close_bankruptcy_guard() {
     engine.last_crank_slot = crash_slot;
 
     let pos_size = (90 * POS_SCALE) as i128;
-    let result2 = engine.execute_trade_not_atomic(b, a, crash_price, crash_slot, pos_size, crash_price, 0i128, 0, 0);
+    let result2 = engine.execute_trade_not_atomic(b, a, crash_price, crash_slot, pos_size, crash_price, 0i128, 0, 100);
 
     assert!(result2.is_err(),
         "organic close that leaves uncovered negative PnL must be rejected");
@@ -1212,7 +1212,7 @@ fn proof_solvent_flat_close_succeeds() {
 
     // Open a small position
     let size = POS_SCALE as i128;
-    let result = engine.execute_trade_not_atomic(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size, DEFAULT_ORACLE, 0i128, 0, 0);
+    let result = engine.execute_trade_not_atomic(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size, DEFAULT_ORACLE, 0i128, 0, 100);
     assert!(result.is_ok());
 
     // Price drops modestly — a has losses but plenty of capital to cover
@@ -1222,7 +1222,7 @@ fn proof_solvent_flat_close_succeeds() {
 
     // Close to flat: a sells their long position
     let pos_size = POS_SCALE as i128;
-    let result2 = engine.execute_trade_not_atomic(b, a, new_price, slot2, pos_size, new_price, 0i128, 0, 0);
+    let result2 = engine.execute_trade_not_atomic(b, a, new_price, slot2, pos_size, new_price, 0i128, 0, 100);
 
     assert!(result2.is_ok(),
         "solvent trader closing to flat must not be rejected");
@@ -1276,15 +1276,15 @@ fn proof_property_51_withdrawal_dust_guard() {
 
     let a = engine.add_user(0).unwrap();
     engine.deposit_not_atomic(a, 5000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
-    engine.keeper_crank_not_atomic(DEFAULT_SLOT, DEFAULT_ORACLE, &[], 0, 0i128, 0, 0).unwrap();
+    engine.keeper_crank_not_atomic(DEFAULT_SLOT, DEFAULT_ORACLE, &[], 0, 0i128, 0, 100).unwrap();
 
     // Withdraw leaving exactly 500 (< MIN_INITIAL_DEPOSIT=1000) → must fail
-    let result = engine.withdraw_not_atomic(a, 4500, DEFAULT_ORACLE, DEFAULT_SLOT, 0i128, 0, 0);
+    let result = engine.withdraw_not_atomic(a, 4500, DEFAULT_ORACLE, DEFAULT_SLOT, 0i128, 0, 100);
     assert!(result.is_err(),
         "withdrawal leaving dust capital (500 < 1000) must be rejected");
 
     // Withdraw leaving exactly 0 → must succeed
-    let result_zero = engine.withdraw_not_atomic(a, 5000, DEFAULT_ORACLE, DEFAULT_SLOT, 0i128, 0, 0);
+    let result_zero = engine.withdraw_not_atomic(a, 5000, DEFAULT_ORACLE, DEFAULT_SLOT, 0i128, 0, 100);
     assert!(result_zero.is_ok(),
         "withdrawal leaving zero capital must succeed");
 
@@ -1307,32 +1307,32 @@ fn proof_property_31_missing_account_safety() {
     // Add one real user for counterparty testing
     let real = engine.add_user(0).unwrap();
     engine.deposit_not_atomic(real, 100_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
-    engine.keeper_crank_not_atomic(DEFAULT_SLOT, DEFAULT_ORACLE, &[], 0, 0i128, 0, 0).unwrap();
+    engine.keeper_crank_not_atomic(DEFAULT_SLOT, DEFAULT_ORACLE, &[], 0, 0i128, 0, 100).unwrap();
 
     // Pick an index that was never add_user'd — it's missing
     let missing: u16 = 3; // MAX_ACCOUNTS=4 in kani, index 3 never materialized
     assert!(!engine.is_used(missing as usize), "account must be unmaterialized");
 
     // settle_account_not_atomic must reject missing account
-    let settle_result = engine.settle_account_not_atomic(missing, DEFAULT_ORACLE, DEFAULT_SLOT, 0i128, 0, 0);
+    let settle_result = engine.settle_account_not_atomic(missing, DEFAULT_ORACLE, DEFAULT_SLOT, 0i128, 0, 100);
     assert!(settle_result.is_err(), "settle_account_not_atomic must reject missing account");
 
     // withdraw_not_atomic must reject missing account
-    let withdraw_result = engine.withdraw_not_atomic(missing, 100, DEFAULT_ORACLE, DEFAULT_SLOT, 0i128, 0, 0);
+    let withdraw_result = engine.withdraw_not_atomic(missing, 100, DEFAULT_ORACLE, DEFAULT_SLOT, 0i128, 0, 100);
     assert!(withdraw_result.is_err(), "withdraw_not_atomic must reject missing account");
 
     // execute_trade_not_atomic with missing account as party a
     let trade_result = engine.execute_trade_not_atomic(missing, real, DEFAULT_ORACLE, DEFAULT_SLOT,
-        POS_SCALE as i128, DEFAULT_ORACLE, 0i128, 0, 0);
+        POS_SCALE as i128, DEFAULT_ORACLE, 0i128, 0, 100);
     assert!(trade_result.is_err(), "execute_trade_not_atomic must reject missing account (party a)");
 
     // execute_trade_not_atomic with missing account as party b
     let trade_result_b = engine.execute_trade_not_atomic(real, missing, DEFAULT_ORACLE, DEFAULT_SLOT,
-        POS_SCALE as i128, DEFAULT_ORACLE, 0i128, 0, 0);
+        POS_SCALE as i128, DEFAULT_ORACLE, 0i128, 0, 100);
     assert!(trade_result_b.is_err(), "execute_trade_not_atomic must reject missing account (party b)");
 
     // liquidate_at_oracle_not_atomic on missing account — returns Ok(false) (no-op)
-    let liq_result = engine.liquidate_at_oracle_not_atomic(missing, DEFAULT_SLOT, DEFAULT_ORACLE, LiquidationPolicy::FullClose, 0i128, 0, 0);
+    let liq_result = engine.liquidate_at_oracle_not_atomic(missing, DEFAULT_SLOT, DEFAULT_ORACLE, LiquidationPolicy::FullClose, 0i128, 0, 100);
     assert!(liq_result.is_ok(), "liquidate must not error on missing");
     assert!(!liq_result.unwrap(), "liquidate must return false (no-op) for missing account");
 
@@ -1407,20 +1407,20 @@ fn proof_property_49_profit_conversion_reserve_preservation() {
 
     engine.deposit_not_atomic(a, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
     engine.deposit_not_atomic(b, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
-    engine.keeper_crank_not_atomic(DEFAULT_SLOT, DEFAULT_ORACLE, &[], 0, 0i128, 0, 0).unwrap();
+    engine.keeper_crank_not_atomic(DEFAULT_SLOT, DEFAULT_ORACLE, &[], 0, 0i128, 0, 100).unwrap();
 
     // Open positions
     let size_q = (100 * POS_SCALE) as i128;
-    engine.execute_trade_not_atomic(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size_q, DEFAULT_ORACLE, 0i128, 0, 0).unwrap();
+    engine.execute_trade_not_atomic(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size_q, DEFAULT_ORACLE, 0i128, 0, 100).unwrap();
 
     // Oracle up — a gets profit
     let high_oracle = 1_100u64;
     let slot2 = DEFAULT_SLOT + 1;
-    engine.keeper_crank_not_atomic(slot2, high_oracle, &[(a, None), (b, None)], 64, 0i128, 0, 0).unwrap();
+    engine.keeper_crank_not_atomic(slot2, high_oracle, &[(a, None), (b, None)], 64, 0i128, 0, 100).unwrap();
 
     // Wait for warmup to partially release
     let slot3 = slot2 + 60; // 60 of 100 slots
-    engine.keeper_crank_not_atomic(slot3, high_oracle, &[(a, None)], 64, 0i128, 0, 0).unwrap();
+    engine.keeper_crank_not_atomic(slot3, high_oracle, &[(a, None)], 64, 0i128, 0, 100).unwrap();
 
     let released = engine.released_pos(a as usize);
     if released == 0 {
@@ -1465,20 +1465,20 @@ fn proof_property_50_flat_only_auto_conversion() {
 
     engine.deposit_not_atomic(a, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
     engine.deposit_not_atomic(b, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
-    engine.keeper_crank_not_atomic(DEFAULT_SLOT, DEFAULT_ORACLE, &[], 0, 0i128, 0, 0).unwrap();
+    engine.keeper_crank_not_atomic(DEFAULT_SLOT, DEFAULT_ORACLE, &[], 0, 0i128, 0, 100).unwrap();
 
     // Open positions
     let size_q = (100 * POS_SCALE) as i128;
-    engine.execute_trade_not_atomic(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size_q, DEFAULT_ORACLE, 0i128, 0, 0).unwrap();
+    engine.execute_trade_not_atomic(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size_q, DEFAULT_ORACLE, 0i128, 0, 100).unwrap();
 
     // Oracle up, then wait for full warmup
     let high_oracle = 1_100u64;
     let slot2 = DEFAULT_SLOT + 1;
-    engine.keeper_crank_not_atomic(slot2, high_oracle, &[(a, None), (b, None)], 64, 0i128, 0, 0).unwrap();
+    engine.keeper_crank_not_atomic(slot2, high_oracle, &[(a, None), (b, None)], 64, 0i128, 0, 100).unwrap();
 
     // Full warmup elapsed
     let slot3 = slot2 + 200; // well past warmup period
-    engine.keeper_crank_not_atomic(slot3, high_oracle, &[(a, None)], 64, 0i128, 0, 0).unwrap();
+    engine.keeper_crank_not_atomic(slot3, high_oracle, &[(a, None)], 64, 0i128, 0, 100).unwrap();
 
     // a still has position, so should have released profit but NOT auto-converted
     assert!(engine.accounts[a as usize].position_basis_q != 0,
@@ -1516,20 +1516,20 @@ fn proof_property_52_convert_released_pnl_instruction() {
 
     engine.deposit_not_atomic(a, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
     engine.deposit_not_atomic(b, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
-    engine.keeper_crank_not_atomic(DEFAULT_SLOT, DEFAULT_ORACLE, &[], 0, 0i128, 0, 0).unwrap();
+    engine.keeper_crank_not_atomic(DEFAULT_SLOT, DEFAULT_ORACLE, &[], 0, 0i128, 0, 100).unwrap();
 
     // Open positions
     let size_q = (100 * POS_SCALE) as i128;
-    engine.execute_trade_not_atomic(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size_q, DEFAULT_ORACLE, 0i128, 0, 0).unwrap();
+    engine.execute_trade_not_atomic(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size_q, DEFAULT_ORACLE, 0i128, 0, 100).unwrap();
 
     // Oracle up
     let high_oracle = 1_200u64;
     let slot2 = DEFAULT_SLOT + 1;
-    engine.keeper_crank_not_atomic(slot2, high_oracle, &[(a, None), (b, None)], 64, 0i128, 0, 0).unwrap();
+    engine.keeper_crank_not_atomic(slot2, high_oracle, &[(a, None), (b, None)], 64, 0i128, 0, 100).unwrap();
 
     // Wait for warmup to fully release
     let slot3 = slot2 + 200;
-    engine.keeper_crank_not_atomic(slot3, high_oracle, &[(a, None)], 64, 0i128, 0, 0).unwrap();
+    engine.keeper_crank_not_atomic(slot3, high_oracle, &[(a, None)], 64, 0i128, 0, 100).unwrap();
 
     // Check released amount
     let released_before = engine.released_pos(a as usize);
@@ -1543,7 +1543,7 @@ fn proof_property_52_convert_released_pnl_instruction() {
     let pmpt_before = engine.pnl_matured_pos_tot;
 
     // Convert all released profit
-    let result = engine.convert_released_pnl_not_atomic(a, released_before, high_oracle, slot3, 0i128, 0, 0);
+    let result = engine.convert_released_pnl_not_atomic(a, released_before, high_oracle, slot3, 0i128, 0, 100);
     assert!(result.is_ok(), "convert_released_pnl_not_atomic must succeed for healthy account");
 
     // R_i must be unchanged

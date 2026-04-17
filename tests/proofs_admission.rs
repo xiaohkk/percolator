@@ -435,3 +435,20 @@ fn in1_no_live_immediate_release() {
     assert!(engine.accounts[idx].pnl == pnl_before);
     assert!(engine.pnl_pos_tot == pnl_pos_before);
 }
+
+// ============================================================================
+// K-9: validate_admission_pair rejects admit_h_max == 0 (Bug 9)
+// Prevents wrapper bypass of admission by passing (0, 0).
+// ============================================================================
+
+#[kani::proof]
+#[kani::unwind(4)]
+#[kani::solver(cadical)]
+fn k9_admission_pair_rejects_zero_max() {
+    let engine = RiskEngine::new(zero_fee_params());
+    let admit_h_min: u8 = kani::any();
+    let admit_h_max = 0u64;
+    let r = RiskEngine::validate_admission_pair(
+        admit_h_min as u64, admit_h_max, &engine.params);
+    assert!(r.is_err());
+}

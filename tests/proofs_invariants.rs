@@ -191,7 +191,7 @@ fn inductive_withdraw_preserves_accounting() {
     // Symbolic withdrawal amount
     let w: u32 = kani::any();
     kani::assume(w >= 1 && w <= 100_000);
-    let result = engine.withdraw_not_atomic(idx, w as u128, DEFAULT_ORACLE, DEFAULT_SLOT, 0i128, 0, 0);
+    let result = engine.withdraw_not_atomic(idx, w as u128, DEFAULT_ORACLE, DEFAULT_SLOT, 0i128, 0, 100);
     kani::cover!(result.is_ok(), "withdraw Ok path reachable");
     if result.is_ok() {
         assert!(engine.check_conservation());
@@ -217,7 +217,7 @@ fn inductive_settle_loss_preserves_accounting() {
 
     // touch_account_live_local settles losses from principal (step 9)
     {
-        let mut ctx = InstructionContext::new_with_admission(0, 0);
+        let mut ctx = InstructionContext::new_with_admission(0, 100);
         engine.accrue_market_to(DEFAULT_SLOT, DEFAULT_ORACLE, 0).unwrap();
         engine.current_slot = DEFAULT_SLOT;
         let _ = engine.touch_account_live_local(idx as usize, &mut ctx);
@@ -494,7 +494,7 @@ fn proof_side_mode_gating() {
     engine.side_mode_long = SideMode::DrainOnly;
 
     let size_q = POS_SCALE as i128;
-    let result = engine.execute_trade_not_atomic(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size_q, DEFAULT_ORACLE, 0i128, 0, 0);
+    let result = engine.execute_trade_not_atomic(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size_q, DEFAULT_ORACLE, 0i128, 0, 100);
     assert!(result == Err(RiskError::SideBlocked));
 
     engine.side_mode_long = SideMode::Normal;
@@ -502,7 +502,7 @@ fn proof_side_mode_gating() {
     engine.stale_account_count_short = 1;
 
     let pos_size = POS_SCALE as i128;
-    let result2 = engine.execute_trade_not_atomic(b, a, DEFAULT_ORACLE, DEFAULT_SLOT, pos_size, DEFAULT_ORACLE, 0i128, 0, 0);
+    let result2 = engine.execute_trade_not_atomic(b, a, DEFAULT_ORACLE, DEFAULT_SLOT, pos_size, DEFAULT_ORACLE, 0i128, 0, 100);
     assert!(result2 == Err(RiskError::SideBlocked));
 }
 
