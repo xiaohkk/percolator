@@ -1973,15 +1973,36 @@ impl RiskEngine {
         loss - pay
     }
 
-    /// absorb_protocol_loss (spec §4.11): use_insurance_buffer then record
-    /// any remaining uninsured loss as implicit haircut.
+    /// record_uninsured_protocol_loss (spec §4.17): after insurance drain,
+    /// any remaining uninsured loss is "represented through Residual and
+    /// junior haircuts". Implement by reducing V by the uninsured amount
+    /// (capped so V >= C_tot + I is preserved). This makes Residual shrink,
+    /// triggering h haircut when matured > Residual.
+    fn record_uninsured_protocol_loss(&mut self, loss: u128) {
+        if loss == 0 { return; }
+        let senior = self.c_tot.get().saturating_add(self.insurance_fund.balance.get());
+        let v = self.vault.get();
+        // Only drain from the Residual portion (V - senior). Cannot reduce V
+        // below senior (would violate conservation).
+        let residual = v.saturating_sub(senior);
+        let drain = core::cmp::min(loss, residual);
+        if drain > 0 {
+            self.vault = U128::new(v - drain);
+        }
+        // Any remaining loss beyond Residual is system-level insolvency — the
+        // engine stays consistent (V >= C_tot + I still holds) but matured
+        // holders will see h < 1 on subsequent operations.
+    }
+
+    /// absorb_protocol_loss (spec §4.17): use_insurance_buffer then
+    /// record_uninsured_protocol_loss for any remainder.
     test_visible! {
     fn absorb_protocol_loss(&mut self, loss: u128) {
         if loss == 0 {
             return;
         }
-        let _rem = self.use_insurance_buffer(loss);
-        // Remaining loss is implicit haircut through h
+        let rem = self.use_insurance_buffer(loss);
+        self.record_uninsured_protocol_loss(rem);
     }
     }
 
@@ -2008,7 +2029,9 @@ impl RiskEngine {
 
         // Step 4 (§5.6 step 4): if OI == 0
         if oi == 0 {
-            // D_rem > 0 → record_uninsured_protocol_loss (implicit through h, no-op)
+            if d_rem > 0 {
+                self.record_uninsured_protocol_loss(d_rem);
+            }
             if self.get_oi_eff(liq_side) == 0 {
                 set_pending_reset(ctx, liq_side);
                 set_pending_reset(ctx, opp);
@@ -2023,7 +2046,9 @@ impl RiskEngine {
                 return Err(RiskError::CorruptState);
             }
             let oi_post = oi.checked_sub(q_close_q).ok_or(RiskError::Overflow)?;
-            // D_rem > 0 → record_uninsured_protocol_loss (implicit through h, no-op)
+            if d_rem > 0 {
+                self.record_uninsured_protocol_loss(d_rem);
+            }
             self.set_oi_eff(opp, oi_post);
             if oi_post == 0 {
                 // Unconditionally reset the drained opp side (fixes phantom dust revert).
@@ -2059,14 +2084,14 @@ impl RiskEngine {
                             self.set_k_side(opp, new_k);
                         }
                         None => {
-                            // K-space overflow: deficit uninsurable, implicit haircut.
-                            // Liquidation must still proceed for liveness.
+                            // K-space overflow: route D_rem through record_uninsured (spec §1.7 clause 12).
+                            self.record_uninsured_protocol_loss(d_rem);
                         }
                     }
                 }
                 Err(OverI128Magnitude) => {
-                    // Quotient overflow: deficit uninsurable, implicit haircut.
-                    // Liquidation must still proceed for liveness.
+                    // Quotient overflow: route D_rem through record_uninsured (spec §1.7 clause 12).
+                    self.record_uninsured_protocol_loss(d_rem);
                 }
             }
         }
@@ -3195,7 +3220,9 @@ impl RiskEngine {
             self.materialize_at(idx, now_slot)?;
             // Route fee to insurance
             if required_fee > 0 {
-                self.insurance_fund.balance = self.insurance_fund.balance + required_fee;
+                self.insurance_fund.balance = U128::new(
+                    self.insurance_fund.balance.get().checked_add(required_fee)
+                        .ok_or(RiskError::Overflow)?);
                 capital_amount = amount - required_fee; // safe: amount >= total_needed > required_fee
             }
         }
