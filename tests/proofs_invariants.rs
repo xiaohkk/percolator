@@ -474,22 +474,39 @@ fn proof_absorb_protocol_loss_respects_floor() {
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
 fn proof_set_position_basis_q_count_tracking() {
+    // Substantive: symbolic basis transitions test count tracking across
+    // sign changes, zero transitions, and magnitude changes.
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap();
+    let idx = engine.add_user(0).unwrap() as usize;
 
+    let b1: i8 = kani::any();
+    let b2: i8 = kani::any();
+    kani::assume(b1 != 0);
+    kani::assume(b2 != 0);
+
+    engine.set_position_basis_q(idx, b1 as i128);
+    // Counts reflect b1's sign
+    if b1 > 0 {
+        assert!(engine.stored_pos_count_long == 1);
+        assert!(engine.stored_pos_count_short == 0);
+    } else {
+        assert!(engine.stored_pos_count_long == 0);
+        assert!(engine.stored_pos_count_short == 1);
+    }
+
+    engine.set_position_basis_q(idx, b2 as i128);
+    // Counts reflect b2's sign (single account, so one side is 1)
+    if b2 > 0 {
+        assert!(engine.stored_pos_count_long == 1);
+        assert!(engine.stored_pos_count_short == 0);
+    } else {
+        assert!(engine.stored_pos_count_long == 0);
+        assert!(engine.stored_pos_count_short == 1);
+    }
+
+    engine.set_position_basis_q(idx, 0i128);
     assert!(engine.stored_pos_count_long == 0);
-
-    engine.set_position_basis_q(idx as usize, POS_SCALE as i128);
-    assert!(engine.stored_pos_count_long == 1);
-
-    let neg = -(POS_SCALE as i128);
-    engine.set_position_basis_q(idx as usize, neg);
-    assert!(engine.stored_pos_count_long == 0);
-    assert!(engine.stored_pos_count_short == 1);
-
-    engine.set_position_basis_q(idx as usize, 0i128);
     assert!(engine.stored_pos_count_short == 0);
-    assert!(engine.stored_pos_count_long == 0);
 }
 
 #[kani::proof]
