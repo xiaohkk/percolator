@@ -125,6 +125,27 @@ pub fn zero_fee_params() -> RiskParams {
     }
 }
 
+/// Test helper: set PnL to any value, Live-mode compatible.
+///
+/// `RiskEngine::set_pnl` uses `ImmediateReleaseResolvedOnly` and errs for positive
+/// increases in Live mode. This helper picks the right mode: UseAdmissionPair in
+/// Live (routes positive PnL via admission), ImmediateRelease otherwise.
+pub fn set_pnl_test(engine: &mut RiskEngine, idx: usize, new_pnl: i128) -> Result<()> {
+    if new_pnl == i128::MIN {
+        return engine.set_pnl(idx, new_pnl); // preserve i128::MIN rejection semantics
+    }
+    let old_pnl = engine.accounts[idx].pnl;
+    let old_pos: u128 = if old_pnl > 0 { old_pnl as u128 } else { 0 };
+    let new_pos: u128 = if new_pnl > 0 { new_pnl as u128 } else { 0 };
+    let h_max = engine.params.h_max;
+    if new_pos > old_pos && engine.market_mode == MarketMode::Live {
+        let mut ctx = InstructionContext::new_with_admission(0, h_max);
+        engine.set_pnl_with_reserve(idx, new_pnl, ReserveMode::UseAdmissionPair(0, h_max), Some(&mut ctx))
+    } else {
+        engine.set_pnl(idx, new_pnl)
+    }
+}
+
 pub fn default_params() -> RiskParams {
     RiskParams {
         maintenance_margin_bps: 500,

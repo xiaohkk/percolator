@@ -320,9 +320,10 @@ fn proof_liquidate_missing_account_no_market_mutation() {
     let slot_before = engine.current_slot;
     let oracle_before = engine.last_oracle_price;
 
-    // Call liquidate on an unused slot
+    // Call liquidate on an unused slot — spec §9.6 step 2 requires materialized account,
+    // public entrypoint returns Err(AccountNotFound) before any market-state mutation.
     let result = engine.liquidate_at_oracle_not_atomic(0, DEFAULT_SLOT, DEFAULT_ORACLE, LiquidationPolicy::FullClose, 0i128, 0, 100);
-    assert!(matches!(result, Ok(false)), "must return Ok(false) for missing account");
+    assert!(matches!(result, Err(RiskError::AccountNotFound)), "must return Err(AccountNotFound) for missing account");
 
     // Market state must not have been mutated
     assert!(engine.current_slot == slot_before, "current_slot must not change");
@@ -654,8 +655,9 @@ fn proof_withdraw_no_crank_gate() {
     let idx = engine.add_user(0).unwrap();
     engine.deposit_not_atomic(idx, 10_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
-    // last_crank_slot is 0, now_slot is far ahead. Must still succeed.
-    let far_slot = DEFAULT_SLOT + 100_000;
+    // last_crank_slot is 0, now_slot is ahead (within max_accrual_dt_slots=1000 envelope).
+    // Must still succeed — no keeper_crank_not_atomic required.
+    let far_slot = DEFAULT_SLOT + 500;
     let result = engine.withdraw_not_atomic(idx, 1_000, DEFAULT_ORACLE, far_slot, 0i128, 0, 100);
     assert!(result.is_ok(), "withdraw_not_atomic must not require fresh crank (spec §0 goal 6)");
 }
@@ -672,8 +674,9 @@ fn proof_trade_no_crank_gate() {
     engine.deposit_not_atomic(a, 100_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
     engine.deposit_not_atomic(b, 100_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
-    // last_crank_slot is 0, now_slot is far ahead. Must still succeed.
-    let far_slot = DEFAULT_SLOT + 100_000;
+    // last_crank_slot is 0, now_slot is ahead (within max_accrual_dt_slots=1000 envelope).
+    // Must still succeed — no keeper_crank_not_atomic required.
+    let far_slot = DEFAULT_SLOT + 500;
     let size: i128 = POS_SCALE as i128;
     let result = engine.execute_trade_not_atomic(a, b, DEFAULT_ORACLE, far_slot, size, DEFAULT_ORACLE, 0i128, 0, 100);
     assert!(result.is_ok(), "trade must not require fresh crank (spec §0 goal 6)");

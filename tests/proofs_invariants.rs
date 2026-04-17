@@ -20,11 +20,11 @@ fn t0_3_set_pnl_aggregate_exact() {
 
     let old_pnl: i16 = kani::any();
     kani::assume(old_pnl > i16::MIN);
-    engine.set_pnl(idx as usize, old_pnl as i128);
+    let _ = set_pnl_test(&mut engine, idx as usize, old_pnl as i128);
 
     let new_pnl: i16 = kani::any();
     kani::assume(new_pnl > i16::MIN);
-    engine.set_pnl(idx as usize, new_pnl as i128);
+    let _ = set_pnl_test(&mut engine, idx as usize, new_pnl as i128);
 
     let expected = if new_pnl > 0 { new_pnl as u128 } else { 0u128 };
     let actual = engine.pnl_pos_tot;
@@ -52,8 +52,8 @@ fn t0_3_sat_all_sign_transitions() {
         _ => unreachable!(),
     }
 
-    engine.set_pnl(idx as usize, old as i128);
-    engine.set_pnl(idx as usize, new as i128);
+    let _ = set_pnl_test(&mut engine, idx as usize, old as i128);
+    let _ = set_pnl_test(&mut engine, idx as usize, new as i128);
 
     let expected = if new > 0 { new as u128 } else { 0u128 };
     let actual = engine.pnl_pos_tot;
@@ -154,11 +154,11 @@ fn inductive_set_pnl_preserves_pnl_pos_tot_delta() {
 
     let pnl_a: i32 = kani::any();
     kani::assume(pnl_a > i32::MIN);
-    engine.set_pnl(a as usize, pnl_a as i128);
+    let _ = set_pnl_test(&mut engine, a as usize, pnl_a as i128);
 
     let pnl_b: i32 = kani::any();
     kani::assume(pnl_b > i32::MIN);
-    engine.set_pnl(b as usize, pnl_b as i128);
+    let _ = set_pnl_test(&mut engine, b as usize, pnl_b as i128);
 
     let pos_a: u128 = if pnl_a > 0 { pnl_a as u128 } else { 0 };
     let pos_b: u128 = if pnl_b > 0 { pnl_b as u128 } else { 0 };
@@ -241,11 +241,11 @@ fn prop_pnl_pos_tot_agrees_with_recompute() {
 
     let pnl_a: i32 = kani::any();
     kani::assume(pnl_a > i32::MIN);
-    engine.set_pnl(a as usize, pnl_a as i128);
+    let _ = set_pnl_test(&mut engine, a as usize, pnl_a as i128);
 
     let pnl_b: i32 = kani::any();
     kani::assume(pnl_b > i32::MIN);
-    engine.set_pnl(b as usize, pnl_b as i128);
+    let _ = set_pnl_test(&mut engine, b as usize, pnl_b as i128);
 
     let pos_a: u128 = if pnl_a > 0 { pnl_a as u128 } else { 0 };
     let pos_b: u128 = if pnl_b > 0 { pnl_b as u128 } else { 0 };
@@ -299,7 +299,8 @@ fn prop_conservation_holds_after_all_ops() {
 fn proof_set_pnl_rejects_i128_min() {
     let mut engine = RiskEngine::new(zero_fee_params());
     let idx = engine.add_user(0).unwrap();
-    engine.set_pnl(idx as usize, i128::MIN);
+    // set_pnl returns Err for i128::MIN; unwrap to trigger the expected panic.
+    engine.set_pnl(idx as usize, i128::MIN).unwrap();
 }
 
 #[kani::proof]
@@ -311,14 +312,14 @@ fn proof_set_pnl_maintains_pnl_pos_tot() {
 
     let pnl1: i32 = kani::any();
     kani::assume(pnl1 > i32::MIN);
-    engine.set_pnl(idx as usize, pnl1 as i128);
+    let _ = set_pnl_test(&mut engine, idx as usize, pnl1 as i128);
 
     let expected1 = if pnl1 > 0 { pnl1 as u128 } else { 0u128 };
     assert!(engine.pnl_pos_tot == expected1);
 
     let pnl2: i32 = kani::any();
     kani::assume(pnl2 > i32::MIN);
-    engine.set_pnl(idx as usize, pnl2 as i128);
+    let _ = set_pnl_test(&mut engine, idx as usize, pnl2 as i128);
 
     let expected2 = if pnl2 > 0 { pnl2 as u128 } else { 0u128 };
     assert!(engine.pnl_pos_tot == expected2);
@@ -357,25 +358,23 @@ fn proof_set_pnl_clamps_reserved_pnl() {
     let mut engine = RiskEngine::new(zero_fee_params());
     let idx = engine.add_user(0).unwrap();
 
-    // set_pnl routes through ImmediateRelease: positive increase goes to matured,
-    // not to reserve. So reserved_pnl stays 0 after set_pnl.
-    engine.set_pnl(idx as usize, 5000i128);
-    assert!(engine.accounts[idx as usize].reserved_pnl == 0u128,
-        "ImmediateRelease: positive PnL goes to matured, not reserve");
-
-    // Use UseHLock to test reserve clamping
-    engine.set_pnl_with_reserve(idx as usize, 0i128, ReserveMode::ImmediateReleaseResolvedOnly, None).unwrap();
-    engine.set_pnl_with_reserve(idx as usize, 5000i128, ReserveMode::UseAdmissionPair(10, 10), None).unwrap();
+    // Market defaults to Live; set_pnl uses ImmediateReleaseResolvedOnly and errs
+    // in Live mode. Use UseAdmissionPair for positive increases (Live-compatible).
+    let mut ctx = InstructionContext::new_with_admission(10, 10);
+    engine.set_pnl_with_reserve(idx as usize, 5000i128, ReserveMode::UseAdmissionPair(10, 10), Some(&mut ctx)).unwrap();
     assert!(engine.accounts[idx as usize].reserved_pnl == 5000u128,
-        "UseHLock: positive PnL goes to reserve");
+        "UseAdmissionPair: positive PnL goes to reserve");
 
-    // Decrease PNL: reserve loss applied via newest-first
-    engine.set_pnl(idx as usize, 3000i128);
-    assert!(engine.accounts[idx as usize].reserved_pnl <= 3000u128);
+    // Decrease PnL via UseAdmissionPair (no positive increase → ctx path not used).
+    // Reserve loss applied via newest-first.
+    engine.set_pnl_with_reserve(idx as usize, 3000i128, ReserveMode::UseAdmissionPair(10, 10), Some(&mut ctx)).unwrap();
+    assert!(engine.accounts[idx as usize].reserved_pnl <= 3000u128,
+        "reserved_pnl must be clamped by new positive PnL");
 
-    // Decrease PNL to -100 → reserve clamped to 0
-    engine.set_pnl(idx as usize, -100i128);
-    assert!(engine.accounts[idx as usize].reserved_pnl == 0u128);
+    // Decrease PnL below zero → reserve must clamp to 0.
+    engine.set_pnl_with_reserve(idx as usize, -100i128, ReserveMode::UseAdmissionPair(10, 10), Some(&mut ctx)).unwrap();
+    assert!(engine.accounts[idx as usize].reserved_pnl == 0u128,
+        "reserved_pnl clamps to 0 when pnl goes negative");
 }
 
 #[kani::proof]

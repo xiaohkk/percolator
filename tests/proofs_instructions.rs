@@ -307,6 +307,7 @@ fn t10_38_accrue_funding_payer_driven() {
     engine.adl_mult_long = ADL_ONE;
     engine.adl_mult_short = ADL_ONE;
     engine.last_oracle_price = 100;
+    engine.fund_px_last = 100; // funding uses fund_px_last, not last_oracle_price
     engine.last_market_slot = 0;
 
     let rate: i8 = kani::any();
@@ -1139,27 +1140,28 @@ fn proof_fee_shortfall_routes_to_fee_credits() {
     let result = engine.execute_trade_not_atomic(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size, DEFAULT_ORACLE, 0i128, 0, 100);
     assert!(result.is_ok());
 
-    // Zero a's capital so the fee can't be paid from principal.
-    // Give enough PnL (as reserved, not released) to stay solvent for margin checks.
-    // Use set_pnl_with_reserve(UseHLock) so PnL goes to reserve, not matured.
+    // Zero a's capital so fee can't be paid from principal. Leave PnL at 0 so
+    // finalize's whole-only auto-conversion (consume_released_pnl → capital)
+    // cannot retroactively sweep the fee debt.
     engine.set_capital(a as usize, 0);
-    engine.set_pnl_with_reserve(a as usize, 5_000_000i128, ReserveMode::UseAdmissionPair(10, 10), None).unwrap();
-    engine.vault = U128::new(engine.vault.get() + 5_000_000);
 
-    // Record fee_credits and PnL before the close.
     let fc_before = engine.accounts[a as usize].fee_credits.get();
+    let pnl_before = engine.accounts[a as usize].pnl;
 
     // Close position: a sells back (trade fee will be charged).
-    // Capital is 0, so the entire fee must be shortfall → fee_credits.
+    // Capital is 0 and PnL is 0 → fee has no principal source → shortfall to fee_credits.
     let pos_size = POS_SCALE as i128;
     let result2 = engine.execute_trade_not_atomic(b, a, DEFAULT_ORACLE, DEFAULT_SLOT, pos_size, DEFAULT_ORACLE, 0i128, 0, 100);
 
     match result2 {
         Ok(()) => {
             let fc_after = engine.accounts[a as usize].fee_credits.get();
-            // fee_credits must have decreased (become more negative) by the shortfall
+            let pnl_after = engine.accounts[a as usize].pnl;
+            // Spec property #17: fee shortfall decreases fee_credits; never touches PNL_i.
             assert!(fc_after < fc_before,
                 "fee shortfall must decrease fee_credits (create debt)");
+            assert!(pnl_after == pnl_before,
+                "fee must not touch PNL_i (spec property #17)");
         }
         Err(_) => {
             // Trade rejected for margin or other reasons — acceptable.
@@ -1331,10 +1333,11 @@ fn proof_property_31_missing_account_safety() {
         POS_SCALE as i128, DEFAULT_ORACLE, 0i128, 0, 100);
     assert!(trade_result_b.is_err(), "execute_trade_not_atomic must reject missing account (party b)");
 
-    // liquidate_at_oracle_not_atomic on missing account — returns Ok(false) (no-op)
+    // liquidate_at_oracle_not_atomic on missing account — per spec §9.6 step 2 (Bug 4 fix),
+    // public entrypoint rejects with Err(AccountNotFound) before mutating market state.
     let liq_result = engine.liquidate_at_oracle_not_atomic(missing, DEFAULT_SLOT, DEFAULT_ORACLE, LiquidationPolicy::FullClose, 0i128, 0, 100);
-    assert!(liq_result.is_ok(), "liquidate must not error on missing");
-    assert!(!liq_result.unwrap(), "liquidate must return false (no-op) for missing account");
+    assert!(matches!(liq_result, Err(RiskError::AccountNotFound)),
+        "liquidate must reject missing account with AccountNotFound (spec §9.6 step 2)");
 
     // Verify no account was materialized
     assert!(!engine.is_used(missing as usize), "missing account must remain unmaterialized");

@@ -20,8 +20,9 @@ use common::*;
 fn proof_funding_rate_accepted_in_accrue() {
     let mut engine = RiskEngine::new(zero_fee_params());
 
+    // Bound by the configured params cap (tighter than the global const).
     let rate: i32 = kani::any();
-    kani::assume(rate.unsigned_abs() <= MAX_ABS_FUNDING_E9_PER_SLOT as u32);
+    kani::assume(rate.unsigned_abs() as u64 <= engine.params.max_abs_funding_e9_per_slot);
 
     let result = engine.accrue_market_to(0, 1, rate as i128);
     assert!(result.is_ok(), "in-bounds rate must be accepted by accrue_market_to");
@@ -62,12 +63,13 @@ fn proof_funding_sign_and_floor() {
     engine.oi_eff_long_q = POS_SCALE;
     engine.oi_eff_short_q = POS_SCALE;
     engine.last_oracle_price = DEFAULT_ORACLE;
+    engine.fund_px_last = DEFAULT_ORACLE; // funding basis (v12.16.5)
     engine.last_market_slot = 0;
 
-    // Symbolic rate (bounded, nonzero)
+    // Symbolic rate bounded by params cap (zero_fee_params: 10^8 < 10^9 const).
     let rate: i32 = kani::any();
     kani::assume(rate != 0);
-    kani::assume(rate.unsigned_abs() <= MAX_ABS_FUNDING_E9_PER_SLOT as u32);
+    kani::assume(rate.unsigned_abs() as u64 <= engine.params.max_abs_funding_e9_per_slot);
 
     let f_long_before = engine.f_long_num;
     let f_short_before = engine.f_short_num;
@@ -104,6 +106,7 @@ fn proof_funding_floor_not_truncation() {
     engine.oi_eff_long_q = POS_SCALE;
     engine.oi_eff_short_q = POS_SCALE;
     engine.last_oracle_price = DEFAULT_ORACLE;
+    engine.fund_px_last = DEFAULT_ORACLE; // funding basis (v12.16.5)
     engine.last_market_slot = 0;
 
     let f_long_before = engine.f_long_num;
@@ -228,18 +231,19 @@ fn proof_funding_substep_large_dt() {
     engine.oi_eff_long_q = POS_SCALE;
     engine.oi_eff_short_q = POS_SCALE;
     engine.last_oracle_price = DEFAULT_ORACLE;
+    engine.fund_px_last = DEFAULT_ORACLE; // funding basis (v12.16.5)
     engine.last_market_slot = 0;
 
-    // dt = MAX_FUNDING_DT + 1 → v12.16.5: one exact total delta, no substeps
-    let dt = MAX_FUNDING_DT + 1;
+    // v12.16.5: one exact total delta, no substeps. Bounded by
+    // max_accrual_dt_slots (zero_fee_params = 1000).
+    let dt = engine.params.max_accrual_dt_slots;
     let result = engine.accrue_market_to(dt, DEFAULT_ORACLE, 100);
     assert!(result.is_ok());
 
-    // fund_num_total = 1000 * 100 * 65536 = 6_553_600_000
-    // F_long -= A_long * fund_num_total = ADL_ONE * 6_553_600_000
-    // K must NOT change from funding (F-only model)
+    // fund_num_total = fund_px_last * rate * dt = 1000 * 100 * 1000
+    // F_long -= A_long * fund_num_total; K must NOT change from funding (F-only).
     assert_eq!(engine.adl_coeff_long, 0, "K_long must not change from funding");
-    let expected_f: i128 = -((ADL_ONE as i128) * 1000 * 100 * (dt as i128));
+    let expected_f: i128 = -((ADL_ONE as i128) * (DEFAULT_ORACLE as i128) * 100 * (dt as i128));
     assert_eq!(engine.f_long_num, expected_f,
         "F_long must reflect exact total funding delta");
 }
@@ -259,7 +263,8 @@ fn proof_funding_price_basis_timing() {
     engine.adl_mult_short = ADL_ONE;
     engine.oi_eff_long_q = POS_SCALE;
     engine.oi_eff_short_q = POS_SCALE;
-    engine.last_oracle_price = 500; // old price (also used as fund_px_0 in v12.16.4)
+    engine.last_oracle_price = 500; // old price for mark basis
+    engine.fund_px_last = 500;      // old price for funding basis (v12.16.5)
     engine.last_market_slot = 0;
 
     // Call with new oracle price 1500, rate = 10% in ppb
@@ -606,7 +611,7 @@ fn proof_bilateral_oi_decomposition() {
 /// Close most of the position (90%) so post-partial health check passes.
 /// Non-vacuity: explicitly assert Ok(true) is reached.
 #[kani::proof]
-#[kani::unwind(34)]
+#[kani::unwind(256)]
 #[kani::solver(cadical)]
 fn proof_partial_liquidation_remainder_nonzero() {
     let mut params = zero_fee_params();
@@ -775,9 +780,11 @@ fn proof_keeper_crank_r_last_stores_supplied_rate() {
     let idx = engine.add_user(0).unwrap();
     engine.deposit_not_atomic(idx, 1_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
-    // Symbolic supplied rate
+    // Symbolic supplied rate bounded by the engine's configured params cap
+    // (zero_fee_params sets max_abs_funding_e9_per_slot = 10^8, tighter than
+    // the global MAX_ABS_FUNDING_E9_PER_SLOT = 10^9).
     let supplied_rate: i32 = kani::any();
-    kani::assume(supplied_rate.unsigned_abs() <= MAX_ABS_FUNDING_E9_PER_SLOT as u32);
+    kani::assume(supplied_rate.unsigned_abs() as u64 <= engine.params.max_abs_funding_e9_per_slot);
 
     // v12.16.4: rate passed directly to accrue_market_to via keeper_crank_not_atomic
     let result = engine.keeper_crank_not_atomic(DEFAULT_SLOT + 1, DEFAULT_ORACLE,
