@@ -19,7 +19,7 @@ use common::*;
 #[kani::solver(cadical)]
 fn ah1_single_admission_range() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
     // Inject some vault/c_tot to make residual non-degenerate
     engine.vault = U128::new(1000);
     engine.c_tot = U128::new(500);
@@ -64,7 +64,7 @@ fn ah1_single_admission_range() {
 #[kani::solver(cadical)]
 fn ah2_sticky_is_absorbing() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
     engine.vault = U128::new(10_000); // plenty of residual — admission WOULD normally give h_min
 
     let admit_h_min: u8 = kani::any();
@@ -101,7 +101,7 @@ fn ah2_sticky_is_absorbing() {
 #[kani::solver(cadical)]
 fn ah3_no_under_admission() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
     // Start constrained: residual = 0 so first fresh triggers h_max
     engine.vault = U128::new(100);
     engine.c_tot = U128::new(100);
@@ -147,7 +147,7 @@ fn ah3_no_under_admission() {
 #[kani::solver(cadical)]
 fn ah4_hmin_zero_preserves_h_equals_one() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
 
     // Small bounded values
     let v: u16 = kani::any();
@@ -195,8 +195,8 @@ fn ah4_hmin_zero_preserves_h_equals_one() {
 #[kani::solver(cadical)]
 fn ah5_cross_account_sticky_isolation() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let a = engine.add_user(0).unwrap();
-    let b = engine.add_user(0).unwrap();
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
     // Healthy residual: admission would give h_min
     engine.vault = U128::new(10_000);
     engine.c_tot = U128::new(0);
@@ -234,7 +234,7 @@ fn ah5_cross_account_sticky_isolation() {
 #[kani::solver(cadical)]
 fn ah6_positive_hmin_floor() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
 
     let admit_h_min: u8 = kani::any();
     kani::assume(admit_h_min > 0);
@@ -265,7 +265,7 @@ fn ah6_positive_hmin_floor() {
 #[kani::solver(cadical)]
 fn ac1_acceleration_all_or_nothing() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap() as usize;
+    let idx = add_user_test(&mut engine, 0).unwrap() as usize;
 
     // Set up account with scheduled bucket
     let r: u8 = kani::any();
@@ -325,7 +325,7 @@ fn ac1_acceleration_all_or_nothing() {
 #[kani::solver(cadical)]
 fn ac2_acceleration_fires_iff_admits() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap() as usize;
+    let idx = add_user_test(&mut engine, 0).unwrap() as usize;
 
     let r: u8 = kani::any();
     engine.accounts[idx].reserved_pnl = r as u128;
@@ -373,7 +373,7 @@ fn ac2_acceleration_fires_iff_admits() {
 #[kani::solver(cadical)]
 fn ac4_acceleration_conservation() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap() as usize;
+    let idx = add_user_test(&mut engine, 0).unwrap() as usize;
 
     let r: u8 = kani::any();
     engine.accounts[idx].reserved_pnl = r as u128;
@@ -416,7 +416,7 @@ fn ac4_acceleration_conservation() {
 #[kani::solver(cadical)]
 fn in1_no_live_immediate_release() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap() as usize;
+    let idx = add_user_test(&mut engine, 0).unwrap() as usize;
     // Live mode (default on new engine)
 
     let new_pnl: u8 = kani::any();
@@ -517,8 +517,8 @@ fn k2_resolve_degenerate_bypasses_dt_cap() {
 #[kani::solver(cadical)]
 fn k71_neg_pnl_count_tracks_actual() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let _a = engine.add_user(0).unwrap();
-    let _b = engine.add_user(0).unwrap();
+    let _a = add_user_test(&mut engine, 0).unwrap();
+    let _b = add_user_test(&mut engine, 0).unwrap();
 
     // Apply arbitrary (small) pnl mutations. set_pnl uses ImmediateReleaseResolvedOnly
     // which only works for non-positive-crossing changes on Live, so restrict

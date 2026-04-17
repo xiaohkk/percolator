@@ -263,7 +263,7 @@ fn t2_14_compose_mark_adl_mark() {
 #[kani::solver(cadical)]
 fn t3_14_epoch_mismatch_forces_terminal_close() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(idx, 1_000_000, 100, 0).unwrap();
 
     let pos_mul: u8 = kani::any();
@@ -309,7 +309,7 @@ fn t3_14_epoch_mismatch_forces_terminal_close() {
 #[kani::solver(cadical)]
 fn t3_14b_epoch_mismatch_with_nonzero_k_diff() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(idx, 10_000_000, 100, 0).unwrap();
 
     let pos = POS_SCALE as i128;
@@ -514,7 +514,7 @@ fn t6_25_pure_pnl_bankruptcy_regression() {
 fn t6_26_full_drain_reset_regression() {
     let mut engine = RiskEngine::new(zero_fee_params());
 
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(idx, 1_000_000, 100, 0).unwrap();
 
     let k_snap_val: i8 = kani::any();
@@ -579,7 +579,7 @@ fn proof_property_43_k_pair_chronology_correctness() {
     // For a long, k_side > k_snap means positive PnL (price went up).
     // If arguments were swapped, PnL would flip sign.
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(idx, 1_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
     // Set up a long position with k_snap = 100

@@ -375,7 +375,6 @@ pub struct RiskParams {
     pub initial_margin_bps: u64,
     pub trading_fee_bps: u64,
     pub max_accounts: u64,
-    pub new_account_fee: U128,
     pub max_crank_staleness_slots: u64,
     pub liquidation_fee_bps: u64,
     pub liquidation_fee_cap: U128,
@@ -965,6 +964,7 @@ impl RiskEngine {
     /// materialize_account(i, slot_anchor) — spec §2.5.
     /// Materializes a missing account at a specific slot index.
     /// The slot must not be currently in use.
+    test_visible! {
     fn materialize_at(&mut self, idx: u16, _slot_anchor: u64) -> Result<()> {
         if idx as usize >= MAX_ACCOUNTS {
             return Err(RiskError::AccountNotFound);
@@ -1042,6 +1042,7 @@ impl RiskEngine {
         }
 
         Ok(())
+    }
     }
 
     // ========================================================================
@@ -3043,134 +3044,6 @@ impl RiskEngine {
     // Account Management
     // ========================================================================
 
-    /// materialize_with_fee: public account materialization (spec §10.0).
-    /// Allocates a slot, charges fee to insurance, sets initial capital from excess.
-    /// Wrapper calls this directly — no manual capital surgery needed.
-    pub fn materialize_with_fee(
-        &mut self,
-        kind: u8,
-        fee_payment: u128,
-        matcher_program: [u8; 32],
-        matcher_context: [u8; 32],
-    ) -> Result<u16> {
-        if self.market_mode != MarketMode::Live {
-            return Err(RiskError::Unauthorized);
-        }
-        // Only valid account kinds allowed
-        if kind != Account::KIND_USER && kind != Account::KIND_LP {
-            return Err(RiskError::Overflow);
-        }
-        let used_count = self.num_used_accounts as u64;
-        if used_count >= self.params.max_accounts {
-            return Err(RiskError::Overflow);
-        }
-
-        let required_fee = self.params.new_account_fee.get();
-        if fee_payment < required_fee {
-            return Err(RiskError::InsufficientBalance);
-        }
-
-        // Post-fee capital: reject dust (0 < excess < min_initial_deposit).
-        // excess == 0 is allowed (user deposits separately after materialization).
-        let excess = fee_payment.saturating_sub(required_fee);
-        if excess > 0 && excess < self.params.min_initial_deposit.get() {
-            return Err(RiskError::InsufficientBalance);
-        }
-
-        // MAX_VAULT_TVL bound
-        let v_candidate = self.vault.get().checked_add(fee_payment)
-            .ok_or(RiskError::Overflow)?;
-        if v_candidate > MAX_VAULT_TVL {
-            return Err(RiskError::Overflow);
-        }
-
-        // Pre-validate c_tot += excess to preserve validate-then-mutate contract (Bug 92).
-        // Bounded by v_candidate <= MAX_VAULT_TVL but we still check explicitly.
-        if excess > 0 {
-            self.c_tot.get().checked_add(excess).ok_or(RiskError::Overflow)?;
-        }
-        // Pre-validate insurance += required_fee (bounded by v_candidate but explicit check)
-        if required_fee > 0 {
-            self.insurance_fund.balance.get().checked_add(required_fee)
-                .ok_or(RiskError::Overflow)?;
-        }
-
-        // Enforce materialized_account_count bound (spec §10.0)
-        self.materialized_account_count = self.materialized_account_count
-            .checked_add(1).ok_or(RiskError::Overflow)?;
-        if self.materialized_account_count > MAX_MATERIALIZED_ACCOUNTS {
-            self.materialized_account_count -= 1;
-            return Err(RiskError::Overflow);
-        }
-
-        let idx = match self.alloc_slot() {
-            Ok(i) => i,
-            Err(e) => {
-                self.materialized_account_count -= 1;
-                return Err(e);
-            }
-        };
-
-        // Commit vault/insurance only after all checks pass
-        let excess = fee_payment.saturating_sub(required_fee);
-        self.vault = U128::new(v_candidate);
-        self.insurance_fund.balance = self.insurance_fund.balance + required_fee;
-
-        // Field-by-field init to avoid ~4KB Account temporary on SBF stack.
-        {
-            let a = &mut self.accounts[idx as usize];
-            a.kind = kind;
-            a.capital = U128::new(excess);
-            a.pnl = 0i128;
-            a.reserved_pnl = 0u128;
-            a.position_basis_q = 0i128;
-            a.adl_a_basis = ADL_ONE;
-            a.adl_k_snap = 0i128;
-            a.f_snap = 0i128;
-            a.adl_epoch_snap = 0;
-            a.matcher_program = matcher_program;
-            a.matcher_context = matcher_context;
-            a.owner = [0; 32];
-            a.fee_credits = I128::ZERO;
-            a.sched_present = 0;
-            a.sched_remaining_q = 0;
-            a.sched_anchor_q = 0;
-            a.sched_start_slot = 0;
-            a.sched_horizon = 0;
-            a.sched_release_q = 0;
-            a.pending_present = 0;
-            a.pending_remaining_q = 0;
-            a.pending_horizon = 0;
-            a.pending_created_slot = 0;
-        }
-
-        if excess > 0 {
-            self.c_tot = U128::new(self.c_tot.get().checked_add(excess)
-                .ok_or(RiskError::Overflow)?);
-        }
-
-        Ok(idx)
-    }
-
-    /// Convenience: materialize a user account.
-    test_visible! {
-    fn add_user(&mut self, fee_payment: u128) -> Result<u16> {
-        self.materialize_with_fee(Account::KIND_USER, fee_payment, [0; 32], [0; 32])
-    }
-    }
-
-    /// Convenience: materialize an LP account with matcher bindings.
-    test_visible! {
-    fn add_lp(
-        &mut self,
-        matching_engine_program: [u8; 32],
-        matching_engine_context: [u8; 32],
-        fee_payment: u128,
-    ) -> Result<u16> {
-        self.materialize_with_fee(Account::KIND_LP, fee_payment, matching_engine_program, matching_engine_context)
-    }
-    }
-
     pub fn set_owner(&mut self, idx: u16, owner: [u8; 32]) -> Result<()> {
         if idx as usize >= MAX_ACCOUNTS || !self.is_used(idx as usize) {
             return Err(RiskError::Unauthorized);
@@ -3207,24 +3080,15 @@ impl RiskEngine {
             return Err(RiskError::Overflow);
         }
 
-        // Step 2: if account missing, require amount >= MIN_INITIAL_DEPOSIT + fee, materialize,
-        // and route new_account_fee to insurance. Consistent with materialize_with_fee.
-        let mut capital_amount = amount;
+        // Step 2: spec §10.2 — deposit is the canonical materialization path.
+        // Missing account materializes when amount >= cfg_min_initial_deposit.
+        // No engine-native opening fee (v12.18.1).
+        let capital_amount = amount;
         if !self.is_used(idx as usize) {
-            let required_fee = self.params.new_account_fee.get();
-            let total_needed = self.params.min_initial_deposit.get()
-                .checked_add(required_fee).ok_or(RiskError::Overflow)?;
-            if amount < total_needed {
+            if amount < self.params.min_initial_deposit.get() {
                 return Err(RiskError::InsufficientBalance);
             }
             self.materialize_at(idx, now_slot)?;
-            // Route fee to insurance
-            if required_fee > 0 {
-                self.insurance_fund.balance = U128::new(
-                    self.insurance_fund.balance.get().checked_add(required_fee)
-                        .ok_or(RiskError::Overflow)?);
-                capital_amount = amount - required_fee; // safe: amount >= total_needed > required_fee
-            }
         }
 
         // Pre-validate: settle_losses can only fail on i128::MIN PNL (corruption).

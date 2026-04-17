@@ -13,7 +13,6 @@ fn default_params() -> RiskParams {
         initial_margin_bps: 1000,       // 10% — MUST be > maintenance
         trading_fee_bps: 10,
         max_accounts: 64,
-        new_account_fee: U128::new(1000),
         max_crank_staleness_slots: 1000,
         liquidation_fee_bps: 100,
         liquidation_fee_cap: U128::new(1_000_000),
@@ -28,6 +27,32 @@ fn default_params() -> RiskParams {
         max_accrual_dt_slots: 1_000,
         max_abs_funding_e9_per_slot: 100_000_000,
     }
+}
+
+/// Helper: allocate a user slot without moving capital (back-door via
+/// materialize_at). The spec-strict deposit path is exercised in
+/// test_deposit_materialize_user.
+fn add_user_test(engine: &mut RiskEngine, _fee_payment: u128) -> Result<u16> {
+    let idx = engine.free_head;
+    if idx == u16::MAX || (idx as usize) >= MAX_ACCOUNTS {
+        return Err(RiskError::Overflow);
+    }
+    engine.materialize_at(idx, 100)?;
+    Ok(idx)
+}
+
+#[allow(dead_code)]
+fn add_lp_test(
+    engine: &mut RiskEngine,
+    matcher_program: [u8; 32],
+    matcher_context: [u8; 32],
+    _fee_payment: u128,
+) -> Result<u16> {
+    let idx = add_user_test(engine, 0)?;
+    engine.accounts[idx as usize].kind = Account::KIND_LP;
+    engine.accounts[idx as usize].matcher_program = matcher_program;
+    engine.accounts[idx as usize].matcher_context = matcher_context;
+    Ok(idx)
 }
 
 /// Build a size_q from a quantity in base units.
@@ -51,8 +76,8 @@ fn setup_two_users(deposit_a: u128, deposit_b: u128) -> (RiskEngine, u16, u16) {
     let slot = 1u64;
     engine.current_slot = slot;
 
-    let a = engine.add_user(1000).expect("add user a");
-    let b = engine.add_user(1000).expect("add user b");
+    let a = add_user_test(&mut engine, 1000).expect("add user a");
+    let b = add_user_test(&mut engine, 1000).expect("add user b");
 
     // Deposit before crank so accounts have capital and are not GC'd
     if deposit_a > 0 {
@@ -101,36 +126,30 @@ fn test_params_require_mm_le_im() {
 }
 
 // ============================================================================
-// 2. add_user and add_lp
+// 2. Materialization via deposit (spec §10.2, v12.18.1)
 // ============================================================================
 
 #[test]
-fn test_add_user() {
+fn test_deposit_materialize_user() {
     let mut engine = RiskEngine::new(default_params());
-    let idx = engine.add_user(1000).expect("add_user");
-    assert_eq!(idx, 0);
+    // default_params: min_initial_deposit = 1000. Deposit >= 1000 materializes.
+    let idx = engine.free_head;
+    engine.deposit_not_atomic(idx, 5000, 1000, 100).unwrap();
     assert!(engine.is_used(idx as usize));
     assert_eq!(engine.num_used_accounts, 1);
-    assert_eq!(engine.accounts[idx as usize].capital.get(), 0);
-    assert_eq!(engine.insurance_fund.balance.get(), 1000);
-    assert_eq!(engine.vault.get(), 1000);
+    assert_eq!(engine.accounts[idx as usize].capital.get(), 5000);
+    assert_eq!(engine.insurance_fund.balance.get(), 0, "no engine-native opening fee");
+    assert_eq!(engine.vault.get(), 5000);
     assert!(engine.accounts[idx as usize].is_user());
 }
 
 #[test]
-fn test_add_user_with_excess() {
+fn test_deposit_materialize_below_min_rejected() {
     let mut engine = RiskEngine::new(default_params());
-    let idx = engine.add_user(5000).expect("add_user");
-    assert_eq!(engine.accounts[idx as usize].capital.get(), 4000);
-    assert_eq!(engine.insurance_fund.balance.get(), 1000);
-    assert_eq!(engine.vault.get(), 5000);
-}
-
-#[test]
-fn test_add_user_insufficient_fee() {
-    let mut engine = RiskEngine::new(default_params());
-    let result = engine.add_user(500);
+    let idx = engine.free_head;
+    let result = engine.deposit_not_atomic(idx, 500, 1000, 100);
     assert_eq!(result, Err(RiskError::InsufficientBalance));
+    assert!(!engine.is_used(idx as usize), "failed deposit must not materialize");
 }
 
 #[test]
@@ -138,12 +157,13 @@ fn test_add_lp() {
     let mut engine = RiskEngine::new(default_params());
     let program = [1u8; 32];
     let context = [2u8; 32];
-    let idx = engine.add_lp(program, context, 2000).expect("add_lp");
+    let idx = add_lp_test(&mut engine, program, context, 0).expect("add_lp");
     assert!(engine.is_used(idx as usize));
     assert!(engine.accounts[idx as usize].is_lp());
     assert_eq!(engine.accounts[idx as usize].matcher_program, program);
     assert_eq!(engine.accounts[idx as usize].matcher_context, context);
-    assert_eq!(engine.accounts[idx as usize].capital.get(), 1000); // 2000 - 1000 fee
+    // v12.18.1: no engine-native opening fee. Capital starts at 0 until deposit.
+    assert_eq!(engine.accounts[idx as usize].capital.get(), 0);
 }
 
 // ============================================================================
@@ -156,7 +176,7 @@ fn test_deposit() {
     let oracle = 1000u64;
     let slot = 1u64;
     engine.current_slot = slot;
-    let idx = engine.add_user(1000).expect("add_user");
+    let idx = add_user_test(&mut engine, 1000).expect("add_user");
 
     let vault_before = engine.vault.get();
     engine.deposit_not_atomic(idx, 10_000, oracle, slot).expect("deposit");
@@ -171,7 +191,7 @@ fn test_withdraw_no_position() {
     let oracle = 1000u64;
     let slot = 1u64;
     engine.current_slot = slot;
-    let idx = engine.add_user(1000).expect("add_user");
+    let idx = add_user_test(&mut engine, 1000).expect("add_user");
 
     // Deposit before crank so account is not GC'd
     engine.deposit_not_atomic(idx, 10_000, oracle, slot).expect("deposit");
@@ -190,7 +210,7 @@ fn test_withdraw_exceeds_balance() {
     let oracle = 1000u64;
     let slot = 1u64;
     engine.current_slot = slot;
-    let idx = engine.add_user(1000).expect("add_user");
+    let idx = add_user_test(&mut engine, 1000).expect("add_user");
     engine.deposit_not_atomic(idx, 5_000, oracle, slot).expect("deposit");
     engine.keeper_crank_not_atomic(slot, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64, 0i128, 0, 100).expect("crank");
 
@@ -202,7 +222,7 @@ fn test_withdraw_exceeds_balance() {
 fn test_withdraw_succeeds_without_fresh_crank() {
     let mut engine = RiskEngine::new(default_params());
     let oracle = 1000u64;
-    let idx = engine.add_user(1000).expect("add_user");
+    let idx = add_user_test(&mut engine, 1000).expect("add_user");
     engine.deposit_not_atomic(idx, 10_000, oracle, 1).expect("deposit");
 
     // Spec §10.4 + §0 goal 6: withdraw_not_atomic must not require a recent keeper crank.
@@ -238,8 +258,8 @@ fn test_basic_trade() {
 fn test_trade_succeeds_without_fresh_crank() {
     let mut engine = RiskEngine::new(default_params());
     let oracle = 1000u64;
-    let a = engine.add_user(1000).expect("add user a");
-    let b = engine.add_user(1000).expect("add user b");
+    let a = add_user_test(&mut engine, 1000).expect("add user a");
+    let b = add_user_test(&mut engine, 1000).expect("add user b");
     engine.deposit_not_atomic(a, 100_000, oracle, 1).expect("deposit a");
     engine.deposit_not_atomic(b, 100_000, oracle, 1).expect("deposit b");
 
@@ -304,9 +324,9 @@ fn test_conservation_after_deposits() {
     let slot = 1u64;
     engine.current_slot = slot;
 
-    let a = engine.add_user(5000).expect("add user a");
+    let a = add_user_test(&mut engine, 5000).expect("add user a");
     engine.deposit_not_atomic(a, 100_000, oracle, slot).expect("deposit");
-    let b = engine.add_user(3000).expect("add user b");
+    let b = add_user_test(&mut engine, 3000).expect("add user b");
     engine.deposit_not_atomic(b, 50_000, oracle, slot).expect("deposit");
 
     assert!(engine.check_conservation());
@@ -535,7 +555,7 @@ fn test_deposit_fee_credits() {
     let mut engine = RiskEngine::new(default_params());
     let slot = 1u64;
     engine.current_slot = slot;
-    let idx = engine.add_user(1000).expect("add_user");
+    let idx = add_user_test(&mut engine, 1000).expect("add_user");
 
     // Give the account fee debt first (spec §2.1: fee_credits <= 0)
     engine.accounts[idx as usize].fee_credits = I128::new(-5000);
@@ -585,7 +605,7 @@ fn test_close_account_flat() {
     let slot = 1u64;
     engine.current_slot = slot;
 
-    let idx = engine.add_user(1000).expect("add_user");
+    let idx = add_user_test(&mut engine, 1000).expect("add_user");
     engine.deposit_not_atomic(idx, 10_000, oracle, slot).expect("deposit");
 
     let capital_returned = engine.close_account_not_atomic(idx, slot, oracle, 0i128, 0, 100).expect("close");
@@ -623,7 +643,7 @@ fn test_keeper_crank_advances_slot() {
     let mut engine = RiskEngine::new(default_params());
     let oracle = 1000u64;
     let slot = 10u64;
-    let _caller = engine.add_user(1000).expect("add_user");
+    let _caller = add_user_test(&mut engine, 1000).expect("add_user");
 
     let outcome = engine.keeper_crank_not_atomic(slot, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64, 0i128, 0, 100).expect("crank");
     assert!(outcome.advanced);
@@ -635,7 +655,7 @@ fn test_keeper_crank_same_slot_not_advanced() {
     let mut engine = RiskEngine::new(default_params());
     let oracle = 1000u64;
     let slot = 10u64;
-    let _caller = engine.add_user(1000).expect("add_user");
+    let _caller = add_user_test(&mut engine, 1000).expect("add_user");
 
     engine.keeper_crank_not_atomic(slot, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64, 0i128, 0, 100).expect("crank1");
     let outcome = engine.keeper_crank_not_atomic(slot, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64, 0i128, 0, 100).expect("crank2");
@@ -651,7 +671,7 @@ fn test_keeper_crank_no_engine_native_maintenance_fee() {
     let slot = 1u64;
     engine.current_slot = slot;
 
-    let caller = engine.add_user(1000).expect("add_user");
+    let caller = add_user_test(&mut engine, 1000).expect("add_user");
     engine.deposit_not_atomic(caller, 10_000, oracle, slot).expect("deposit");
 
     let capital_before = engine.accounts[caller as usize].capital.get();
@@ -791,7 +811,7 @@ fn test_effective_pos_epoch_mismatch() {
 #[test]
 fn test_set_owner() {
     let mut engine = RiskEngine::new(default_params());
-    let idx = engine.add_user(1000).expect("add_user");
+    let idx = add_user_test(&mut engine, 1000).expect("add_user");
     let owner = [42u8; 32];
     engine.set_owner(idx, owner).expect("set_owner");
     assert_eq!(engine.accounts[idx as usize].owner, owner);
@@ -838,7 +858,7 @@ fn test_multiple_accounts() {
 
     // Create several accounts
     for _ in 0..10 {
-        let idx = engine.add_user(1000).expect("add_user");
+        let idx = add_user_test(&mut engine, 1000).expect("add_user");
         engine.deposit_not_atomic(idx, 10_000, oracle, slot).expect("deposit");
     }
 
@@ -944,8 +964,8 @@ fn test_insurance_absorbs_loss_on_liquidation() {
     let slot = 1u64;
     engine.current_slot = slot;
 
-    let a = engine.add_user(1000).expect("add user a");
-    let b = engine.add_user(1000).expect("add user b");
+    let a = add_user_test(&mut engine, 1000).expect("add user a");
+    let b = add_user_test(&mut engine, 1000).expect("add user b");
 
     // Deposit before crank so accounts are not GC'd
     engine.deposit_not_atomic(a, 20_000, oracle, slot).expect("deposit a");
@@ -1041,7 +1061,7 @@ fn test_account_equity_net_positive() {
     let slot = 1u64;
     engine.current_slot = slot;
 
-    let idx = engine.add_user(1000).expect("add_user");
+    let idx = add_user_test(&mut engine, 1000).expect("add_user");
     engine.deposit_not_atomic(idx, 50_000, oracle, slot).expect("deposit");
 
     let eq = engine.account_equity_net(&engine.accounts[idx as usize], oracle);
@@ -1055,10 +1075,10 @@ fn test_count_used() {
     let mut engine = RiskEngine::new(default_params());
     assert_eq!(engine.count_used(), 0);
 
-    engine.add_user(1000).expect("add_user");
+    add_user_test(&mut engine, 1000).expect("add_user");
     assert_eq!(engine.count_used(), 1);
 
-    engine.add_user(1000).expect("add_user");
+    add_user_test(&mut engine, 1000).expect("add_user");
     assert_eq!(engine.count_used(), 2);
 }
 
@@ -1070,8 +1090,8 @@ fn test_conservation_maintained_through_lifecycle() {
     let slot = 1u64;
     engine.current_slot = slot;
 
-    let a = engine.add_user(1000).expect("add a");
-    let b = engine.add_user(1000).expect("add b");
+    let a = add_user_test(&mut engine, 1000).expect("add a");
+    let b = add_user_test(&mut engine, 1000).expect("add b");
 
     // Deposit before crank so accounts are not GC'd
     engine.deposit_not_atomic(a, 100_000, oracle, slot).expect("dep a");
@@ -1118,8 +1138,8 @@ fn test_fee_seniority_after_restart_on_new_profit_in_trade() {
     let slot = 1u64;
     engine.current_slot = slot;
 
-    let a = engine.add_user(1000).expect("add a");
-    let b = engine.add_user(1000).expect("add b");
+    let a = add_user_test(&mut engine, 1000).expect("add a");
+    let b = add_user_test(&mut engine, 1000).expect("add b");
 
     // Large deposits so margin is not an issue
     engine.deposit_not_atomic(a, 1_000_000, oracle, slot).expect("dep a");
@@ -1181,8 +1201,8 @@ fn test_charge_fee_safe_does_not_panic_on_extreme_pnl() {
     let slot = 1u64;
     engine.current_slot = slot;
 
-    let a = engine.add_user(1000).expect("add a");
-    let b = engine.add_user(1000).expect("add b");
+    let a = add_user_test(&mut engine, 1000).expect("add a");
+    let b = add_user_test(&mut engine, 1000).expect("add b");
 
     // Give a zero capital (so fee shortfall goes to PnL),
     // and b large capital for margin
@@ -1216,7 +1236,7 @@ fn test_keeper_crank_propagates_corruption() {
     let slot = 1u64;
     engine.current_slot = slot;
 
-    let a = engine.add_user(1000).expect("add a");
+    let a = add_user_test(&mut engine, 1000).expect("add a");
     engine.deposit_not_atomic(a, 100_000, oracle, slot).expect("dep a");
     engine.keeper_crank_not_atomic(slot, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64, 0i128, 0, 100).expect("crank");
 
@@ -1244,7 +1264,7 @@ fn test_self_trade_rejected() {
     let slot = 1u64;
     engine.current_slot = slot;
 
-    let a = engine.add_user(1000).expect("add a");
+    let a = add_user_test(&mut engine, 1000).expect("add a");
     engine.deposit_not_atomic(a, 100_000, oracle, slot).expect("dep a");
     engine.keeper_crank_not_atomic(slot, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64, 0i128, 0, 100).expect("crank");
 
@@ -1299,7 +1319,7 @@ fn test_schedule_reset_error_propagated_in_withdraw() {
     let slot = 1u64;
     engine.current_slot = slot;
 
-    let a = engine.add_user(1000).expect("add a");
+    let a = add_user_test(&mut engine, 1000).expect("add a");
     engine.deposit_not_atomic(a, 100_000, oracle, slot).expect("dep a");
     engine.keeper_crank_not_atomic(slot, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64, 0i128, 0, 100).expect("crank");
 
@@ -1507,7 +1527,7 @@ fn test_keeper_crank_multi_slot_advance_no_fee() {
     let slot = 1u64;
     engine.current_slot = slot;
 
-    let a = engine.add_user(1000).unwrap();
+    let a = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(a, 10_000_000, oracle, slot).unwrap();
     engine.keeper_crank_not_atomic(slot, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64, 0i128, 0, 100).unwrap();
 
@@ -1632,7 +1652,7 @@ fn test_charge_fee_safe_rejects_pnl_at_i256_min() {
     let slot = 1u64;
     engine.current_slot = slot;
 
-    let a = engine.add_user(1000).unwrap();
+    let a = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(a, 0, oracle, slot).unwrap(); // zero capital so shortfall goes to PnL
 
     // Set PnL very close to i128::MIN
@@ -1830,7 +1850,7 @@ fn test_gc_dust_preserves_fee_credits() {
     let slot = 1u64;
     engine.current_slot = slot;
 
-    let a = engine.add_user(1000).unwrap();
+    let a = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(a, 10_000, oracle, slot).unwrap();
     engine.keeper_crank_not_atomic(slot, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64, 0i128, 0, 100).unwrap();
 
@@ -1862,7 +1882,7 @@ fn test_gc_collects_dead_account_with_negative_fee_credits() {
     let slot = 1u64;
     engine.current_slot = slot;
 
-    let a = engine.add_user(1000).unwrap();
+    let a = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(a, 10_000, oracle, slot).unwrap();
     engine.keeper_crank_not_atomic(slot, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64, 0i128, 0, 100).unwrap();
 
@@ -1890,7 +1910,7 @@ fn test_gc_still_protects_positive_fee_credits() {
     let slot = 1u64;
     engine.current_slot = slot;
 
-    let a = engine.add_user(1000).unwrap();
+    let a = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(a, 10_000, oracle, slot).unwrap();
     engine.keeper_crank_not_atomic(slot, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64, 0i128, 0, 100).unwrap();
 
@@ -1925,8 +1945,8 @@ fn test_min_liquidation_fee_enforced() {
     let slot = 1u64;
     engine.current_slot = slot;
 
-    let a = engine.add_user(1000).unwrap();
-    let b = engine.add_user(1000).unwrap();
+    let a = add_user_test(&mut engine, 1000).unwrap();
+    let b = add_user_test(&mut engine, 1000).unwrap();
     // Large capital so account stays solvent even after price drop
     engine.deposit_not_atomic(a, 1_000_000, oracle, slot).unwrap();
     engine.deposit_not_atomic(b, 1_000_000, oracle, slot).unwrap();
@@ -1977,8 +1997,8 @@ fn test_min_liquidation_fee_does_not_exceed_cap() {
     let slot = 1u64;
     engine.current_slot = slot;
 
-    let a = engine.add_user(1000).unwrap();
-    let b = engine.add_user(1000).unwrap();
+    let a = add_user_test(&mut engine, 1000).unwrap();
+    let b = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(a, 50_000, oracle, slot).unwrap();
     engine.deposit_not_atomic(b, 50_000, oracle, slot).unwrap();
 
@@ -2016,7 +2036,7 @@ fn test_property_49_consume_released_pnl_preserves_reserve() {
     let oracle = 1_000u64;
     let slot = 1u64;
     let mut engine = RiskEngine::new(default_params());
-    let a = engine.add_user(1000).unwrap();
+    let a = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(a, 100_000, oracle, slot).unwrap();
     engine.keeper_crank_not_atomic(slot, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 0, 0i128, 0, 100).unwrap();
 
@@ -2064,11 +2084,10 @@ fn test_property_50_flat_only_auto_conversion() {
     let slot = 1u64;
     let mut params = default_params();
     params.trading_fee_bps = 0;
-    params.new_account_fee = U128::ZERO;
     let mut engine = RiskEngine::new(params);
 
-    let a = engine.add_user(0).unwrap();
-    let b = engine.add_user(0).unwrap();
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(a, 100_000, oracle, slot).unwrap();
     engine.deposit_not_atomic(b, 100_000, oracle, slot).unwrap();
     engine.keeper_crank_not_atomic(slot, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 0, 0i128, 0, 100).unwrap();
@@ -2152,10 +2171,9 @@ fn test_property_51_universal_withdrawal_dust_guard() {
 
     let mut params = default_params();
     params.min_initial_deposit = U128::new(min_deposit);
-    params.new_account_fee = U128::ZERO;
     let mut engine = RiskEngine::new(params);
 
-    let a = engine.add_user(0).unwrap();
+    let a = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(a, 5_000, oracle, slot).unwrap();
     engine.keeper_crank_not_atomic(slot, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 0, 0i128, 0, 100).unwrap();
 
@@ -2190,8 +2208,8 @@ fn test_property_52_convert_released_pnl_explicit() {
     let oracle = 1_000u64;
     let slot = 1u64;
     let mut engine = RiskEngine::new(default_params());
-    let a = engine.add_user(1000).unwrap();
-    let b = engine.add_user(1000).unwrap();
+    let a = add_user_test(&mut engine, 1000).unwrap();
+    let b = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(a, 100_000, oracle, slot).unwrap();
     engine.deposit_not_atomic(b, 100_000, oracle, slot).unwrap();
     engine.keeper_crank_not_atomic(slot, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 0, 0i128, 0, 100).unwrap();
@@ -2250,11 +2268,10 @@ fn test_property_53_phantom_dust_adl_ordering() {
     let mut params = default_params();
     params.trading_fee_bps = 0;
 
-    params.new_account_fee = U128::ZERO;
     let mut engine = RiskEngine::new(params);
 
-    let a = engine.add_user(0).unwrap();
-    let b = engine.add_user(0).unwrap();
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
     // Give 'a' small capital so it goes bankrupt on crash; give 'b' large capital
     engine.deposit_not_atomic(a, 50_000, oracle, slot).unwrap();
     engine.deposit_not_atomic(b, 1_000_000, oracle, slot).unwrap();
@@ -2301,11 +2318,10 @@ fn test_property_54_unilateral_exact_drain_reset() {
     let mut params = default_params();
     params.trading_fee_bps = 0;
 
-    params.new_account_fee = U128::ZERO;
     let mut engine = RiskEngine::new(params);
 
-    let a = engine.add_user(0).unwrap();
-    let b = engine.add_user(0).unwrap();
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(a, 100_000, oracle, slot).unwrap();
     engine.deposit_not_atomic(b, 100_000, oracle, slot).unwrap();
     engine.keeper_crank_not_atomic(slot, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 0, 0i128, 0, 100).unwrap();
@@ -2343,7 +2359,7 @@ fn test_property_54_unilateral_exact_drain_reset() {
 #[test]
 fn test_force_close_resolved_flat_no_pnl() {
     let mut engine = RiskEngine::new(default_params());
-    let idx = engine.add_user(1000).unwrap();
+    let idx = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(idx, 50_000, 1000, 100).unwrap();
 
     engine.market_mode = MarketMode::Resolved;
@@ -2356,8 +2372,8 @@ fn test_force_close_resolved_flat_no_pnl() {
 #[test]
 fn test_force_close_resolved_with_open_position() {
     let mut engine = RiskEngine::new(default_params());
-    let a = engine.add_user(1000).unwrap();
-    let b = engine.add_user(1000).unwrap();
+    let a = add_user_test(&mut engine, 1000).unwrap();
+    let b = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(a, 500_000, 1000, 100).unwrap();
     engine.deposit_not_atomic(b, 500_000, 1000, 100).unwrap();
 
@@ -2375,8 +2391,8 @@ fn test_force_close_resolved_with_open_position() {
 #[test]
 fn test_force_close_resolved_with_negative_pnl() {
     let mut engine = RiskEngine::new(default_params());
-    let a = engine.add_user(1000).unwrap();
-    let b = engine.add_user(1000).unwrap();
+    let a = add_user_test(&mut engine, 1000).unwrap();
+    let b = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(a, 500_000, 1000, 100).unwrap();
     engine.deposit_not_atomic(b, 500_000, 1000, 100).unwrap();
 
@@ -2395,7 +2411,7 @@ fn test_force_close_resolved_with_negative_pnl() {
 #[test]
 fn test_force_close_resolved_with_positive_pnl() {
     let mut engine = RiskEngine::new(default_params());
-    let idx = engine.add_user(1000).unwrap();
+    let idx = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(idx, 50_000, 1000, 100).unwrap();
 
 
@@ -2414,7 +2430,7 @@ fn test_force_close_resolved_with_positive_pnl() {
 #[test]
 fn test_force_close_resolved_with_fee_debt() {
     let mut engine = RiskEngine::new(default_params());
-    let idx = engine.add_user(1000).unwrap();
+    let idx = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(idx, 50_000, 1000, 100).unwrap();
 
 
@@ -2444,8 +2460,8 @@ fn test_resolved_two_phase_no_deadlock() {
     // positive-PnL accounts both needed reconciliation. Err on phase 2
     // rolled back phase 1, preventing either from making progress.
     let mut engine = RiskEngine::new(default_params());
-    let a = engine.add_user(1000).unwrap();
-    let b = engine.add_user(1000).unwrap();
+    let a = add_user_test(&mut engine, 1000).unwrap();
+    let b = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(a, 500_000, 1000, 100).unwrap();
     engine.deposit_not_atomic(b, 500_000, 1000, 100).unwrap();
 
@@ -2481,8 +2497,8 @@ fn test_force_close_combined_convenience() {
     // positive-PnL accounts that aren't terminal-ready yet, then
     // completes on re-call after all accounts reconciled.
     let mut engine = RiskEngine::new(default_params());
-    let a = engine.add_user(1000).unwrap();
-    let b = engine.add_user(1000).unwrap();
+    let a = add_user_test(&mut engine, 1000).unwrap();
+    let b = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(a, 500_000, 1000, 100).unwrap();
     engine.deposit_not_atomic(b, 500_000, 1000, 100).unwrap();
 
@@ -2515,8 +2531,8 @@ fn test_force_close_combined_convenience() {
 fn test_force_close_same_epoch_positive_k_pair_pnl() {
     // Account opened long, price moved up → unrealized profit from K-pair
     let mut engine = RiskEngine::new(default_params());
-    let a = engine.add_user(1000).unwrap();
-    let b = engine.add_user(1000).unwrap();
+    let a = add_user_test(&mut engine, 1000).unwrap();
+    let b = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(a, 500_000, 1000, 100).unwrap();
     engine.deposit_not_atomic(b, 500_000, 1000, 100).unwrap();
 
@@ -2552,8 +2568,8 @@ fn test_force_close_same_epoch_positive_k_pair_pnl() {
 fn test_force_close_same_epoch_negative_k_pair_pnl() {
     // Account opened long, price moved down → unrealized loss from K-pair
     let mut engine = RiskEngine::new(default_params());
-    let a = engine.add_user(1000).unwrap();
-    let b = engine.add_user(1000).unwrap();
+    let a = add_user_test(&mut engine, 1000).unwrap();
+    let b = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(a, 500_000, 1000, 100).unwrap();
     engine.deposit_not_atomic(b, 500_000, 1000, 100).unwrap();
 
@@ -2573,7 +2589,7 @@ fn test_force_close_same_epoch_negative_k_pair_pnl() {
 #[test]
 fn test_force_close_with_fee_debt_exceeding_capital() {
     let mut engine = RiskEngine::new(default_params());
-    let idx = engine.add_user(1000).unwrap();
+    let idx = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(idx, 10_000, 1000, 100).unwrap();
 
     // Fee debt >> capital
@@ -2590,7 +2606,7 @@ fn test_force_close_with_fee_debt_exceeding_capital() {
 #[test]
 fn test_force_close_zero_capital_zero_pnl() {
     let mut engine = RiskEngine::new(default_params());
-    let idx = engine.add_user(1000).unwrap();
+    let idx = add_user_test(&mut engine, 1000).unwrap();
     // No deposit — capital = 0 (new_account_fee consumed all)
 
     engine.market_mode = MarketMode::Resolved;
@@ -2603,9 +2619,9 @@ fn test_force_close_zero_capital_zero_pnl() {
 #[test]
 fn test_force_close_c_tot_tracks_exactly() {
     let mut engine = RiskEngine::new(default_params());
-    let a = engine.add_user(1000).unwrap();
-    let b = engine.add_user(1000).unwrap();
-    let c = engine.add_user(1000).unwrap();
+    let a = add_user_test(&mut engine, 1000).unwrap();
+    let b = add_user_test(&mut engine, 1000).unwrap();
+    let c = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(a, 100_000, 1000, 100).unwrap();
     engine.deposit_not_atomic(b, 200_000, 1000, 100).unwrap();
     engine.deposit_not_atomic(c, 300_000, 1000, 100).unwrap();
@@ -2635,8 +2651,8 @@ fn test_force_close_c_tot_tracks_exactly() {
 #[test]
 fn test_force_close_stored_pos_count_tracks() {
     let mut engine = RiskEngine::new(default_params());
-    let a = engine.add_user(1000).unwrap();
-    let b = engine.add_user(1000).unwrap();
+    let a = add_user_test(&mut engine, 1000).unwrap();
+    let b = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(a, 500_000, 1000, 100).unwrap();
     engine.deposit_not_atomic(b, 500_000, 1000, 100).unwrap();
 
@@ -2659,7 +2675,7 @@ fn test_force_close_multiple_sequential_no_aggregate_drift() {
     let mut engine = RiskEngine::new(default_params());
     let mut accounts = Vec::new();
     for _ in 0..4 {
-        let idx = engine.add_user(1000).unwrap();
+        let idx = add_user_test(&mut engine, 1000).unwrap();
         engine.deposit_not_atomic(idx, 100_000, 1000, 100).unwrap();
         accounts.push(idx);
     }
@@ -2681,8 +2697,8 @@ fn test_force_close_multiple_sequential_no_aggregate_drift() {
 #[test]
 fn test_force_close_decrements_positions() {
     let mut engine = RiskEngine::new(default_params());
-    let a = engine.add_user(1000).unwrap();
-    let b = engine.add_user(1000).unwrap();
+    let a = add_user_test(&mut engine, 1000).unwrap();
+    let b = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(a, 500_000, 1000, 100).unwrap();
     engine.deposit_not_atomic(b, 500_000, 1000, 100).unwrap();
 
@@ -2706,8 +2722,8 @@ fn test_force_close_decrements_positions() {
 fn test_force_close_both_sides_sequential() {
     // Both accounts must be closeable in either order after resolve.
     let mut engine = RiskEngine::new(default_params());
-    let a = engine.add_user(1000).unwrap();
-    let b = engine.add_user(1000).unwrap();
+    let a = add_user_test(&mut engine, 1000).unwrap();
+    let b = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(a, 500_000, 1000, 100).unwrap();
     engine.deposit_not_atomic(b, 500_000, 1000, 100).unwrap();
 
@@ -2730,7 +2746,7 @@ fn test_force_close_both_sides_sequential() {
 #[test]
 fn test_force_close_rejects_corrupt_a_basis() {
     let mut engine = RiskEngine::new(default_params());
-    let a = engine.add_user(1000).unwrap();
+    let a = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(a, 500_000, 1000, 100).unwrap();
 
     // Manufacture corrupt state: nonzero position with a_basis = 0
@@ -2751,8 +2767,8 @@ fn test_force_close_rejects_corrupt_a_basis() {
 #[test]
 fn test_property_31_fullclose_liquidation_zeros_position() {
     let mut engine = RiskEngine::new(default_params());
-    let a = engine.add_user(1000).unwrap();
-    let b = engine.add_user(1000).unwrap();
+    let a = add_user_test(&mut engine, 1000).unwrap();
+    let b = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(a, 50_000, 1000, 100).unwrap();
     engine.deposit_not_atomic(b, 500_000, 1000, 100).unwrap();
 
@@ -2784,7 +2800,7 @@ fn test_property_31_fullclose_liquidation_zeros_position() {
 #[test]
 fn test_append_reserve_creates_sched_bucket() {
     let mut engine = RiskEngine::new(default_params());
-    let idx = engine.add_user(1000).unwrap();
+    let idx = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(idx, 100_000, 1000, 100).unwrap();
     // Simulate positive PnL increase that would create a reserve
     engine.accounts[idx as usize].pnl = 10_000;
@@ -2803,7 +2819,7 @@ fn test_append_reserve_creates_sched_bucket() {
 #[test]
 fn test_append_reserve_merges_same_slot_horizon() {
     let mut engine = RiskEngine::new(default_params());
-    let idx = engine.add_user(1000).unwrap();
+    let idx = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(idx, 100_000, 1000, 100).unwrap();
     engine.current_slot = 100;
 
@@ -2821,7 +2837,7 @@ fn test_append_reserve_merges_same_slot_horizon() {
 #[test]
 fn test_append_reserve_different_horizon_creates_pending() {
     let mut engine = RiskEngine::new(default_params());
-    let idx = engine.add_user(1000).unwrap();
+    let idx = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(idx, 100_000, 1000, 100).unwrap();
     engine.current_slot = 100;
 
@@ -2838,7 +2854,7 @@ fn test_append_reserve_different_horizon_creates_pending() {
 #[test]
 fn test_apply_reserve_loss_newest_first() {
     let mut engine = RiskEngine::new(default_params());
-    let idx = engine.add_user(1000).unwrap();
+    let idx = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(idx, 100_000, 1000, 100).unwrap();
     engine.current_slot = 100;
 
@@ -2858,7 +2874,7 @@ fn test_apply_reserve_loss_newest_first() {
 #[test]
 fn test_prepare_account_for_resolved_touch() {
     let mut engine = RiskEngine::new(default_params());
-    let idx = engine.add_user(1000).unwrap();
+    let idx = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(idx, 100_000, 1000, 100).unwrap();
     engine.current_slot = 100;
 
@@ -2876,7 +2892,7 @@ fn test_prepare_account_for_resolved_touch() {
 #[test]
 fn test_advance_profit_warmup_sched_maturity() {
     let mut engine = RiskEngine::new(default_params());
-    let idx = engine.add_user(1000).unwrap();
+    let idx = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(idx, 100_000, 1000, 100).unwrap();
     engine.current_slot = 100;
 
@@ -2906,7 +2922,7 @@ fn test_advance_profit_warmup_sched_maturity() {
 #[test]
 fn test_advance_profit_warmup_sched_then_pending_promotion() {
     let mut engine = RiskEngine::new(default_params());
-    let idx = engine.add_user(1000).unwrap();
+    let idx = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(idx, 100_000, 1000, 100).unwrap();
     engine.current_slot = 100;
 
@@ -2935,7 +2951,7 @@ fn test_advance_profit_warmup_sched_then_pending_promotion() {
 #[test]
 fn test_set_pnl_with_reserve_positive_increase_creates_cohort() {
     let mut engine = RiskEngine::new(default_params());
-    let idx = engine.add_user(1000).unwrap();
+    let idx = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(idx, 100_000, 1000, 100).unwrap();
     engine.current_slot = 100;
 
@@ -2953,7 +2969,7 @@ fn test_set_pnl_with_reserve_positive_increase_creates_cohort() {
 #[test]
 fn test_set_pnl_with_reserve_immediate_release() {
     let mut engine = RiskEngine::new(default_params());
-    let idx = engine.add_user(1000).unwrap();
+    let idx = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(idx, 100_000, 1000, 100).unwrap();
     // Top up insurance to create positive residual so admission can release instantly
     engine.top_up_insurance_fund(50_000, 100).unwrap();
@@ -2972,7 +2988,7 @@ fn test_set_pnl_with_reserve_immediate_release() {
 #[test]
 fn test_set_pnl_with_reserve_negative_lifo_loss() {
     let mut engine = RiskEngine::new(default_params());
-    let idx = engine.add_user(1000).unwrap();
+    let idx = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(idx, 100_000, 1000, 100).unwrap();
     engine.current_slot = 100;
 
@@ -2992,7 +3008,7 @@ fn test_set_pnl_with_reserve_negative_lifo_loss() {
 #[test]
 fn test_set_pnl_with_reserve_h_lock_zero_immediate() {
     let mut engine = RiskEngine::new(default_params());
-    let idx = engine.add_user(1000).unwrap();
+    let idx = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(idx, 100_000, 1000, 100).unwrap();
     // UseAdmissionPair(0, h_max) on healthy market → instant release via admission
     engine.deposit_not_atomic(idx, 100_000, 1000, 100).unwrap();
@@ -3011,7 +3027,7 @@ fn test_set_pnl_with_reserve_h_lock_zero_immediate() {
 #[test]
 fn test_touch_live_local_does_not_auto_convert() {
     let mut engine = RiskEngine::new(default_params());
-    let idx = engine.add_user(1000).unwrap();
+    let idx = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(idx, 100_000, 1000, 100).unwrap();
 
 
@@ -3036,7 +3052,7 @@ fn test_touch_live_local_does_not_auto_convert() {
 #[test]
 fn test_finalize_whole_only_conversion() {
     let mut engine = RiskEngine::new(default_params());
-    let idx = engine.add_user(1000).unwrap();
+    let idx = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(idx, 100_000, 1000, 100).unwrap();
 
     // Flat account with 10k released positive PnL.
@@ -3064,7 +3080,7 @@ fn test_finalize_whole_only_conversion() {
 #[test]
 fn test_finalize_no_conversion_under_haircut() {
     let mut engine = RiskEngine::new(default_params());
-    let idx = engine.add_user(1000).unwrap();
+    let idx = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(idx, 100_000, 1000, 100).unwrap();
 
     // Flat with 10k PnL (ImmediateRelease) but insufficient residual
@@ -3091,8 +3107,8 @@ fn test_finalize_no_conversion_under_haircut() {
 #[test]
 fn test_resolve_market_basic() {
     let mut engine = RiskEngine::new(default_params());
-    let a = engine.add_user(1000).unwrap();
-    let b = engine.add_user(1000).unwrap();
+    let a = add_user_test(&mut engine, 1000).unwrap();
+    let b = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(a, 500_000, 1000, 100).unwrap();
     engine.deposit_not_atomic(b, 500_000, 1000, 100).unwrap();
     engine.execute_trade_not_atomic(a, b, 1000, 100, (100 * POS_SCALE) as i128, 1000, 0i128, 0, 100).unwrap();
@@ -3112,7 +3128,7 @@ fn test_resolve_market_basic() {
 #[test]
 fn test_resolve_market_rejects_out_of_band_price() {
     let mut engine = RiskEngine::new(default_params());
-    let idx_tmp = engine.add_user(1000).unwrap(); engine.deposit_not_atomic(idx_tmp, 100_000, 1000, 100).unwrap();
+    let idx_tmp = add_user_test(&mut engine, 1000).unwrap(); engine.deposit_not_atomic(idx_tmp, 100_000, 1000, 100).unwrap();
 
     // resolve_price_deviation_bps = 1000 (10%)
     // Self-sync accrues at live_oracle=1000 first → P_last=1000
@@ -3124,7 +3140,7 @@ fn test_resolve_market_rejects_out_of_band_price() {
 #[test]
 fn test_resolve_market_accepts_in_band_price() {
     let mut engine = RiskEngine::new(default_params());
-    let idx_tmp = engine.add_user(1000).unwrap(); engine.deposit_not_atomic(idx_tmp, 100_000, 1000, 100).unwrap();
+    let idx_tmp = add_user_test(&mut engine, 1000).unwrap(); engine.deposit_not_atomic(idx_tmp, 100_000, 1000, 100).unwrap();
     engine.last_oracle_price = 1000;
 
     // Accrue to resolution slot first (v12.16.4 requirement)
@@ -3143,8 +3159,8 @@ fn test_blocker1_trade_open_must_not_use_unreleased_pnl() {
     let mut params = default_params();
     params.trading_fee_bps = 0;
     let mut engine = RiskEngine::new(params);
-    let a = engine.add_user(1000).unwrap();
-    let b = engine.add_user(1000).unwrap();
+    let a = add_user_test(&mut engine, 1000).unwrap();
+    let b = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(a, 50_000, 1000, 100).unwrap();
     engine.deposit_not_atomic(b, 500_000, 1000, 100).unwrap();
 
@@ -3180,7 +3196,7 @@ fn test_blocker3_terminal_close_rejects_negative_pnl() {
     // close_resolved_terminal_not_atomic must reject accounts with pnl < 0
     // that haven't been reconciled (losses not absorbed).
     let mut engine = RiskEngine::new(default_params());
-    let a = engine.add_user(1000).unwrap();
+    let a = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(a, 50_000, 1000, 100).unwrap();
 
     // Manually set resolved state with negative PnL
@@ -3202,8 +3218,8 @@ fn test_blocker4_adl_overflow_explicit_socialization() {
     let mut params = default_params();
     params.trading_fee_bps = 0;
     let mut engine = RiskEngine::new(params);
-    let a = engine.add_user(1000).unwrap();
-    let b = engine.add_user(1000).unwrap();
+    let a = add_user_test(&mut engine, 1000).unwrap();
+    let b = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(a, 100_000, 1000, 100).unwrap();
     engine.deposit_not_atomic(b, 100_000, 1000, 100).unwrap();
 
@@ -3230,7 +3246,7 @@ fn audit_2_trade_open_must_use_all_pos_pnl_via_g() {
     // not just released/matured PnL. Fresh unreleased profit SHOULD
     // support the same account's risk-increasing trades through g.
     let mut engine = RiskEngine::new(default_params());
-    let a = engine.add_user(1000).unwrap();
+    let a = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(a, 100, 1000, 100).unwrap();
 
     // Inject positive PnL, ALL in reserve (unreleased)
@@ -3284,7 +3300,7 @@ fn audit_5_invalid_h_lock_rejected_at_entry() {
     // Bad h_lock must be rejected before any state mutation,
     // not panic deep in set_pnl_with_reserve.
     let mut engine = RiskEngine::new(default_params());
-    let a = engine.add_user(1000).unwrap();
+    let a = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(a, 100_000, 1000, 100).unwrap();
 
     let bad_h = engine.params.h_max + 1;
@@ -3293,17 +3309,19 @@ fn audit_5_invalid_h_lock_rejected_at_entry() {
 }
 
 #[test]
-fn audit_6_materialize_with_fee_needs_live_gate() {
-    // materialize_with_fee must reject on resolved markets
+fn audit_6_deposit_materialize_needs_live_gate() {
+    // deposit_not_atomic (sole materialization path in v12.18.1) must
+    // reject on resolved markets — including for missing accounts.
     let mut engine = RiskEngine::new(default_params());
-    let _a = engine.add_user(1000).unwrap();
+    let _a = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(_a, 100_000, 1000, 100).unwrap();
     engine.accrue_market_to(100, 1000, 0).unwrap();
     engine.resolve_market_not_atomic(1000, 1000, 100, 0).unwrap();
 
-    let result = engine.materialize_with_fee(
-        Account::KIND_USER, 1000, [0; 32], [0; 32]);
-    assert!(result.is_err(), "materialize must be blocked on resolved markets");
+    // Try to deposit into an unused slot on a Resolved market — must reject.
+    let unused_idx = engine.free_head;
+    let result = engine.deposit_not_atomic(unused_idx, 10_000, 1000, 101);
+    assert!(result.is_err(), "deposit must be blocked on resolved markets");
 }
 
 #[test]
@@ -3311,7 +3329,7 @@ fn audit_8_resolve_must_enforce_band_before_first_accrue() {
     // resolve_market must check price band even without prior accrual.
     // P_last is set by init, so the band is always enforceable.
     let mut engine = RiskEngine::new(default_params());
-    let _a = engine.add_user(1000).unwrap();
+    let _a = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(_a, 100_000, 1000, 100).unwrap();
     // engine.last_oracle_price = 1000 from init
     // resolve_price_deviation_bps = 1000 (10%)
@@ -3327,7 +3345,7 @@ fn audit_9_pending_merge_uses_max_horizon() {
     // When pending bucket already exists, further appends merge and
     // horizon = max(existing, new h_lock).
     let mut engine = RiskEngine::new(default_params());
-    let a = engine.add_user(1000).unwrap();
+    let a = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(a, 1_000_000, 1000, 100).unwrap();
 
     let idx = a as usize;
@@ -3358,7 +3376,7 @@ fn audit_9_pending_merge_uses_max_horizon() {
 fn audit_10_accrue_market_to_must_reject_on_resolved() {
     // Public accrue_market_to must not work on resolved markets.
     let mut engine = RiskEngine::new(default_params());
-    let _a = engine.add_user(1000).unwrap();
+    let _a = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(_a, 100_000, 1000, 100).unwrap();
     engine.accrue_market_to(100, 1000, 0).unwrap();
     engine.resolve_market_not_atomic(1000, 1000, 100, 0).unwrap();
@@ -3376,8 +3394,8 @@ fn fix2_tiny_position_withdrawal_floor() {
     // Microscopic position with notional flooring to 0 must still require
     // min_nonzero_im_req for withdrawal.
     let mut engine = RiskEngine::new(default_params());
-    let a = engine.add_user(1000).unwrap();
-    let b = engine.add_user(1000).unwrap();
+    let a = add_user_test(&mut engine, 1000).unwrap();
+    let b = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(a, 10_000, 1000, 100).unwrap();
     engine.deposit_not_atomic(b, 100_000, 1000, 100).unwrap();
 
@@ -3398,7 +3416,7 @@ fn fix3_flat_conversion_rejects_if_post_eq_negative() {
     // Flat account with fee debt: haircutted conversion + sweep must not
     // leave Eq_maint_raw < 0.
     let mut engine = RiskEngine::new(default_params());
-    let a = engine.add_user(1000).unwrap();
+    let a = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(a, 1, 1000, 100).unwrap(); // minimal capital
 
     let idx = a as usize;
@@ -3424,21 +3442,20 @@ fn fix3_flat_conversion_rejects_if_post_eq_negative() {
 }
 
 #[test]
-fn fix5_materialize_with_fee_requires_min_deposit() {
-    // materialize_with_fee must reject when post-fee capital < MIN_INITIAL_DEPOSIT
+fn fix5_deposit_materialize_requires_min_deposit() {
+    // v12.18.1: deposit is the sole materialization path. Spec §10.2 requires
+    // amount >= cfg_min_initial_deposit. No engine-native new_account_fee.
     let mut engine = RiskEngine::new(default_params());
-    // new_account_fee = 1000, min_initial_deposit = 1000
-    // Paying exactly fee (1000) leaves excess = 0. Excess of 0 is OK (no capital).
-    // Paying fee + 1 leaves excess = 1 < min_initial_deposit. Must reject.
-    let result = engine.materialize_with_fee(
-        Account::KIND_USER, 1001, [0; 32], [0; 32]);
+    // min_initial_deposit = 1000 in default_params.
+    let unused_idx = engine.free_head;
+    let result = engine.deposit_not_atomic(unused_idx, 999, 1000, 100);
     assert!(result.is_err(),
-        "materialize must reject when excess (1) < min_initial_deposit (1000)");
+        "deposit into missing account with amount < min_initial_deposit must reject");
 
-    // Paying fee + min_initial_deposit should succeed
-    let result2 = engine.materialize_with_fee(
-        Account::KIND_USER, 2000, [0; 32], [0; 32]);
-    assert!(result2.is_ok(), "materialize must succeed with adequate capital");
+    // Exactly min_initial_deposit must succeed and materialize.
+    let result2 = engine.deposit_not_atomic(unused_idx, 1000, 1000, 100);
+    assert!(result2.is_ok(), "deposit == min_initial_deposit must materialize");
+    assert!(engine.is_used(unused_idx as usize));
 }
 
 // ============================================================================
@@ -3446,20 +3463,15 @@ fn fix5_materialize_with_fee_requires_min_deposit() {
 // ============================================================================
 
 #[test]
-fn blocker2_materialize_dust_excess_must_be_rejected() {
-    // Paying fee + tiny amount leaves dust capital. Must be rejected.
+fn blocker2_deposit_dust_amount_rejected() {
+    // v12.18.1: deposit must reject amounts below min_initial_deposit
+    // when the account is missing (can't materialize with dust).
     let mut engine = RiskEngine::new(default_params());
-    // new_account_fee = 1000, min_initial_deposit = 1000
-    // fee_payment = 1001 → excess = 1 < min_initial_deposit = 1000
-    let result = engine.materialize_with_fee(
-        Account::KIND_USER, 1001, [0; 32], [0; 32]);
-    assert!(result.is_err(),
-        "materialize with dust post-fee capital must be rejected");
-
-    // excess = 0 is OK (user deposits separately)
-    let result2 = engine.materialize_with_fee(
-        Account::KIND_USER, 1000, [0; 32], [0; 32]);
-    assert!(result2.is_ok(), "zero excess (will deposit later) is allowed");
+    let unused_idx = engine.free_head;
+    let result = engine.deposit_not_atomic(unused_idx, 500, 1000, 100);
+    assert!(result.is_err(), "dust deposit into missing account must reject");
+    assert!(!engine.is_used(unused_idx as usize),
+        "missing account must not be materialized on failed deposit");
 }
 
 #[test]
@@ -3467,20 +3479,13 @@ fn blocker3_materialize_at_is_stack_safe() {
     // materialize_at must not construct a full Account on the stack.
     // This is a compile-time/runtime property — just verify it works.
     let mut engine = RiskEngine::new(default_params());
-    let idx = engine.add_user(1000).unwrap();
+    let idx = add_user_test(&mut engine, 1000).unwrap();
     // If this didn't stack-overflow, materialization is field-by-field.
     assert!(engine.is_used(idx as usize));
 }
 
-#[test]
-fn blocker6_invalid_kind_rejected() {
-    // materialize_with_fee must reject invalid account kinds.
-    let mut engine = RiskEngine::new(default_params());
-    let result = engine.materialize_with_fee(
-        42, // invalid kind
-        2000, [0; 32], [0; 32]);
-    assert!(result.is_err(), "invalid account kind must be rejected");
-}
+// blocker6: materialize_with_fee removed in v12.18.1 — deposit path has no
+// kind parameter, so invalid-kind rejection no longer applies at that surface.
 
 #[test]
 fn blocker5_set_owner_requires_caller_proof() {
@@ -3488,7 +3493,7 @@ fn blocker5_set_owner_requires_caller_proof() {
     // Currently it only checks owner == [0; 32]. This test documents the
     // current behavior — any caller can claim an unowned account.
     let mut engine = RiskEngine::new(default_params());
-    let idx = engine.add_user(1000).unwrap();
+    let idx = add_user_test(&mut engine, 1000).unwrap();
     assert_eq!(engine.accounts[idx as usize].owner, [0; 32]);
 
     // First claim succeeds
@@ -3520,8 +3525,8 @@ fn funding_new_entrant_must_not_inherit_old_fraction() {
     engine.accrue_market_to(slot + 1, oracle, 1).unwrap();
 
     // New pair joins
-    let c = engine.add_user(1000).unwrap();
-    let d = engine.add_user(1000).unwrap();
+    let c = add_user_test(&mut engine, 1000).unwrap();
+    let d = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(c, 500_000, oracle, slot + 1).unwrap();
     engine.deposit_not_atomic(d, 500_000, oracle, slot + 1).unwrap();
     let size2 = make_size_q(100);
@@ -3553,8 +3558,8 @@ fn funding_basic_sign_convention() {
     let oracle = 1000u64;
     let slot = 100u64;
     let mut engine = RiskEngine::new_with_market(default_params(), slot, oracle);
-    let a = engine.add_user(1000).unwrap();
-    let b = engine.add_user(1000).unwrap();
+    let a = add_user_test(&mut engine, 1000).unwrap();
+    let b = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(a, 500_000, oracle, slot).unwrap();
     engine.deposit_not_atomic(b, 500_000, oracle, slot).unwrap();
 
@@ -3602,8 +3607,8 @@ fn test_kf_combined_floor_negative_boundary() {
     // Correct: floor(1/2 * (-1*FUNDING_DEN + -FUNDING_DEN) / FUNDING_DEN) = floor(-1) = -1
     // Wrong:   floor(-1/2) + floor(-1/2) = -1 + -1 = -2
     let mut engine = RiskEngine::new(default_params());
-    let a = engine.add_user(1000).unwrap();
-    let b = engine.add_user(1000).unwrap();
+    let a = add_user_test(&mut engine, 1000).unwrap();
+    let b = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(a, 500_000, 1000, 100).unwrap();
     engine.deposit_not_atomic(b, 500_000, 1000, 100).unwrap();
 
@@ -3674,7 +3679,7 @@ fn test_h_lock_zero_always_legal() {
     let mut params = default_params();
     params.h_min = 5;
     let mut engine = RiskEngine::new(params);
-    let a = engine.add_user(1000).unwrap();
+    let a = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(a, 100_000, 1000, 100).unwrap();
 
     // h_lock = 0 must be accepted
@@ -3686,33 +3691,17 @@ fn test_h_lock_zero_always_legal() {
     assert!(result2.is_err(), "nonzero h_lock below h_min must be rejected");
 }
 
-#[test]
-fn test_materialize_then_dust_deposit_bypass() {
-    // materialize_with_fee(fee_only) then deposit(1) bypasses MIN_INITIAL_DEPOSIT.
-    let mut engine = RiskEngine::new(default_params());
-    // Create with zero excess (just the fee)
-    let idx = engine.materialize_with_fee(
-        Account::KIND_USER, 1000, [0; 32], [0; 32]).unwrap();
-    assert_eq!(engine.accounts[idx as usize].capital.get(), 0);
-
-    // Now deposit 1 — this should be rejected because the account has
-    // capital below MIN_INITIAL_DEPOSIT and the deposit doesn't bring it up.
-    let result = engine.deposit_not_atomic(idx, 1, 1000, 100);
-    // Under canonical rules, a non-missing account with capital < min_initial
-    // should not accept deposits below the floor. Currently this succeeds.
-    // We accept this as a known wrapper-policy gap for now.
-    // The real fix is either: hide materialize_with_fee, or require
-    // min_initial_deposit in materialize_with_fee for all excess.
-    assert!(result.is_ok() || result.is_err(),
-        "documenting current behavior — dust deposit after zero-excess materialize");
-}
+// test_materialize_then_dust_deposit_bypass removed: materialize_with_fee gone
+// in v12.18.1. Dust-deposit-bypass no longer reachable because deposit into a
+// missing account requires amount >= min_initial_deposit (see
+// fix5_deposit_materialize_requires_min_deposit).
 
 #[test]
 fn test_reclaim_rejects_nonempty_queue_metadata() {
     // reclaim_empty_account must verify queue metadata is empty, not just
     // reserved_pnl == 0.
     let mut engine = RiskEngine::new(default_params());
-    let a = engine.add_user(1000).unwrap();
+    let a = add_user_test(&mut engine, 1000).unwrap();
     // Deposit just enough to not be reclaimable normally
     engine.deposit_not_atomic(a, 100, 1000, 100).unwrap();
 
@@ -3746,8 +3735,8 @@ fn test_funding_partition_invariance() {
 
     // --- Engine A: one accrue of 2 slots ---
     let mut ea = RiskEngine::new_with_market(params, slot, oracle);
-    let a1 = ea.add_user(1000).unwrap();
-    let a2 = ea.add_user(1000).unwrap();
+    let a1 = add_user_test(&mut ea, 1000).unwrap();
+    let a2 = add_user_test(&mut ea, 1000).unwrap();
     ea.deposit_not_atomic(a1, 500_000, oracle, slot).unwrap();
     ea.deposit_not_atomic(a2, 500_000, oracle, slot).unwrap();
     // Use a rate that produces a non-integer fund_term per slot:
@@ -3768,8 +3757,8 @@ fn test_funding_partition_invariance() {
 
     // --- Engine B: two accrues of 1 slot each ---
     let mut eb = RiskEngine::new_with_market(params, slot, oracle);
-    let b1 = eb.add_user(1000).unwrap();
-    let b2 = eb.add_user(1000).unwrap();
+    let b1 = add_user_test(&mut eb, 1000).unwrap();
+    let b2 = add_user_test(&mut eb, 1000).unwrap();
     eb.deposit_not_atomic(b1, 500_000, oracle, slot).unwrap();
     eb.deposit_not_atomic(b2, 500_000, oracle, slot).unwrap();
     eb.execute_trade_not_atomic(b1, b2, oracle, slot, size, oracle, rate, 0, 100).unwrap();
@@ -3807,7 +3796,7 @@ fn test_funding_partition_invariance() {
 #[test]
 fn test_charge_account_fee_basic() {
     let mut engine = RiskEngine::new(default_params());
-    let a = engine.add_user(1000).unwrap();
+    let a = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(a, 100_000, 1000, 100).unwrap();
 
     let cap_before = engine.accounts[a as usize].capital.get();
@@ -3826,7 +3815,7 @@ fn test_charge_account_fee_basic() {
 #[test]
 fn test_charge_account_fee_excess_routes_to_fee_debt() {
     let mut engine = RiskEngine::new(default_params());
-    let a = engine.add_user(1000).unwrap();
+    let a = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(a, 1_000, 1000, 100).unwrap();
 
     // Fee larger than capital — excess goes to fee_credits
@@ -3841,7 +3830,7 @@ fn test_charge_account_fee_excess_routes_to_fee_debt() {
 #[test]
 fn test_charge_account_fee_does_not_touch_pnl_or_reserve() {
     let mut engine = RiskEngine::new(default_params());
-    let a = engine.add_user(1000).unwrap();
+    let a = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(a, 100_000, 1000, 100).unwrap();
 
     let pnl_before = engine.accounts[a as usize].pnl;
@@ -3862,7 +3851,7 @@ fn test_charge_account_fee_does_not_touch_pnl_or_reserve() {
 #[test]
 fn test_charge_account_fee_live_only() {
     let mut engine = RiskEngine::new(default_params());
-    let a = engine.add_user(1000).unwrap();
+    let a = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(a, 100_000, 1000, 100).unwrap();
     engine.accrue_market_to(100, 1000, 0).unwrap();
     engine.resolve_market_not_atomic(1000, 1000, 100, 0).unwrap();
@@ -3881,8 +3870,8 @@ fn test_force_close_returns_enum_deferred() {
     let oracle = 1000u64;
     let slot = 100u64;
     let mut engine = RiskEngine::new_with_market(default_params(), slot, oracle);
-    let a = engine.add_user(1000).unwrap();
-    let b = engine.add_user(1000).unwrap();
+    let a = add_user_test(&mut engine, 1000).unwrap();
+    let b = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(a, 500_000, oracle, slot).unwrap();
     engine.deposit_not_atomic(b, 500_000, oracle, slot).unwrap();
 
@@ -3922,7 +3911,7 @@ fn test_force_close_returns_enum_deferred() {
 fn test_settle_flat_negative_pnl() {
     // Lightweight permissionless path to zero out flat negative PnL.
     let mut engine = RiskEngine::new(default_params());
-    let a = engine.add_user(1000).unwrap();
+    let a = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(a, 50_000, 1000, 100).unwrap();
 
     // Inject flat negative PnL (simulate settled loss from prior touch)
@@ -3954,7 +3943,7 @@ fn test_settle_flat_negative_rejects_nonflat() {
 fn test_settle_flat_negative_noop_on_positive_pnl() {
     // Spec §9.2.4: noop when PnL >= 0 (not an error)
     let mut engine = RiskEngine::new(default_params());
-    let a = engine.add_user(1000).unwrap();
+    let a = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(a, 50_000, 1000, 100).unwrap();
     engine.set_pnl(a as usize, 1000); // positive PnL
 
@@ -3965,7 +3954,7 @@ fn test_settle_flat_negative_noop_on_positive_pnl() {
 #[test]
 fn test_is_resolved_getter() {
     let mut engine = RiskEngine::new(default_params());
-    let _a = engine.add_user(1000).unwrap();
+    let _a = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(_a, 100_000, 1000, 100).unwrap();
 
     assert!(!engine.is_resolved(), "must be Live initially");
@@ -3981,7 +3970,7 @@ fn test_resolved_context_getter() {
     let oracle = 1000u64;
     let slot = 100u64;
     let mut engine = RiskEngine::new_with_market(default_params(), slot, oracle);
-    let _a = engine.add_user(1000).unwrap();
+    let _a = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(_a, 100_000, oracle, slot).unwrap();
     engine.accrue_market_to(slot, oracle, 0).unwrap();
     engine.resolve_market_not_atomic(oracle, oracle, slot, 0).unwrap();

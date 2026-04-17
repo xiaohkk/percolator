@@ -219,7 +219,7 @@ fn t0_4_fee_debt_i128_min() {
 #[kani::solver(cadical)]
 fn proof_notional_flat_is_zero() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
 
     let oracle: u16 = kani::any();
     kani::assume(oracle > 0 && oracle <= 1000);
@@ -235,7 +235,7 @@ fn proof_notional_scales_with_price() {
     // Use the engine's actual notional() function to verify monotonicity
     // through the floor(abs(eff_pos_q) * price / POS_SCALE) formula.
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(idx, 10_000_000, 100, 0).unwrap();
 
     // Give the account a non-zero position
@@ -266,7 +266,7 @@ fn proof_notional_scales_with_price() {
 #[kani::solver(cadical)]
 fn proof_warmup_release_bounded_by_reserved() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(idx, 100_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
     let pnl_val: u16 = kani::any();
@@ -343,7 +343,7 @@ fn proof_ceil_div_positive_checked() {
 #[kani::solver(cadical)]
 fn proof_haircut_mul_div_conservative() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
 
     let pnl_val: u16 = kani::any();
     kani::assume(pnl_val > 0 && pnl_val <= 10_000);

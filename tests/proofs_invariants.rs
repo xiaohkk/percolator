@@ -16,7 +16,7 @@ use common::*;
 #[kani::solver(cadical)]
 fn t0_3_set_pnl_aggregate_exact() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
 
     let old_pnl: i16 = kani::any();
     kani::assume(old_pnl > i16::MIN);
@@ -36,7 +36,7 @@ fn t0_3_set_pnl_aggregate_exact() {
 #[kani::solver(cadical)]
 fn t0_3_sat_all_sign_transitions() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
 
     let old: i16 = kani::any();
     let new: i16 = kani::any();
@@ -113,7 +113,7 @@ fn t0_4_conservation_check_handles_overflow() {
 #[kani::solver(cadical)]
 fn inductive_top_up_insurance_preserves_accounting() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
 
     let dep: u32 = kani::any();
     kani::assume(dep > 0 && dep <= 1_000_000);
@@ -131,7 +131,7 @@ fn inductive_top_up_insurance_preserves_accounting() {
 #[kani::solver(cadical)]
 fn inductive_set_capital_decrease_preserves_accounting() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
 
     let dep: u32 = kani::any();
     kani::assume(dep >= 1000 && dep <= 1_000_000);
@@ -149,8 +149,8 @@ fn inductive_set_capital_decrease_preserves_accounting() {
 #[kani::solver(cadical)]
 fn inductive_set_pnl_preserves_pnl_pos_tot_delta() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let a = engine.add_user(0).unwrap();
-    let b = engine.add_user(0).unwrap();
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
 
     let pnl_a: i32 = kani::any();
     kani::assume(pnl_a > i32::MIN);
@@ -170,7 +170,7 @@ fn inductive_set_pnl_preserves_pnl_pos_tot_delta() {
 #[kani::solver(cadical)]
 fn inductive_deposit_preserves_accounting() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
 
     let dep: u32 = kani::any();
     kani::assume(dep >= 1 && dep <= 1_000_000);
@@ -183,7 +183,7 @@ fn inductive_deposit_preserves_accounting() {
 #[kani::solver(cadical)]
 fn inductive_withdraw_preserves_accounting() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
 
     // Concrete deposit to reduce symbolic state space
     engine.deposit_not_atomic(idx, 100_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
@@ -203,7 +203,7 @@ fn inductive_withdraw_preserves_accounting() {
 #[kani::solver(cadical)]
 fn inductive_settle_loss_preserves_accounting() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
 
     let dep: u32 = kani::any();
     kani::assume(dep >= 1000 && dep <= 1_000_000);
@@ -236,8 +236,8 @@ fn inductive_settle_loss_preserves_accounting() {
 fn prop_pnl_pos_tot_agrees_with_recompute() {
     let mut engine = RiskEngine::new(zero_fee_params());
 
-    let a = engine.add_user(0).unwrap();
-    let b = engine.add_user(0).unwrap();
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
 
     let pnl_a: i32 = kani::any();
     kani::assume(pnl_a > i32::MIN);
@@ -260,7 +260,7 @@ fn prop_pnl_pos_tot_agrees_with_recompute() {
 fn prop_conservation_holds_after_all_ops() {
     let mut engine = RiskEngine::new(zero_fee_params());
 
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
 
     let dep: u32 = kani::any();
     kani::assume(dep > 0 && dep <= 5_000_000);
@@ -298,7 +298,7 @@ fn prop_conservation_holds_after_all_ops() {
 #[kani::should_panic]
 fn proof_set_pnl_rejects_i128_min() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
     // set_pnl returns Err for i128::MIN; unwrap to trigger the expected panic.
     engine.set_pnl(idx as usize, i128::MIN).unwrap();
 }
@@ -308,7 +308,7 @@ fn proof_set_pnl_rejects_i128_min() {
 #[kani::solver(cadical)]
 fn proof_set_pnl_maintains_pnl_pos_tot() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
 
     let pnl1: i32 = kani::any();
     kani::assume(pnl1 > i32::MIN);
@@ -333,7 +333,7 @@ fn proof_set_pnl_underflow_safety() {
     // arbitrary set_pnl_with_reserve transitions.
     let mut engine = RiskEngine::new(zero_fee_params());
     engine.vault = U128::new(10_000); // positive residual for admission
-    let idx = engine.add_user(0).unwrap() as usize;
+    let idx = add_user_test(&mut engine, 0).unwrap() as usize;
 
     // Symbolic positive initial PnL via admission pair
     let pnl1: u8 = kani::any();
@@ -356,7 +356,7 @@ fn proof_set_pnl_underflow_safety() {
 #[kani::solver(cadical)]
 fn proof_set_pnl_clamps_reserved_pnl() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
 
     // Market defaults to Live; set_pnl uses ImmediateReleaseResolvedOnly and errs
     // in Live mode. Use UseAdmissionPair for positive increases (Live-compatible).
@@ -382,7 +382,7 @@ fn proof_set_pnl_clamps_reserved_pnl() {
 #[kani::solver(cadical)]
 fn proof_set_capital_maintains_c_tot() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
 
     let initial: u32 = kani::any();
     kani::assume(initial > 0 && initial <= 1_000_000);
@@ -476,7 +476,7 @@ fn proof_set_position_basis_q_count_tracking() {
     // Substantive: symbolic basis transitions test count tracking across
     // sign changes, zero transitions, and magnitude changes.
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap() as usize;
+    let idx = add_user_test(&mut engine, 0).unwrap() as usize;
 
     let b1: i8 = kani::any();
     let b2: i8 = kani::any();
@@ -515,8 +515,8 @@ fn proof_side_mode_gating() {
     let mut engine = RiskEngine::new(zero_fee_params());
     engine.last_crank_slot = DEFAULT_SLOT;
 
-    let a = engine.add_user(0).unwrap();
-    let b = engine.add_user(0).unwrap();
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(a, 5_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
     engine.deposit_not_atomic(b, 5_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
@@ -540,8 +540,8 @@ fn proof_side_mode_gating() {
 #[kani::solver(cadical)]
 fn proof_account_equity_net_nonnegative() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let a = engine.add_user(0).unwrap();
-    let b = engine.add_user(0).unwrap();
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
 
     let cap_a: u16 = kani::any();
     kani::assume(cap_a > 0 && cap_a <= 10_000);
@@ -577,7 +577,7 @@ fn proof_account_equity_net_nonnegative() {
 #[kani::solver(cadical)]
 fn proof_effective_pos_q_epoch_mismatch_returns_zero() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
 
     engine.accounts[idx as usize].position_basis_q = POS_SCALE as i128;
     engine.accounts[idx as usize].adl_a_basis = ADL_ONE;
@@ -602,7 +602,7 @@ fn proof_effective_pos_q_flat_is_zero() {
     // Substantive: after attaching a symbolic nonzero position and then
     // detaching (attach 0), effective_pos_q returns 0.
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap() as usize;
+    let idx = add_user_test(&mut engine, 0).unwrap() as usize;
 
     // Attach a symbolic nonzero position via the proper path
     let basis: i8 = kani::any();
@@ -621,7 +621,7 @@ fn proof_effective_pos_q_flat_is_zero() {
 #[kani::solver(cadical)]
 fn proof_attach_effective_position_updates_side_counts() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
 
     assert!(engine.stored_pos_count_long == 0);
     assert!(engine.stored_pos_count_short == 0);

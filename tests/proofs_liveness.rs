@@ -45,8 +45,8 @@ fn t11_43_end_instruction_auto_finalizes_ready_side() {
 fn t11_44_trade_path_reopens_ready_reset_side() {
     let mut engine = RiskEngine::new(zero_fee_params());
 
-    let a = engine.add_user(0).unwrap();
-    let b = engine.add_user(0).unwrap();
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(a, 10_000_000, 100, 0).unwrap();
     engine.deposit_not_atomic(b, 10_000_000, 100, 0).unwrap();
 
@@ -220,9 +220,9 @@ fn t11_53_keeper_crank_quiesces_after_pending_reset() {
     engine.adl_epoch_long = 0;
     engine.adl_epoch_short = 0;
 
-    let a = engine.add_user(0).unwrap();
-    let b = engine.add_user(0).unwrap();
-    let c = engine.add_user(0).unwrap();
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
+    let c = add_user_test(&mut engine, 0).unwrap();
 
     // a: long POS_SCALE (entire long side OI), tiny capital → deeply underwater
     engine.deposit_not_atomic(a, 1, 100, 0).unwrap();
@@ -307,8 +307,8 @@ fn proof_keeper_reset_lifecycle_last_stale_triggers_finalize() {
     engine.adl_epoch_long = 1;   // new epoch (post-reset)
     engine.adl_epoch_short = 0;
 
-    let a = engine.add_user(0).unwrap();
-    let b = engine.add_user(0).unwrap();
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
 
     // a: the last stale long account — has a position from epoch 0 (stale)
     engine.deposit_not_atomic(a, 10_000_000, 100, 0).unwrap();
@@ -393,9 +393,9 @@ fn proof_adl_pipeline_trade_liquidate_reopen() {
     let mut engine = RiskEngine::new(zero_fee_params());
     engine.last_crank_slot = DEFAULT_SLOT;
 
-    let a = engine.add_user(0).unwrap();
-    let b = engine.add_user(0).unwrap();
-    let c = engine.add_user(0).unwrap();
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
+    let c = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(a, 100_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
     engine.deposit_not_atomic(b, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
     engine.deposit_not_atomic(c, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();

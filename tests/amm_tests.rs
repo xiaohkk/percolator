@@ -13,7 +13,6 @@ fn default_params() -> RiskParams {
         initial_margin_bps: 1000,    // 10%
         trading_fee_bps: 10,         // 0.1%
         max_accounts: 64,
-        new_account_fee: U128::new(0),
         max_crank_staleness_slots: u64::MAX,
         liquidation_fee_bps: 50,
         liquidation_fee_cap: U128::new(100_000),
@@ -28,6 +27,35 @@ fn default_params() -> RiskParams {
         max_accrual_dt_slots: 1_000,
         max_abs_funding_e9_per_slot: 100_000_000,
     }
+}
+
+/// Helper: allocate a user slot without moving capital. Uses `materialize_at`
+/// (test-visible back-door). The public engine API materializes only via
+/// deposit with amount >= min_initial_deposit — exercised separately.
+#[cfg(feature = "test")]
+fn add_user_test(engine: &mut RiskEngine, _fee_payment: u128) -> Result<u16> {
+    let idx = engine.free_head;
+    if idx == u16::MAX || (idx as usize) >= MAX_ACCOUNTS {
+        return Err(RiskError::Overflow);
+    }
+    engine.materialize_at(idx, 100)?;
+    Ok(idx)
+}
+
+/// Helper: materialize an LP account (materialize as user then rewrite kind).
+#[cfg(feature = "test")]
+#[allow(dead_code)]
+fn add_lp_test(
+    engine: &mut RiskEngine,
+    matcher_program: [u8; 32],
+    matcher_context: [u8; 32],
+    _fee_payment: u128,
+) -> Result<u16> {
+    let idx = add_user_test(engine, 0)?;
+    engine.accounts[idx as usize].kind = Account::KIND_LP;
+    engine.accounts[idx as usize].matcher_program = matcher_program;
+    engine.accounts[idx as usize].matcher_context = matcher_context;
+    Ok(idx)
 }
 
 /// Helper: create i128 position size from base quantity (scaled by POS_SCALE)
@@ -63,8 +91,8 @@ fn test_e2e_complete_user_journey() {
     let _ = engine.top_up_insurance_fund(50_000, 0);
 
     // Add two users with capital
-    let alice = engine.add_user(0).unwrap();
-    let bob = engine.add_user(0).unwrap();
+    let alice = add_user_test(&mut engine, 0).unwrap();
+    let bob = add_user_test(&mut engine, 0).unwrap();
 
     let oracle_price: u64 = 100; // 100 quote per base
 
@@ -177,8 +205,8 @@ fn test_e2e_funding_complete_cycle() {
     let mut engine = Box::new(RiskEngine::new(default_params()));
     let _ = engine.top_up_insurance_fund(50_000, 0);
 
-    let alice = engine.add_user(0).unwrap();
-    let bob = engine.add_user(0).unwrap();
+    let alice = add_user_test(&mut engine, 0).unwrap();
+    let bob = add_user_test(&mut engine, 0).unwrap();
 
     let oracle_price: u64 = 100;
 
@@ -260,8 +288,8 @@ fn test_e2e_negative_funding_rate() {
     let mut engine = Box::new(RiskEngine::new(default_params()));
     let _ = engine.top_up_insurance_fund(50_000, 0);
 
-    let alice = engine.add_user(0).unwrap();
-    let bob = engine.add_user(0).unwrap();
+    let alice = add_user_test(&mut engine, 0).unwrap();
+    let bob = add_user_test(&mut engine, 0).unwrap();
 
     let oracle_price: u64 = 100;
 

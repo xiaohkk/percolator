@@ -16,7 +16,7 @@ use common::*;
 #[kani::solver(cadical)]
 fn proof_a2_reserve_bounds_after_set_pnl() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(idx, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
     let init_pnl: i128 = kani::any();
@@ -52,8 +52,8 @@ fn proof_a2_reserve_bounds_after_set_pnl() {
 #[kani::solver(cadical)]
 fn proof_a7_fee_credits_bounds_after_trade() {
     let mut engine = RiskEngine::new(default_params()); // trading_fee_bps=10
-    let a = engine.add_user(1000).unwrap();
-    let b = engine.add_user(1000).unwrap();
+    let a = add_user_test(&mut engine, 1000).unwrap();
+    let b = add_user_test(&mut engine, 1000).unwrap();
     // Tiny capital so fee exceeds capital → routes through fee_credits
     engine.deposit_not_atomic(a, 100, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
     engine.deposit_not_atomic(b, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
@@ -84,7 +84,7 @@ fn proof_a7_fee_credits_bounds_after_trade() {
 #[kani::solver(cadical)]
 fn proof_f2_insurance_floor_after_absorb() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(idx, 100_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
     let ins_bal: u128 = kani::any();
@@ -117,8 +117,8 @@ fn proof_f2_insurance_floor_after_absorb() {
 #[kani::solver(cadical)]
 fn proof_f8_loss_seniority_in_touch() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let a = engine.add_user(0).unwrap();
-    let b = engine.add_user(0).unwrap();
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(a, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
     engine.deposit_not_atomic(b, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
@@ -152,8 +152,8 @@ fn proof_f8_loss_seniority_in_touch() {
 #[kani::solver(cadical)]
 fn proof_b7_oi_balance_after_trade() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let a = engine.add_user(0).unwrap();
-    let b = engine.add_user(0).unwrap();
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(a, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
     engine.deposit_not_atomic(b, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
@@ -179,8 +179,8 @@ fn proof_b7_oi_balance_after_trade() {
 #[kani::solver(cadical)]
 fn proof_b1_conservation_after_trade_with_fees() {
     let mut engine = RiskEngine::new(default_params());
-    let a = engine.add_user(1000).unwrap();
-    let b = engine.add_user(1000).unwrap();
+    let a = add_user_test(&mut engine, 1000).unwrap();
+    let b = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(a, 100_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
     engine.deposit_not_atomic(b, 100_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
     assert!(engine.check_conservation());
@@ -207,8 +207,8 @@ fn proof_b1_conservation_after_trade_with_fees() {
 #[kani::solver(cadical)]
 fn proof_e8_position_bound_enforcement() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let a = engine.add_user(0).unwrap();
-    let b = engine.add_user(0).unwrap();
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(a, 10_000_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
     engine.deposit_not_atomic(b, 10_000_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
@@ -229,7 +229,7 @@ fn proof_e8_position_bound_enforcement() {
 #[kani::solver(cadical)]
 fn proof_b5_matured_leq_pos_tot() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(idx, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
     let pnl: i128 = kani::any();
@@ -261,8 +261,8 @@ fn proof_b5_matured_leq_pos_tot() {
 #[kani::solver(cadical)]
 fn proof_g4_drain_only_blocks_oi_increase() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let a = engine.add_user(0).unwrap();
-    let b = engine.add_user(0).unwrap();
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(a, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
     engine.deposit_not_atomic(b, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
@@ -289,8 +289,8 @@ fn proof_g4_drain_only_blocks_oi_increase() {
 #[kani::solver(cadical)]
 fn proof_goal5_no_same_trade_bootstrap() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let a = engine.add_user(0).unwrap();
-    let b = engine.add_user(0).unwrap();
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
     // a gets just enough capital to pass IM for a small position,
     // but NOT enough if the trade adds large positive slippage
     engine.deposit_not_atomic(a, 10_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
@@ -340,7 +340,7 @@ fn proof_goal5_no_same_trade_bootstrap() {
 #[kani::solver(cadical)]
 fn proof_goal7_pending_merge_max_horizon() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(idx, 1_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
     // First append creates sched
@@ -380,7 +380,7 @@ fn proof_goal7_pending_merge_max_horizon() {
 #[kani::solver(cadical)]
 fn proof_goal23_deposit_no_insurance_draw() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(idx, 100_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
     let ins_before = engine.insurance_fund.balance.get();
@@ -411,8 +411,8 @@ fn proof_goal23_deposit_no_insurance_draw() {
 #[kani::solver(cadical)]
 fn proof_goal27_finalize_path_independent() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let a = engine.add_user(0).unwrap();
-    let b = engine.add_user(0).unwrap();
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(a, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
     engine.deposit_not_atomic(b, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
@@ -459,7 +459,7 @@ fn proof_goal27_finalize_path_independent() {
 #[kani::solver(cadical)]
 fn proof_two_bucket_reserve_sum_after_append() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(idx, 1_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
     let h_lock: u64 = kani::any();
@@ -495,7 +495,7 @@ fn proof_two_bucket_reserve_sum_after_append() {
 #[kani::solver(cadical)]
 fn proof_two_bucket_loss_newest_first() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(idx, 1_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
     // Create sched + pending
@@ -525,7 +525,7 @@ fn proof_two_bucket_loss_newest_first() {
 #[kani::solver(cadical)]
 fn proof_two_bucket_scheduled_timing() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(idx, 1_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
     let anchor: u128 = kani::any();
@@ -559,7 +559,7 @@ fn proof_two_bucket_scheduled_timing() {
 #[kani::solver(cadical)]
 fn proof_two_bucket_pending_non_maturity() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(idx, 1_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
     // Create sched + pending

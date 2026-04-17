@@ -18,8 +18,8 @@ use common::*;
 fn t3_16_reset_pending_counter_invariant() {
     let mut engine = RiskEngine::new(zero_fee_params());
 
-    let a = engine.add_user(0).unwrap();
-    let b = engine.add_user(0).unwrap();
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(a, 1_000_000, 100, 0).unwrap();
     engine.deposit_not_atomic(b, 1_000_000, 100, 0).unwrap();
 
@@ -57,8 +57,8 @@ fn t3_16_reset_pending_counter_invariant() {
 fn t3_16b_reset_counter_with_nonzero_k_diff() {
     let mut engine = RiskEngine::new(zero_fee_params());
 
-    let a = engine.add_user(0).unwrap();
-    let b = engine.add_user(0).unwrap();
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(a, 10_000_000, 100, 0).unwrap();
     engine.deposit_not_atomic(b, 10_000_000, 100, 0).unwrap();
 
@@ -156,7 +156,7 @@ fn t3_19_finalize_side_reset_requires_all_stale_touched() {
 fn t6_26b_full_drain_reset_nonzero_k_diff() {
     let mut engine = RiskEngine::new(zero_fee_params());
 
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(idx, 10_000_000, 100, 0).unwrap();
 
     engine.accounts[idx as usize].position_basis_q = POS_SCALE as i128;
@@ -197,7 +197,7 @@ fn t6_26b_full_drain_reset_nonzero_k_diff() {
 #[kani::solver(cadical)]
 fn t9_35_warmup_release_monotone_in_time() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(idx, 10_000_000, 100, 0).unwrap();
 
     let pnl_val: u8 = kani::any();
@@ -230,7 +230,7 @@ fn t9_35_warmup_release_monotone_in_time() {
 #[kani::solver(cadical)]
 fn t9_36_fee_seniority_after_restart() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(idx, 10_000_000, 100, 0).unwrap();
 
     let fc_val: i8 = kani::any();
@@ -358,7 +358,7 @@ fn t10_38_accrue_funding_payer_driven() {
 #[kani::solver(cadical)]
 fn t11_39_same_epoch_settle_idempotent_real_engine() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(idx, 10_000_000, 100, 0).unwrap();
 
     let pos = POS_SCALE as i128;
@@ -391,7 +391,7 @@ fn t11_39_same_epoch_settle_idempotent_real_engine() {
 #[kani::solver(cadical)]
 fn t11_40_non_compounding_quantity_basis_two_touches() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(idx, 10_000_000, 100, 0).unwrap();
 
     let pos = POS_SCALE as i128;
@@ -422,7 +422,7 @@ fn t11_40_non_compounding_quantity_basis_two_touches() {
 #[kani::solver(cadical)]
 fn t11_41_attach_effective_position_remainder_accounting() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(idx, 10_000_000, 100, 0).unwrap();
 
     // Use a_basis=7, a_side=6 so that POS_SCALE * 6 % 7 != 0 (nonzero remainder)
@@ -457,8 +457,8 @@ fn t11_41_attach_effective_position_remainder_accounting() {
 #[kani::solver(cadical)]
 fn t11_42_dynamic_dust_bound_inductive() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let a = engine.add_user(0).unwrap();
-    let b = engine.add_user(0).unwrap();
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(a, 10_000_000, 100, 0).unwrap();
     engine.deposit_not_atomic(b, 10_000_000, 100, 0).unwrap();
 
@@ -491,8 +491,8 @@ fn t11_42_dynamic_dust_bound_inductive() {
 fn t11_50_execute_trade_atomic_oi_update_sign_flip() {
     let mut engine = RiskEngine::new(zero_fee_params());
 
-    let a = engine.add_user(0).unwrap();
-    let b = engine.add_user(0).unwrap();
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(a, 100_000_000, 100, 0).unwrap();
     engine.deposit_not_atomic(b, 100_000_000, 100, 0).unwrap();
 
@@ -518,8 +518,8 @@ fn t11_50_execute_trade_atomic_oi_update_sign_flip() {
 fn t11_51_execute_trade_slippage_zero_sum() {
     let mut engine = RiskEngine::new(zero_fee_params());
 
-    let a = engine.add_user(0).unwrap();
-    let b = engine.add_user(0).unwrap();
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(a, 10_000_000, 100, 0).unwrap();
     engine.deposit_not_atomic(b, 10_000_000, 100, 0).unwrap();
 
@@ -543,7 +543,7 @@ fn t11_51_execute_trade_slippage_zero_sum() {
 fn t11_52_touch_account_full_restart_fee_seniority() {
     let mut engine = RiskEngine::new(zero_fee_params());
 
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(idx, 10_000_000, 100, 0).unwrap();
 
     let pos = POS_SCALE as i128;
@@ -594,8 +594,8 @@ fn t11_52_touch_account_full_restart_fee_seniority() {
 fn t11_54_worked_example_regression() {
     let mut engine = RiskEngine::new(zero_fee_params());
 
-    let a = engine.add_user(0).unwrap();
-    let b = engine.add_user(0).unwrap();
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(a, 10_000_000, 100, 0).unwrap();
     engine.deposit_not_atomic(b, 10_000_000, 100, 0).unwrap();
 
@@ -630,8 +630,8 @@ fn t11_54_worked_example_regression() {
 fn t5_24_dynamic_dust_bound_sufficient() {
     let mut engine = RiskEngine::new(zero_fee_params());
 
-    let a = engine.add_user(0).unwrap();
-    let b = engine.add_user(0).unwrap();
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(a, 10_000_000, 100, 0).unwrap();
     engine.deposit_not_atomic(b, 10_000_000, 100, 0).unwrap();
 
@@ -838,8 +838,8 @@ fn t12_53_adl_truncation_dust_must_not_deadlock() {
     let mut engine = RiskEngine::new(zero_fee_params());
     let mut ctx = InstructionContext::new();
 
-    let a = engine.add_user(0).unwrap();
-    let b = engine.add_user(0).unwrap();
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(a, 10_000_000, 100, 0).unwrap();
     engine.deposit_not_atomic(b, 10_000_000, 100, 0).unwrap();
 
@@ -951,7 +951,7 @@ fn t14_61_dust_bound_adl_a_truncation_sufficient() {
 #[kani::solver(cadical)]
 fn t14_62_dust_bound_same_epoch_zeroing() {
     let mut engine = RiskEngine::new(zero_fee_params());
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(idx, 10_000_000, 100, 0).unwrap();
 
     // Use basis=1, a_basis=3 so floor(1 * 1 / 3) = 0 → position zeroes
@@ -1037,9 +1037,9 @@ fn t14_65_dust_bound_end_to_end_clearance() {
     let mut ctx = InstructionContext::new();
 
     // Two long accounts (a,b) and one short (c) for OI balance.
-    let a_idx = engine.add_user(0).unwrap();
-    let b_idx = engine.add_user(0).unwrap();
-    let c_idx = engine.add_user(0).unwrap();
+    let a_idx = add_user_test(&mut engine, 0).unwrap();
+    let b_idx = add_user_test(&mut engine, 0).unwrap();
+    let c_idx = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(a_idx, 10_000_000, 100, 0).unwrap();
     engine.deposit_not_atomic(b_idx, 10_000_000, 100, 0).unwrap();
     engine.deposit_not_atomic(c_idx, 10_000_000, 100, 0).unwrap();
@@ -1130,8 +1130,8 @@ fn proof_fee_shortfall_routes_to_fee_credits() {
     params.trading_fee_bps = 10; // 10 bps
     let mut engine = RiskEngine::new(params);
 
-    let a = engine.add_user(0).unwrap();
-    let b = engine.add_user(0).unwrap();
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(a, 10_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
     engine.deposit_not_atomic(b, 10_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
@@ -1178,8 +1178,8 @@ fn proof_fee_shortfall_routes_to_fee_credits() {
 fn proof_organic_close_bankruptcy_guard() {
     let mut engine = RiskEngine::new(zero_fee_params());
 
-    let a = engine.add_user(0).unwrap();
-    let b = engine.add_user(0).unwrap();
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(a, 10_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
     engine.deposit_not_atomic(b, 10_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
@@ -1207,8 +1207,8 @@ fn proof_organic_close_bankruptcy_guard() {
 fn proof_solvent_flat_close_succeeds() {
     let mut engine = RiskEngine::new(zero_fee_params());
 
-    let a = engine.add_user(0).unwrap();
-    let b = engine.add_user(0).unwrap();
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(a, 1_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
     engine.deposit_not_atomic(b, 1_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
@@ -1245,7 +1245,7 @@ fn proof_property_23_deposit_materialization_threshold() {
     params.min_initial_deposit = U128::new(1000);
     let mut engine = RiskEngine::new(params);
 
-    let existing = engine.add_user(0).unwrap();
+    let existing = add_user_test(&mut engine, 0).unwrap();
 
     // Try to deposit below threshold into unmaterialized account
     let missing: u16 = 3;
@@ -1276,7 +1276,7 @@ fn proof_property_51_withdrawal_dust_guard() {
     params.min_initial_deposit = U128::new(1000);
     let mut engine = RiskEngine::new(params);
 
-    let a = engine.add_user(0).unwrap();
+    let a = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(a, 5000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
     engine.keeper_crank_not_atomic(DEFAULT_SLOT, DEFAULT_ORACLE, &[], 0, 0i128, 0, 100).unwrap();
 
@@ -1307,7 +1307,7 @@ fn proof_property_31_missing_account_safety() {
     let mut engine = RiskEngine::new(zero_fee_params());
 
     // Add one real user for counterparty testing
-    let real = engine.add_user(0).unwrap();
+    let real = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(real, 100_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
     engine.keeper_crank_not_atomic(DEFAULT_SLOT, DEFAULT_ORACLE, &[], 0, 0i128, 0, 100).unwrap();
 
@@ -1356,7 +1356,7 @@ fn proof_property_44_deposit_true_flat_guard() {
     // that insurance_fund doesn't change (resolve_flat_negative calls
     // absorb_protocol_loss which would affect insurance).
     let mut engine = RiskEngine::new(zero_fee_params());
-    let a = engine.add_user(0).unwrap();
+    let a = add_user_test(&mut engine, 0).unwrap();
 
     engine.deposit_not_atomic(a, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
@@ -1405,8 +1405,8 @@ fn proof_property_49_profit_conversion_reserve_preservation() {
     // Converting ReleasedPos_i = x must leave R_i unchanged and reduce
     // both PNL_pos_tot and PNL_matured_pos_tot by exactly x.
     let mut engine = RiskEngine::new(zero_fee_params());
-    let a = engine.add_user(0).unwrap();
-    let b = engine.add_user(0).unwrap();
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
 
     engine.deposit_not_atomic(a, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
     engine.deposit_not_atomic(b, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
@@ -1463,8 +1463,8 @@ fn proof_property_50_flat_only_auto_conversion() {
     // touch_account_live_local on an open-position account must NOT auto-convert.
     // Only flat accounts get auto-conversion via do_profit_conversion.
     let mut engine = RiskEngine::new(zero_fee_params());
-    let a = engine.add_user(0).unwrap();
-    let b = engine.add_user(0).unwrap();
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
 
     engine.deposit_not_atomic(a, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
     engine.deposit_not_atomic(b, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
@@ -1514,8 +1514,8 @@ fn proof_property_52_convert_released_pnl_instruction() {
     // convert_released_pnl_not_atomic consumes only ReleasedPos_i, leaves R_i unchanged,
     // sweeps fee debt, and rejects if post-conversion is not maintenance healthy.
     let mut engine = RiskEngine::new(zero_fee_params());
-    let a = engine.add_user(0).unwrap();
-    let b = engine.add_user(0).unwrap();
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
 
     engine.deposit_not_atomic(a, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
     engine.deposit_not_atomic(b, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
@@ -1642,7 +1642,7 @@ fn proof_audit2_deposit_existing_accepts_small_topup() {
     // Per spec §12 property #23: an existing materialized account may
     // receive deposits smaller than MIN_INITIAL_DEPOSIT.
     let mut engine = RiskEngine::new(zero_fee_params());
-    let a = engine.add_user(0).unwrap();
+    let a = add_user_test(&mut engine, 0).unwrap();
 
     // First deposit to establish the account
     let min_dep = engine.params.min_initial_deposit.get();
@@ -1665,19 +1665,18 @@ fn proof_audit2_deposit_existing_accepts_small_topup() {
 #[kani::solver(cadical)]
 fn proof_audit4_add_user_atomic_on_failure() {
     let mut params = zero_fee_params();
-    params.new_account_fee = U128::new(100);
     let mut engine = RiskEngine::new(params);
 
     // --- Path 1: failure via "no free slots" ---
     for _ in 0..MAX_ACCOUNTS {
-        engine.add_user(100).unwrap();
+        add_user_test(&mut engine, 100).unwrap();
     }
 
     let vault_before = engine.vault.get();
     let ins_before = engine.insurance_fund.balance.get();
     let c_tot_before = engine.c_tot.get();
 
-    let result = engine.add_user(100);
+    let result = add_user_test(&mut engine, 100);
     assert!(result.is_err());
 
     assert!(engine.vault.get() == vault_before,
@@ -1694,7 +1693,6 @@ fn proof_audit4_add_user_atomic_on_failure() {
 #[kani::solver(cadical)]
 fn proof_audit4_add_user_atomic_on_tvl_failure() {
     let mut params = zero_fee_params();
-    params.new_account_fee = U128::new(100);
     let mut engine = RiskEngine::new(params);
 
     // Set vault just below MAX_VAULT_TVL so fee would push it over
@@ -1706,7 +1704,7 @@ fn proof_audit4_add_user_atomic_on_tvl_failure() {
     let used_before = engine.num_used_accounts;
 
     // fee_payment=100 would push vault to MAX_VAULT_TVL+1 — must fail
-    let result = engine.add_user(100);
+    let result = add_user_test(&mut engine, 100);
     assert!(result.is_err());
 
     assert!(engine.vault.get() == vault_before,
@@ -1724,7 +1722,7 @@ fn proof_audit4_add_user_atomic_on_tvl_failure() {
 fn proof_audit4_deposit_fee_credits_max_tvl() {
     let params = zero_fee_params();
     let mut engine = RiskEngine::new(params);
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
 
     // Give account fee debt so deposit is not a no-op
     engine.accounts[idx as usize].fee_credits = I128::new(-1000);

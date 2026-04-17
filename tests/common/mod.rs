@@ -108,7 +108,6 @@ pub fn zero_fee_params() -> RiskParams {
         initial_margin_bps: 1000,
         trading_fee_bps: 0,
         max_accounts: MAX_ACCOUNTS as u64,
-        new_account_fee: U128::ZERO,
         max_crank_staleness_slots: u64::MAX,
         liquidation_fee_bps: 0,
         liquidation_fee_cap: U128::ZERO,
@@ -123,6 +122,43 @@ pub fn zero_fee_params() -> RiskParams {
         max_accrual_dt_slots: 1_000,
         max_abs_funding_e9_per_slot: 100_000_000,
     }
+}
+
+/// Test helper: materialize a user account via deposit_not_atomic (spec §10.2).
+///
+/// v12.18.1 removed add_user / add_lp / materialize_with_fee. The sole
+/// materialization path is deposit with amount >= cfg_min_initial_deposit.
+/// This helper picks the head of the free list and deposits the minimum.
+///
+/// Accepts an unused `_fee_payment` argument for mechanical migration from the
+/// old `add_user_test(&mut engine, fee)` API; the engine no longer charges a fee.
+pub fn add_user_test(engine: &mut RiskEngine, _fee_payment: u128) -> Result<u16> {
+    let idx = engine.free_head;
+    if idx == u16::MAX || (idx as usize) >= MAX_ACCOUNTS {
+        return Err(RiskError::Overflow);
+    }
+    // Use materialize_at (test-visible back-door) to allocate a slot without
+    // moving capital/vault. The public engine API only materializes via
+    // deposit_not_atomic(amount >= min_initial_deposit); that spec-strict
+    // path is exercised in dedicated materialization tests.
+    engine.materialize_at(idx, DEFAULT_SLOT)?;
+    Ok(idx)
+}
+
+/// Test helper: materialize an LP account. The engine has no LP-specific
+/// materialization path under v12.18.1, so this helper materializes via
+/// deposit then rewrites `kind` + matcher fields post-hoc.
+pub fn add_lp_test(
+    engine: &mut RiskEngine,
+    matcher_program: [u8; 32],
+    matcher_context: [u8; 32],
+    _fee_payment: u128,
+) -> Result<u16> {
+    let idx = add_user_test(engine, 0)?;
+    engine.accounts[idx as usize].kind = Account::KIND_LP;
+    engine.accounts[idx as usize].matcher_program = matcher_program;
+    engine.accounts[idx as usize].matcher_context = matcher_context;
+    Ok(idx)
 }
 
 /// Test helper: set PnL to any value, Live-mode compatible.
@@ -152,7 +188,6 @@ pub fn default_params() -> RiskParams {
         initial_margin_bps: 1000,
         trading_fee_bps: 10,
         max_accounts: MAX_ACCOUNTS as u64,
-        new_account_fee: U128::new(1000),
         max_crank_staleness_slots: 1000,
         liquidation_fee_bps: 100,
         liquidation_fee_cap: U128::new(1_000_000),

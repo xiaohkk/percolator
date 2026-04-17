@@ -365,7 +365,7 @@ fn proof_accrue_mark_still_works() {
 fn proof_deposit_no_insurance_draw() {
     let mut engine = RiskEngine::new(zero_fee_params());
 
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
     // Start with zero capital
     engine.deposit_not_atomic(idx, 0, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
@@ -402,7 +402,7 @@ fn proof_deposit_no_insurance_draw() {
 fn proof_deposit_sweep_pnl_guard() {
     let mut engine = RiskEngine::new(zero_fee_params());
 
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
     // Start with zero capital
     engine.deposit_not_atomic(idx, 0, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
@@ -437,7 +437,7 @@ fn proof_deposit_sweep_pnl_guard() {
 fn proof_deposit_sweep_when_pnl_nonneg() {
     let mut engine = RiskEngine::new(zero_fee_params());
 
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
     // Symbolic initial capital — ensures fee_debt_sweep has capital to pay from
     let init_cap: u32 = kani::any();
     kani::assume(init_cap >= 10_000 && init_cap <= 1_000_000);
@@ -520,7 +520,7 @@ fn proof_top_up_insurance_rejects_stale_slot() {
 fn proof_positive_conversion_denominator() {
     let mut engine = RiskEngine::new(zero_fee_params());
 
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(idx, 1_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
     // Set up matured positive PNL
@@ -553,8 +553,8 @@ fn proof_positive_conversion_denominator() {
 fn proof_bilateral_oi_decomposition() {
     let mut engine = RiskEngine::new(zero_fee_params());
 
-    let a = engine.add_user(0).unwrap();
-    let b = engine.add_user(0).unwrap();
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(a, 5_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
     engine.deposit_not_atomic(b, 5_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
     engine.last_crank_slot = DEFAULT_SLOT;
@@ -618,8 +618,8 @@ fn proof_partial_liquidation_remainder_nonzero() {
     params.maintenance_margin_bps = 100; // 1% margin — easy to restore health after partial
     let mut engine = RiskEngine::new(params);
 
-    let a = engine.add_user(0).unwrap();
-    let b = engine.add_user(0).unwrap();
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
     // Small deposit for a — high leverage. Large deposit for b — counterparty.
     engine.deposit_not_atomic(a, 50_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
     engine.deposit_not_atomic(b, 5_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
@@ -665,8 +665,8 @@ fn proof_partial_liquidation_remainder_nonzero() {
 fn proof_liquidation_policy_validity() {
     let mut engine = RiskEngine::new(zero_fee_params());
 
-    let a = engine.add_user(0).unwrap();
-    let b = engine.add_user(0).unwrap();
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(a, 5_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
     engine.deposit_not_atomic(b, 5_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
     engine.last_crank_slot = DEFAULT_SLOT;
@@ -699,7 +699,7 @@ fn proof_liquidation_policy_validity() {
 fn proof_deposit_fee_credits_cap() {
     let mut engine = RiskEngine::new(zero_fee_params());
 
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(idx, 100_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
     // Give fee debt
@@ -738,8 +738,8 @@ fn proof_deposit_fee_credits_cap() {
 fn proof_partial_liq_health_check_mandatory() {
     let mut engine = RiskEngine::new(zero_fee_params());
 
-    let a = engine.add_user(0).unwrap();
-    let b = engine.add_user(0).unwrap();
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(a, 5_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
     engine.deposit_not_atomic(b, 5_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
     engine.last_crank_slot = DEFAULT_SLOT;
@@ -777,7 +777,7 @@ fn proof_partial_liq_health_check_mandatory() {
 fn proof_keeper_crank_r_last_stores_supplied_rate() {
     let mut engine = RiskEngine::new(zero_fee_params());
 
-    let idx = engine.add_user(0).unwrap();
+    let idx = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(idx, 1_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
     // Symbolic supplied rate bounded by the engine's configured params cap
@@ -805,8 +805,8 @@ fn proof_keeper_crank_r_last_stores_supplied_rate() {
 fn proof_deposit_nonflat_no_sweep_no_resolve() {
     let mut engine = RiskEngine::new(zero_fee_params());
 
-    let a = engine.add_user(0).unwrap();
-    let b = engine.add_user(0).unwrap();
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(a, 5_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
     engine.deposit_not_atomic(b, 5_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
     engine.last_crank_slot = DEFAULT_SLOT;
