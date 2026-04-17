@@ -2910,26 +2910,26 @@ fn test_advance_profit_warmup_sched_then_pending_promotion() {
     engine.deposit_not_atomic(idx, 100_000, 1000, 100).unwrap();
     engine.current_slot = 100;
 
-    // Two buckets: sched (10k, h=100) then pending (5k, h=200)
+    // Two buckets: sched (10k, h=50) then pending (5k, h=100).
+    // Both within [cfg_h_min=0, cfg_h_max=100].
     engine.accounts[idx as usize].pnl = 15_000;
     engine.pnl_pos_tot = 15_000;
-    engine.append_or_route_new_reserve(idx as usize, 10_000, 100, 100); // sched: 100-slot horizon
-    engine.append_or_route_new_reserve(idx as usize, 5_000, 100, 200);  // pending: 200-slot horizon
+    engine.append_or_route_new_reserve(idx as usize, 10_000, 100, 50).unwrap();
+    engine.append_or_route_new_reserve(idx as usize, 5_000, 100, 100).unwrap();
 
     assert_eq!(engine.accounts[idx as usize].sched_present, 1);
     assert_eq!(engine.accounts[idx as usize].pending_present, 1);
     assert_eq!(engine.accounts[idx as usize].reserved_pnl, 15_000);
 
-    // At slot 200: sched fully matured -> clears + promotes pending to sched
-    engine.current_slot = 200;
-    engine.advance_profit_warmup(idx as usize);
+    // At slot 150: sched fully matured -> clears + promotes pending to sched
+    engine.current_slot = 150;
+    engine.advance_profit_warmup(idx as usize).unwrap();
 
-    // sched 10_000 fully released, pending promoted to sched (starts at slot 200)
     assert_eq!(engine.accounts[idx as usize].reserved_pnl, 5_000);
     assert_eq!(engine.accounts[idx as usize].sched_present, 1, "pending promoted to sched");
     assert_eq!(engine.accounts[idx as usize].pending_present, 0);
     assert_eq!(engine.accounts[idx as usize].sched_remaining_q, 5_000);
-    assert_eq!(engine.accounts[idx as usize].sched_start_slot, 200);
+    assert_eq!(engine.accounts[idx as usize].sched_start_slot, 150);
 }
 
 #[test]

@@ -2733,7 +2733,10 @@ impl RiskEngine {
                 return Err(RiskError::CorruptState);
             }
         } else {
+            // Spec §4.4/§1.4: pending_horizon in [cfg_h_min, cfg_h_max]
             if a.pending_horizon == 0 { return Err(RiskError::CorruptState); }
+            if a.pending_horizon < self.params.h_min { return Err(RiskError::CorruptState); }
+            if a.pending_horizon > self.params.h_max { return Err(RiskError::CorruptState); }
             if a.pending_remaining_q == 0 { return Err(RiskError::CorruptState); }
         }
         let sched_r = if a.sched_present != 0 { a.sched_remaining_q } else { 0 };
@@ -3823,6 +3826,11 @@ impl RiskEngine {
     ) -> Result<bool> {
                 Self::validate_admission_pair(admit_h_min, admit_h_max, &self.params)?;
 
+        // Spec §9.6 step 2: require account materialized (public entry point).
+        if (idx as usize) >= MAX_ACCOUNTS || !self.is_used(idx as usize) {
+            return Err(RiskError::AccountNotFound);
+        }
+
         // Bounds and existence check BEFORE touch_account_live_local to prevent
         // market-state mutation (accrue_market_to) on missing accounts.
         if idx as usize >= MAX_ACCOUNTS || !self.is_used(idx as usize) {
@@ -4096,8 +4104,9 @@ impl RiskEngine {
         // MAX_TOUCHED_PER_INSTRUCTION = 64 matches LIQ_BUDGET_PER_CRANK.
         self.finalize_touched_accounts_post_live(&ctx)?;
 
-        // GC dust accounts
-        let gc_closed = self.garbage_collect_dust()?;
+        // Note: dust GC is NOT part of keeper_crank per spec §9.7.
+        // Deployments should run reclaim_empty_account_not_atomic explicitly.
+        let gc_closed = 0u32;
 
         // Steps 9-10: end-of-instruction resets
         self.schedule_end_of_instruction_resets(&mut ctx)?;
@@ -4331,9 +4340,18 @@ impl RiskEngine {
             return Err(RiskError::Undercollateralized);
         }
 
-        // Forgive fee debt (safe: position is zero, PnL is zero)
+        // Spec §9.5 step 11: require FeeDebt_i == 0 (fee_credits >= 0).
+        // Voluntary close must not forgive fee debt (unlike reclaim).
         if self.accounts[idx as usize].fee_credits.get() < 0 {
-            self.accounts[idx as usize].fee_credits = I128::ZERO;
+            return Err(RiskError::Undercollateralized);
+        }
+
+        // Spec §9.5 step 10: require R_i == 0 and both reserve buckets absent.
+        if self.accounts[idx as usize].reserved_pnl != 0
+            || self.accounts[idx as usize].sched_present != 0
+            || self.accounts[idx as usize].pending_present != 0
+        {
+            return Err(RiskError::Undercollateralized);
         }
 
         let capital = self.accounts[idx as usize].capital;
@@ -4397,24 +4415,22 @@ impl RiskEngine {
             return Err(RiskError::Overflow);
         }
 
-        // Spec §9.8 clause 5: degenerate recovery branch.
-        // If live_oracle_price == P_last and funding_rate == 0, accrue is a no-op;
-        // skip it so dormant markets (dt > max_accrual_dt_slots) can still resolve.
-        let degenerate = live_oracle_price == self.last_oracle_price && funding_rate_e9 == 0;
+        // Spec §9.8 step 5/6: degenerate vs ordinary branch.
+        let used_degenerate = live_oracle_price == self.last_oracle_price && funding_rate_e9 == 0;
 
-        if degenerate {
-            // No accrue needed. Just advance slots.
+        if used_degenerate {
+            // Step 5: degenerate branch — no accrue, just advance slots.
             self.current_slot = now_slot;
             self.last_market_slot = now_slot;
-            // Band check still runs (against P_last == live_oracle_price).
         } else {
-            // Step 5: self-synchronizing live accrual with trusted current oracle + funding
+            // Step 6: ordinary branch — accrue with live_oracle_price + funding.
             self.accrue_market_to(now_slot, live_oracle_price, funding_rate_e9)?;
         }
 
-        // Step 6: price deviation check against REFRESHED P_last
-        {
-            let p_last = self.last_oracle_price; // now == live_oracle_price
+        // Spec §9.8 step 7: band check only on ordinary branch.
+        // Step 8: degenerate branch skips the ordinary band check entirely.
+        if !used_degenerate {
+            let p_last = self.last_oracle_price; // == live_oracle_price after accrue
             let p_last_i = p_last as i128;
             let p_res = resolved_price as i128;
             let dev_bps = self.params.resolve_price_deviation_bps as i128;
@@ -4422,7 +4438,7 @@ impl RiskEngine {
             let lhs = (diff_abs as u128).checked_mul(10_000).ok_or(RiskError::Overflow)?;
             let rhs = (dev_bps as u128).checked_mul(p_last as u128).ok_or(RiskError::Overflow)?;
             if lhs > rhs {
-                return Err(RiskError::Overflow); // price outside settlement band
+                return Err(RiskError::Overflow);
             }
         }
 
