@@ -162,13 +162,13 @@ pub enum MarketMode {
     Resolved = 1,
 }
 
-/// Reserve mode for set_pnl (spec §4.5, v12.14.0)
+/// Reserve mode for set_pnl (spec §4.8)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReserveMode {
-    /// Route positive increase into cohort queue with this horizon
-    UseHLock(u64),
-    /// Positive increase is immediately released (no reserve)
-    ImmediateRelease,
+    /// Admission-pair: engine decides h_eff from (h_min, h_max) at reserve creation time
+    UseAdmissionPair(u64, u64),
+    /// Immediate release, only valid in Resolved mode (fails on Live)
+    ImmediateReleaseResolvedOnly,
     /// Positive increase is forbidden (returns Err)
     NoPositiveIncreaseAllowed,
 }
@@ -190,11 +190,15 @@ pub const MAX_TOUCHED_PER_INSTRUCTION: usize = 64;
 pub struct InstructionContext {
     pub pending_reset_long: bool,
     pub pending_reset_short: bool,
-    /// Shared warmup horizon for this instruction
-    pub h_lock_shared: u64,
+    /// Shared admission pair for this instruction
+    pub admit_h_min_shared: u64,
+    pub admit_h_max_shared: u64,
     /// Deduplicated touched accounts (ascending order)
     pub touched_accounts: [u16; MAX_TOUCHED_PER_INSTRUCTION],
     pub touched_count: u8,
+    /// Per-instruction sticky set: accounts that required admit_h_max
+    pub h_max_sticky_accounts: [u16; MAX_TOUCHED_PER_INSTRUCTION],
+    pub h_max_sticky_count: u8,
 }
 
 impl InstructionContext {
@@ -202,19 +206,47 @@ impl InstructionContext {
         Self {
             pending_reset_long: false,
             pending_reset_short: false,
-            h_lock_shared: 0,
+            admit_h_min_shared: 0,
+            admit_h_max_shared: 0,
             touched_accounts: [0; MAX_TOUCHED_PER_INSTRUCTION],
             touched_count: 0,
+            h_max_sticky_accounts: [0; MAX_TOUCHED_PER_INSTRUCTION],
+            h_max_sticky_count: 0,
         }
     }
 
-    pub fn new_with_h_lock(h_lock: u64) -> Self {
+    pub fn new_with_admission(admit_h_min: u64, admit_h_max: u64) -> Self {
         Self {
             pending_reset_long: false,
             pending_reset_short: false,
-            h_lock_shared: h_lock,
+            admit_h_min_shared: admit_h_min,
+            admit_h_max_shared: admit_h_max,
             touched_accounts: [0; MAX_TOUCHED_PER_INSTRUCTION],
             touched_count: 0,
+            h_max_sticky_accounts: [0; MAX_TOUCHED_PER_INSTRUCTION],
+            h_max_sticky_count: 0,
+        }
+    }
+
+    /// Check if account is in sticky set
+    pub fn is_h_max_sticky(&self, idx: u16) -> bool {
+        let count = self.h_max_sticky_count as usize;
+        for i in 0..count {
+            if self.h_max_sticky_accounts[i] == idx { return true; }
+        }
+        false
+    }
+
+    /// Insert account into sticky set
+    pub fn mark_h_max_sticky(&mut self, idx: u16) -> bool {
+        if self.is_h_max_sticky(idx) { return true; }
+        let count = self.h_max_sticky_count as usize;
+        if count < MAX_TOUCHED_PER_INSTRUCTION {
+            self.h_max_sticky_accounts[count] = idx;
+            self.h_max_sticky_count += 1;
+            true
+        } else {
+            false
         }
     }
 
@@ -978,20 +1010,78 @@ impl RiskEngine {
     // O(1) Aggregate Helpers (spec §4)
     // ========================================================================
 
+
+    /// admit_fresh_reserve_h_lock (spec §4.7): decide effective horizon for fresh reserve.
+    /// Returns admit_h_min if instant release preserves h=1, admit_h_max otherwise.
+    /// Sticky: once an account gets h_max in this instruction, all later increments also get h_max.
+    fn admit_fresh_reserve_h_lock(
+        &self, idx: usize, fresh_positive_pnl: u128,
+        ctx: &mut InstructionContext, admit_h_min: u64, admit_h_max: u64,
+    ) -> u64 {
+        // Step 1: sticky check
+        if ctx.is_h_max_sticky(idx as u16) { return admit_h_max; }
+        // Step 2: headroom check
+        let senior = self.c_tot.get().saturating_add(self.insurance_fund.balance.get());
+        let residual = self.vault.get().saturating_sub(senior);
+        let matured_plus_fresh = self.pnl_matured_pos_tot.saturating_add(fresh_positive_pnl);
+        let admitted_h_eff = if matured_plus_fresh <= residual {
+            admit_h_min
+        } else {
+            admit_h_max
+        };
+        // Step 3: mark sticky if h_max
+        if admitted_h_eff == admit_h_max {
+            ctx.mark_h_max_sticky(idx as u16);
+        }
+        admitted_h_eff
+    }
+
+    /// admit_outstanding_reserve_on_touch (spec §4.9): accelerate existing reserve if h=1 holds.
+    fn admit_outstanding_reserve_on_touch(&mut self, idx: usize) -> Result<()> {
+        if self.market_mode != MarketMode::Live { return Ok(()); }
+        let a = &self.accounts[idx];
+        let sched_r = if a.sched_present != 0 { a.sched_remaining_q } else { 0 };
+        let pend_r = if a.pending_present != 0 { a.pending_remaining_q } else { 0 };
+        let reserve_total = sched_r.checked_add(pend_r).ok_or(RiskError::CorruptState)?;
+        if reserve_total == 0 { return Ok(()); }
+        let senior = self.c_tot.get().saturating_add(self.insurance_fund.balance.get());
+        let residual = self.vault.get().saturating_sub(senior);
+        let matured_plus_reserve = self.pnl_matured_pos_tot.saturating_add(reserve_total);
+        if matured_plus_reserve <= residual {
+            // Accelerate: release all reserve immediately
+            self.pnl_matured_pos_tot = self.pnl_matured_pos_tot.checked_add(reserve_total)
+                .ok_or(RiskError::Overflow)?;
+            let a = &mut self.accounts[idx];
+            a.sched_present = 0;
+            a.sched_remaining_q = 0;
+            a.sched_anchor_q = 0;
+            a.sched_start_slot = 0;
+            a.sched_horizon = 0;
+            a.sched_release_q = 0;
+            a.pending_present = 0;
+            a.pending_remaining_q = 0;
+            a.pending_horizon = 0;
+            a.pending_created_slot = 0;
+            a.reserved_pnl = 0;
+            if self.pnl_matured_pos_tot > self.pnl_pos_tot { return Err(RiskError::CorruptState); }
+        }
+        Ok(())
+    }
+
     /// set_pnl: thin wrapper routing through set_pnl_with_reserve(ImmediateRelease).
     /// All PnL mutations go through one canonical path. ImmediateRelease routes
     /// positive increases directly to matured (no reserve queue), and decreases
     /// go through apply_reserve_loss_newest_first — replacing the old saturating_sub.
     test_visible! {
     fn set_pnl(&mut self, idx: usize, new_pnl: i128) -> Result<()> {
-        self.set_pnl_with_reserve(idx, new_pnl, ReserveMode::ImmediateRelease)
+        self.set_pnl_with_reserve(idx, new_pnl, ReserveMode::ImmediateReleaseResolvedOnly, None)
     }
     }
 
     /// set_pnl with reserve_mode (spec §4.5, v12.14.0).
     /// Canonical PNL mutation that routes positive increases through the cohort queue.
     test_visible! {
-    fn set_pnl_with_reserve(&mut self, idx: usize, new_pnl: i128, reserve_mode: ReserveMode) -> Result<()> {
+    fn set_pnl_with_reserve(&mut self, idx: usize, new_pnl: i128, reserve_mode: ReserveMode, ctx: Option<&mut InstructionContext>) -> Result<()> {
         if new_pnl == i128::MIN { return Err(RiskError::Overflow); }
 
         let old = self.accounts[idx].pnl;
@@ -1014,13 +1104,16 @@ impl RiskEngine {
                 ReserveMode::NoPositiveIncreaseAllowed => {
                     return Err(RiskError::Overflow);
                 }
-                ReserveMode::UseHLock(h_lock) if h_lock != 0 => {
-                    if self.market_mode != MarketMode::Live { return Err(RiskError::Unauthorized); }
-                    if h_lock < self.params.h_min || h_lock > self.params.h_max {
-                        return Err(RiskError::Overflow);
+                ReserveMode::ImmediateReleaseResolvedOnly => {
+                    if self.market_mode == MarketMode::Live {
+                        return Err(RiskError::Unauthorized);
                     }
                 }
-                _ => {} // ImmediateRelease and UseHLock(0) always valid
+                ReserveMode::UseAdmissionPair(_, _) => {
+                    if self.market_mode != MarketMode::Live {
+                        return Err(RiskError::Unauthorized);
+                    }
+                }
             }
         }
 
@@ -1060,21 +1153,24 @@ impl RiskEngine {
                 ReserveMode::NoPositiveIncreaseAllowed => {
                     return Err(RiskError::Overflow); // unreachable: pre-validated
                 }
-                ReserveMode::ImmediateRelease => {
+                ReserveMode::ImmediateReleaseResolvedOnly => {
+                    // Only valid in Resolved mode (pre-validated above)
                     self.pnl_matured_pos_tot = self.pnl_matured_pos_tot.checked_add(reserve_add)
                         .ok_or(RiskError::Overflow)?;
                     if self.pnl_matured_pos_tot > self.pnl_pos_tot { return Err(RiskError::CorruptState); }
                     return Ok(());
                 }
-                ReserveMode::UseHLock(h_lock) => {
-                    if h_lock == 0 {
+                ReserveMode::UseAdmissionPair(admit_h_min, admit_h_max) => {
+                    // Admission-pair: engine decides effective horizon (spec §4.7)
+                    let ctx = ctx.ok_or(RiskError::CorruptState)?;
+                    let admitted_h_eff = self.admit_fresh_reserve_h_lock(
+                        idx, reserve_add, ctx, admit_h_min, admit_h_max);
+                    if admitted_h_eff == 0 {
                         self.pnl_matured_pos_tot = self.pnl_matured_pos_tot.checked_add(reserve_add)
                             .ok_or(RiskError::Overflow)?;
-                        if self.pnl_matured_pos_tot > self.pnl_pos_tot { return Err(RiskError::CorruptState); }
-                        return Ok(());
+                    } else {
+                        self.append_or_route_new_reserve(idx, reserve_add, self.current_slot, admitted_h_eff)?;
                     }
-                    // h_lock validity already pre-validated above
-                    self.append_or_route_new_reserve(idx, reserve_add, self.current_slot, h_lock)?;
                     if self.pnl_matured_pos_tot > self.pnl_pos_tot { return Err(RiskError::CorruptState); }
                     return Ok(());
                 }
@@ -1588,7 +1684,7 @@ impl RiskEngine {
     /// settle_side_effects_live (spec §5.3, v12.14.0) — routes PnL delta
     /// through set_pnl_with_reserve with UseHLock for cohort queue.
     test_visible! {
-    fn settle_side_effects_with_h_lock(&mut self, idx: usize, h_lock: u64) -> Result<()> {
+    fn settle_side_effects_live(&mut self, idx: usize, ctx: &mut InstructionContext) -> Result<()> {
         let basis = self.accounts[idx].position_basis_q;
         if basis == 0 { return Ok(()); }
 
@@ -1615,7 +1711,7 @@ impl RiskEngine {
                 .ok_or(RiskError::Overflow)?;
             if new_pnl == i128::MIN { return Err(RiskError::Overflow); }
 
-            self.set_pnl_with_reserve(idx, new_pnl, ReserveMode::UseHLock(h_lock))?;
+            self.set_pnl_with_reserve(idx, new_pnl, ReserveMode::UseAdmissionPair(ctx.admit_h_min_shared, ctx.admit_h_max_shared), Some(ctx))?;
 
             if q_eff_new == 0 {
                 self.inc_phantom_dust_bound(side)?;
@@ -1651,7 +1747,7 @@ impl RiskEngine {
             let new_stale = old_stale.checked_sub(1).ok_or(RiskError::CorruptState)?;
 
             // Mutate
-            self.set_pnl_with_reserve(idx, new_pnl, ReserveMode::UseHLock(h_lock))?;
+            self.set_pnl_with_reserve(idx, new_pnl, ReserveMode::UseAdmissionPair(ctx.admit_h_min_shared, ctx.admit_h_max_shared), Some(ctx))?;
             self.set_position_basis_q(idx, 0i128)?;
             self.set_stale_count(side, new_stale);
             self.accounts[idx].adl_a_basis = ADL_ONE;
@@ -1785,11 +1881,12 @@ impl RiskEngine {
     }
 
     /// Validate h_lock before any state mutation.
-    fn validate_h_lock(h_lock: u64, params: &RiskParams) -> Result<()> {
-        if h_lock > params.h_max { return Err(RiskError::Overflow); }
-        // H_lock == 0 (ImmediateRelease) is always legal per spec §1.4.
-        // Nonzero H_lock must be in [H_min, H_max].
-        if h_lock != 0 && h_lock < params.h_min { return Err(RiskError::Overflow); }
+    fn validate_admission_pair(admit_h_min: u64, admit_h_max: u64, params: &RiskParams) -> Result<()> {
+        // spec §1.4: 0 <= admit_h_min <= admit_h_max <= cfg_h_max
+        if admit_h_min > admit_h_max { return Err(RiskError::Overflow); }
+        if admit_h_max > params.h_max { return Err(RiskError::Overflow); }
+        if admit_h_min > 0 && admit_h_min < params.h_min { return Err(RiskError::Overflow); }
+        if admit_h_max > 0 && admit_h_max < params.h_min { return Err(RiskError::Overflow); }
         Ok(())
     }
 
@@ -2789,7 +2886,7 @@ impl RiskEngine {
         self.advance_profit_warmup(idx)?;
 
         // Step 5: settle side effects with H_lock for reserve routing
-        self.settle_side_effects_with_h_lock(idx, ctx.h_lock_shared)?;
+        self.settle_side_effects_live(idx, ctx)?;
 
         // Step 6: settle losses from principal
         self.settle_losses(idx)?;
@@ -3079,9 +3176,10 @@ impl RiskEngine {
         oracle_price: u64,
         now_slot: u64,
         funding_rate_e9: i128,
-        h_lock: u64,
+        admit_h_min: u64,
+        admit_h_max: u64,
     ) -> Result<()> {
-                Self::validate_h_lock(h_lock, &self.params)?;
+                Self::validate_admission_pair(admit_h_min, admit_h_max, &self.params)?;
 
         if oracle_price == 0 || oracle_price > MAX_ORACLE_PRICE {
             return Err(RiskError::Overflow);
@@ -3099,7 +3197,7 @@ impl RiskEngine {
             return Err(RiskError::Unauthorized);
         }
 
-        let mut ctx = InstructionContext::new_with_h_lock(h_lock);
+        let mut ctx = InstructionContext::new_with_admission(admit_h_min, admit_h_max);
 
         // Step 2: accrue market
         self.accrue_market_to(now_slot, oracle_price, funding_rate_e9)?;
@@ -3166,9 +3264,10 @@ impl RiskEngine {
         oracle_price: u64,
         now_slot: u64,
         funding_rate_e9: i128,
-        h_lock: u64,
+        admit_h_min: u64,
+        admit_h_max: u64,
     ) -> Result<()> {
-                Self::validate_h_lock(h_lock, &self.params)?;
+                Self::validate_admission_pair(admit_h_min, admit_h_max, &self.params)?;
 
         if oracle_price == 0 || oracle_price > MAX_ORACLE_PRICE {
             return Err(RiskError::Overflow);
@@ -3181,7 +3280,7 @@ impl RiskEngine {
             return Err(RiskError::Unauthorized);
         }
 
-        let mut ctx = InstructionContext::new_with_h_lock(h_lock);
+        let mut ctx = InstructionContext::new_with_admission(admit_h_min, admit_h_max);
 
         // Step 2: accrue market
         self.accrue_market_to(now_slot, oracle_price, funding_rate_e9)?;
@@ -3216,9 +3315,10 @@ impl RiskEngine {
         size_q: i128,
         exec_price: u64,
         funding_rate_e9: i128,
-        h_lock: u64,
+        admit_h_min: u64,
+        admit_h_max: u64,
     ) -> Result<()> {
-                Self::validate_h_lock(h_lock, &self.params)?;
+                Self::validate_admission_pair(admit_h_min, admit_h_max, &self.params)?;
 
         if oracle_price == 0 || oracle_price > MAX_ORACLE_PRICE {
             return Err(RiskError::Overflow);
@@ -3255,7 +3355,7 @@ impl RiskEngine {
             return Err(RiskError::Unauthorized);
         }
 
-        let mut ctx = InstructionContext::new_with_h_lock(h_lock);
+        let mut ctx = InstructionContext::new_with_admission(admit_h_min, admit_h_max);
 
         // Step 10: accrue market once
         self.accrue_market_to(now_slot, oracle_price, funding_rate_e9)?;
@@ -3346,11 +3446,11 @@ impl RiskEngine {
 
         let pnl_a = self.accounts[a as usize].pnl.checked_add(trade_pnl_a).ok_or(RiskError::Overflow)?;
         if pnl_a == i128::MIN { return Err(RiskError::Overflow); }
-        self.set_pnl_with_reserve(a as usize, pnl_a, ReserveMode::UseHLock(h_lock))?;
+        self.set_pnl_with_reserve(a as usize, pnl_a, ReserveMode::UseAdmissionPair(ctx.admit_h_min_shared, ctx.admit_h_max_shared), Some(&mut ctx))?;
 
         let pnl_b = self.accounts[b as usize].pnl.checked_add(trade_pnl_b).ok_or(RiskError::Overflow)?;
         if pnl_b == i128::MIN { return Err(RiskError::Overflow); }
-        self.set_pnl_with_reserve(b as usize, pnl_b, ReserveMode::UseHLock(h_lock))?;
+        self.set_pnl_with_reserve(b as usize, pnl_b, ReserveMode::UseAdmissionPair(ctx.admit_h_min_shared, ctx.admit_h_max_shared), Some(&mut ctx))?;
 
         // Step 8: attach effective positions
         self.attach_effective_position(a as usize, new_eff_a)?;
@@ -3651,9 +3751,10 @@ impl RiskEngine {
         oracle_price: u64,
         policy: LiquidationPolicy,
         funding_rate_e9: i128,
-        h_lock: u64,
+        admit_h_min: u64,
+        admit_h_max: u64,
     ) -> Result<bool> {
-                Self::validate_h_lock(h_lock, &self.params)?;
+                Self::validate_admission_pair(admit_h_min, admit_h_max, &self.params)?;
 
         // Bounds and existence check BEFORE touch_account_live_local to prevent
         // market-state mutation (accrue_market_to) on missing accounts.
@@ -3665,7 +3766,7 @@ impl RiskEngine {
             return Err(RiskError::Unauthorized);
         }
 
-        let mut ctx = InstructionContext::new_with_h_lock(h_lock);
+        let mut ctx = InstructionContext::new_with_admission(admit_h_min, admit_h_max);
 
         // Step 2: accrue market
         self.accrue_market_to(now_slot, oracle_price, funding_rate_e9)?;
@@ -3814,7 +3915,7 @@ impl RiskEngine {
                 if d != 0 {
                     // Spec §8.5 step 8: NoPositiveIncreaseAllowed for defense-in-depth
                     self.set_pnl_with_reserve(idx as usize, 0i128,
-                        ReserveMode::NoPositiveIncreaseAllowed)?;
+                        ReserveMode::NoPositiveIncreaseAllowed, None)?;
                 }
 
                 Ok(true)
@@ -3836,9 +3937,10 @@ impl RiskEngine {
         ordered_candidates: &[(u16, Option<LiquidationPolicy>)],
         max_revalidations: u16,
         funding_rate_e9: i128,
-        h_lock: u64,
+        admit_h_min: u64,
+        admit_h_max: u64,
     ) -> Result<CrankOutcome> {
-                Self::validate_h_lock(h_lock, &self.params)?;
+                Self::validate_admission_pair(admit_h_min, admit_h_max, &self.params)?;
 
         if oracle_price == 0 || oracle_price > MAX_ORACLE_PRICE {
             return Err(RiskError::Overflow);
@@ -3854,7 +3956,7 @@ impl RiskEngine {
             max_revalidations, MAX_TOUCHED_PER_INSTRUCTION as u16);
 
         // Step 1: initialize instruction context
-        let mut ctx = InstructionContext::new_with_h_lock(h_lock);
+        let mut ctx = InstructionContext::new_with_admission(admit_h_min, admit_h_max);
 
         // Steps 2-4: validate inputs
         if now_slot < self.current_slot {
@@ -4038,9 +4140,10 @@ impl RiskEngine {
         oracle_price: u64,
         now_slot: u64,
         funding_rate_e9: i128,
-        h_lock: u64,
+        admit_h_min: u64,
+        admit_h_max: u64,
     ) -> Result<()> {
-                Self::validate_h_lock(h_lock, &self.params)?;
+                Self::validate_admission_pair(admit_h_min, admit_h_max, &self.params)?;
 
         if oracle_price == 0 || oracle_price > MAX_ORACLE_PRICE {
             return Err(RiskError::Overflow);
@@ -4053,7 +4156,7 @@ impl RiskEngine {
             return Err(RiskError::Unauthorized);
         }
 
-        let mut ctx = InstructionContext::new_with_h_lock(h_lock);
+        let mut ctx = InstructionContext::new_with_admission(admit_h_min, admit_h_max);
 
         // Step 2: accrue market
         self.accrue_market_to(now_slot, oracle_price, funding_rate_e9)?;
@@ -4127,8 +4230,8 @@ impl RiskEngine {
     // close_account_not_atomic
     // ========================================================================
 
-    pub fn close_account_not_atomic(&mut self, idx: u16, now_slot: u64, oracle_price: u64, funding_rate_e9: i128, h_lock: u64) -> Result<u128> {
-                Self::validate_h_lock(h_lock, &self.params)?;
+    pub fn close_account_not_atomic(&mut self, idx: u16, now_slot: u64, oracle_price: u64, funding_rate_e9: i128, admit_h_min: u64, admit_h_max: u64) -> Result<u128> {
+                Self::validate_admission_pair(admit_h_min, admit_h_max, &self.params)?;
 
         if self.market_mode != MarketMode::Live {
             return Err(RiskError::Unauthorized);
@@ -4138,7 +4241,7 @@ impl RiskEngine {
             return Err(RiskError::AccountNotFound);
         }
 
-        let mut ctx = InstructionContext::new_with_h_lock(h_lock);
+        let mut ctx = InstructionContext::new_with_admission(admit_h_min, admit_h_max);
 
         // Accrue market + live local touch + finalize
         self.accrue_market_to(now_slot, oracle_price, funding_rate_e9)?;

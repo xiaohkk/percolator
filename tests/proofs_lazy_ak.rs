@@ -288,7 +288,7 @@ fn t3_14_epoch_mismatch_forces_terminal_close() {
 
     let pnl_before = engine.accounts[idx as usize].pnl;
 
-    let result = engine.settle_side_effects_with_h_lock(idx as usize, 0);
+    let result = { let mut _ctx = InstructionContext::new_with_admission(0, 0); engine.settle_side_effects_live(idx as usize, &mut _ctx) };
     assert!(result.is_ok());
 
     assert!(engine.accounts[idx as usize].position_basis_q == 0);
@@ -336,7 +336,7 @@ fn t3_14b_epoch_mismatch_with_nonzero_k_diff() {
 
     let pnl_before = engine.accounts[idx as usize].pnl;
 
-    let result = engine.settle_side_effects_with_h_lock(idx as usize, 0);
+    let result = { let mut _ctx = InstructionContext::new_with_admission(0, 0); engine.settle_side_effects_live(idx as usize, &mut _ctx) };
     assert!(result.is_ok());
 
     assert!(engine.accounts[idx as usize].position_basis_q == 0);
@@ -546,7 +546,7 @@ fn t6_26_full_drain_reset_regression() {
 
     let pnl_before = engine.accounts[idx as usize].pnl;
 
-    let result = engine.settle_side_effects_with_h_lock(idx as usize, 0);
+    let result = { let mut _ctx = InstructionContext::new_with_admission(0, 0); engine.settle_side_effects_live(idx as usize, &mut _ctx) };
     assert!(result.is_ok());
 
     assert!(engine.accounts[idx as usize].position_basis_q == 0);
@@ -598,7 +598,7 @@ fn proof_property_43_k_pair_chronology_correctness() {
     let pnl_before = engine.accounts[idx as usize].pnl;
 
     // settle_side_effects uses the real engine ordering
-    let result = engine.settle_side_effects_with_h_lock(idx as usize, 0);
+    let result = { let mut _ctx = InstructionContext::new_with_admission(0, 0); engine.settle_side_effects_live(idx as usize, &mut _ctx) };
     assert!(result.is_ok());
 
     let pnl_after = engine.accounts[idx as usize].pnl;

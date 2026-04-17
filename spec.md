@@ -1,24 +1,27 @@
-# Risk Engine Spec (Source of Truth) — v12.17.0
+
+# Risk Engine Spec (Source of Truth) — v12.18.1
 
 **Combined Single-Document Native 128-bit Revision  
-(Wrapper-Driven Warmup Horizon / Wrapper-Owned Account-Fee Policy / Wrapper-Supplied High-Precision Funding Side-Index Input / Simplified Scheduled-Plus-Pending Warmup / Exact Candidate-Trade Neutralization / Self-Synchronizing Terminal-K-Delta Resolved Settlement / Whole-Only Automatic Flat Conversion / Full-Local-PnL Maintenance / Immutable Configuration / Unencumbered-Flat Deposit Sweep / Mandatory Post-Partial Local Health Check Edition)**
+(Wrapper-Owned Two-Point Warmup Admission / Touch-Time Reserve Re-Admission / Wrapper-Owned Account-Fee Policy / Wrapper-Supplied High-Precision Funding Side-Index Input / Simplified Scheduled-Plus-Pending Warmup / Exact Candidate-Trade Neutralization / Self-Synchronizing Terminal-K-Delta Resolved Settlement / Whole-Only Automatic Flat Conversion / Full-Local-PnL Maintenance / Immutable Configuration / Unencumbered-Flat Deposit Sweep / Mandatory Post-Partial Local Health Check Edition)**
 
 **Design:** Protected Principal + Junior Profit Claims + Lazy A/K/F Side Indices (Native 128-bit Base-10 Scaling)  
 **Status:** implementation source of truth (normative language: MUST / MUST NOT / SHOULD / MAY)  
 **Scope:** perpetual DEX risk engine for a single quote-token vault
 
-This revision supersedes v12.16.9. It keeps the two-bucket warmup model and fixes the remaining non-minor safety, liveness, and implementation-spec issues:
+This revision supersedes v12.18.0. It retains the two-bucket warmup design, keeps resolved settlement terminal-delta based, and addresses the remaining production-blocking issues by:
 
-1. the ADL precision scale is raised substantially and the drain threshold is raised with it, so same-epoch A-decay dust remains economically negligible before a side enters `DrainOnly`,
-2. `resolve_market` remains self-synchronizing and terminal-delta based, but the spec now keeps its trusted-input boundaries explicit,
-3. the canonical K/F fusion helper now has an explicit mathematical law, including the mandatory `FUNDING_DEN` un-scaling and exact floor semantics,
-4. warmup release now clamps elapsed time at the bucket horizon before evaluating maturity, eliminating the dormant-account quotient-overflow liveness trap,
-5. voluntary closes to flat now use the same fee-neutral shortfall-comparison principle as other strict risk-reducing trades, so pre-existing fee debt no longer forces users into dust-position exits,
-6. `set_pnl` positive-reserve creation now writes `PNL_i` before reserve state so `R_i <= max(PNL_i, 0)` never becomes transiently false inside a successful path,
-7. stale-path helpers now name their `den` context explicitly and require nonzero stale counters before decrement,
-8. epoch increments are now explicitly checked and must fail conservatively on overflow,
-9. resolved and live helper cross-references and runtime preconditions are clarified where the previous draft was ambiguous,
-10. all prior conservation, readiness, terminal-delta, and fee-equity-impact fixes are retained.
+1. replacing the live single-horizon input with a **wrapper-supplied two-point admission pair** `(admit_h_min, admit_h_max)`,
+2. replacing the full per-account admitted-horizon cache with an **engine-enforced sticky-`admit_h_max` rule** so later same-instruction fresh PnL cannot be under-admitted,
+3. forbidding the live `ImmediateRelease` backdoor and restricting immediate release on positive live PnL only to **admitted `h_eff = 0`** outcomes,
+4. adding **touch-time outstanding-reserve re-admission** so already-reserved profit can mature immediately when the current global state safely admits it,
+5. hardening funding liveness with an **engine-enforced funding envelope** and an explicit privileged stale-resolution recovery branch:
+   - immutable `max_accrual_dt_slots`,
+   - immutable `max_abs_funding_e9_per_slot`,
+   - init-time exact validation that the worst-case funding delta fits persistent `i128`,
+   - per-call `dt <= max_accrual_dt_slots`,
+6. making touched-account and admission-state capacities explicit and non-silent,
+7. clarifying keeper ordering as an explicit wrapper / keeper policy choice rather than an implicit engine guarantee, and
+8. retaining all prior conservation, counter, payout-snapshot, fee-equity-impact, touch-time acceleration, and terminal-delta fixes.
 
 The engine core keeps only:
 
@@ -34,7 +37,7 @@ The engine core keeps only:
 
 The following policy inputs are wrapper-owned and are **not** computed by the engine core:
 
-- the warmup horizon chosen for a live accrued instruction that may create new reserve,
+- the two-point warmup admission pair `(admit_h_min, admit_h_max)` chosen for a live accrued instruction that may create new reserve,
 - any optional wrapper-owned per-account fee policy beyond engine-native trading and liquidation fees,
 - the funding rate applied to the elapsed live interval,
 - any public execution-price admissibility policy,
@@ -63,7 +66,7 @@ The engine MUST provide the following properties.
 13. **Resolved-close liveness split:** after a resolved account is locally reconciled, an account with `PNL_i <= 0` MUST be closable immediately; an account with `PNL_i > 0` MAY wait for global terminal-readiness and shared snapshot capture before payout.
 14. **No zombie poisoning of the matured-profit haircut:** non-interacting accounts MUST NOT indefinitely pin the matured-profit haircut denominator `h` with fresh unwarmed PnL. Touched accounts MUST make warmup progress.
 15. **Funding, mark, and ADL exactness under laziness:** any quantity whose correct value depends on the position held over an interval MUST be represented through A/K/F side indices or a formally equivalent event-segmented method. Integer rounding at settlement MUST NOT mint positive aggregate claims.
-16. **Economically negligible ADL truncation before `DrainOnly`:** under the configured `ADL_ONE` and `MIN_A_SIDE`, same-epoch A-decay dust that is deferred into `phantom_dust_bound_*_q` MUST remain economically negligible before a side can remain live in `DrainOnly`.
+16. **Economically negligible ADL truncation before `DrainOnly`:** under the configured `ADL_ONE` and `MIN_A_SIDE`, same-epoch A-decay dust deferred into `phantom_dust_bound_*_q` MUST remain economically negligible before a side can remain live in `DrainOnly`.
 17. **No hidden protocol MM:** the protocol MUST NOT secretly internalize user flow against an undisclosed residual inventory.
 18. **Defined recovery from precision stress:** the engine MUST define deterministic recovery when side precision is exhausted. It MUST NOT rely on assertion failure, silent overflow, or permanent `DrainOnly` states.
 19. **No sequential quantity dependency:** same-epoch account settlement MUST be fully local. It MAY depend on the account’s own stored basis and current global side state, but MUST NOT require a canonical-order prefix or global carry cursor.
@@ -75,25 +78,27 @@ The engine MUST provide the following properties.
 25. **Finite-capacity liveness:** because account capacity is finite, the engine MUST provide permissionless dead-account reclamation or equivalent slot reuse so abandoned empty accounts and flat dust accounts below the live-balance floor cannot permanently exhaust capacity.
 26. **Permissionless off-chain keeper compatibility:** candidate discovery MAY be performed entirely off chain. The engine MUST expose exact current-state shortlist processing and targeted per-account settle, liquidate, reclaim, or resolved-close paths so any permissionless keeper can make liquidation and reset progress without any required on-chain phase-1 scan.
 27. **No pure-capital insurance draw without accrual:** pure capital-flow instructions (`deposit`, `deposit_fee_credits`, `top_up_insurance_fund`, `charge_account_fee`) that do not call `accrue_market_to` MUST NOT decrement `I` or record uninsured protocol loss.
-28. **Configuration immutability within a market instance:** warmup bounds, trade-fee, margin, liquidation, insurance-floor, and live-balance-floor parameters MUST remain fixed for the lifetime of a market instance unless a future revision defines an explicit safe update procedure.
+28. **Configuration immutability within a market instance:** warmup bounds, admission bounds, trade-fee, margin, liquidation, insurance-floor, funding envelope, and live-balance-floor parameters MUST remain fixed for the lifetime of a market instance unless a future revision defines an explicit safe update procedure.
 29. **Scheduled-bucket exactness:** the active scheduled reserve bucket MUST mature according to its stored `sched_horizon` up to the required integer flooring and reserve-loss caps.
 30. **Resolved-market close exactness:** resolved-market close MUST be defined through canonical helpers. It MUST NOT rely on direct zero-writes that bypass `C_tot`, `PNL_pos_tot`, `PNL_matured_pos_tot`, reserve state, or reset counters.
 31. **Path-independent touched-account finalization:** flat auto-conversion and fee-debt sweep on live touched accounts MUST depend only on the post-live touched state and the shared conversion snapshot, not on whether the instruction was single-touch or multi-touch.
 32. **No resolved payout race:** resolved accounts with positive claims MUST NOT be terminally paid out until stale-account reconciliation is complete across both sides and the shared resolved-payout snapshot is locked.
 33. **Path-independent resolved positive payouts:** once stale-account reconciliation is complete and terminal payout becomes unlocked, all positive resolved payouts MUST use one shared resolved-payout snapshot so caller order cannot improve the payout ratio.
-34. **Bounded resolved settlement price:** the resolved settlement price used in `resolve_market` MUST remain within an immutable deviation band of the last live effective mark `P_last`.
+34. **Bounded resolved settlement price on the ordinary resolution path:** when `resolve_market` uses its ordinary self-synchronizing live-sync branch, the resolved settlement price MUST remain within an immutable deviation band of the trusted live-sync price supplied for that instruction. The privileged degenerate recovery branch may bypass this band and rely entirely on trusted settlement inputs.
 35. **No permissionless haircut realization of flat released profit:** automatic flat conversion in live instructions MUST occur only at a whole snapshot (`h = 1`). Any lossy conversion of released profit under `h < 1` MUST be an explicit user action.
-36. **No retroactive funding erasure at resolution:** the zero-funding settlement shift inside `resolve_market` MUST only operate on market state already accrued through the resolution slot, so the settlement transition cannot erase elapsed live funding.
-37. **No silent touched-set truncation:** every account touched by live local-touch MUST either be recorded for end-of-instruction finalization or the instruction MUST fail conservatively.
-38. **No valid-price sentinel overloading:** no strictly positive price value may be used as an “uninitialized” sentinel for `P_last`, `fund_px_last`, or any other economically meaningful stored price.
-
-39. **Self-synchronizing resolution:** `resolve_market` MUST synchronize live accrual to its resolution slot inside the same top-level instruction before applying the final zero-funding settlement shift. It MUST NOT depend on a separate prior accrual transaction for correctness or liveness.
+36. **No retroactive funding erasure at ordinary resolution:** in the ordinary self-synchronizing `resolve_market` path, the zero-funding settlement shift MUST only operate on market state already accrued through the resolution slot, so the settlement transition cannot erase elapsed live funding. The privileged degenerate recovery branch may intentionally skip omitted live accrual after `slot_last` and therefore must rely entirely on trusted settlement policy.
+37. **No silent touched-set or admission-state truncation:** every account touched by live local touch and every account recorded in instruction-local admission state MUST either be tracked in the instruction context or the instruction MUST fail conservatively.
+38. **No valid-price sentinel overloading:** no strictly positive price value may be used as an “uninitialized” sentinel for `P_last`, `fund_px_last`, or any other economically meaningful stored price field.
+39. **Self-synchronizing resolution with a privileged degenerate-recovery escape hatch:** `resolve_market` MUST ordinarily synchronize live accrual to its resolution slot inside the same top-level instruction before applying the final zero-funding settlement shift. The same privileged instruction MAY instead take the explicit degenerate recovery branch described in §9.8 when the deployment needs to avoid additional live-state shift — for example because the accrual envelope has already been exceeded or cumulative `K` or `F` headroom is tight.
 40. **Bounded-cost exact arithmetic:** the specification MUST permit exact implementations of scheduled warmup release and funding accrual without runtime work proportional to elapsed slots and without relying on narrow intermediate products that can overflow before the exact quotient is taken.
-41. **Runtime-aware deployment constraints:** on constrained runtimes, deployments MUST choose batch sizes, account-opening economics, and wrapper composition so exact wide arithmetic, materialized-account capacity, and transaction-size limits do not create avoidable operational deadlocks.
-42. **Resolution must not depend on cumulative-K absorption of the final settlement mark:** the final settlement price shift MAY be stored as separate resolved terminal K deltas rather than added into persistent live `K_side`.
+41. **Runtime-aware deployment constraints:** on constrained runtimes, deployments MUST choose batch sizes, account-opening economics, funding envelopes, and wrapper composition so exact wide arithmetic, materialized-account capacity, and transaction-size limits do not create avoidable operational deadlocks.
+42. **Resolution must not depend on cumulative-K absorption of the final settlement mark:** the final settlement price shift is carried as separate resolved terminal K deltas rather than added into persistent live `K_side`.
 43. **Resolved reconciliation must not deadlock on live-only claim caps:** once the market is resolved, local reconciliation MAY exceed live-market positive-PnL caps so long as all persistent values remain representable and terminal payout remains snapshot-capped.
-**Atomic execution model:** every top-level external instruction defined in §9 MUST be atomic. If any required precondition, checked-arithmetic guard, or conservative-failure condition fails, the instruction MUST roll back all state mutations performed since that instruction began.
+44. **No live positive-PnL bypass of admission:** every positive reserve-creating event on a live market MUST pass through the two-point admission rule; there is no unconditional live `ImmediateRelease` path.
+45. **No same-instruction under-admission:** within one top-level instruction, once an account requires the slow admitted horizon `admit_h_max` for any fresh positive increment, all later fresh positive increments on that account in that instruction MUST also use `admit_h_max`. An earlier newest pending increment MAY be conservatively lifted to `admit_h_max` if it merges with a later slower-admitted increment; under-admission is forbidden.
+46. **Touch-time reserve acceleration is monotone:** touching a live account may only accelerate existing reserve by removing buckets when the current state safely admits immediate release; it MUST never extend or re-lock reserve.
 
+**Atomic execution model:** every top-level external instruction defined in §9 MUST be atomic. If any required precondition, checked-arithmetic guard, or conservative-failure condition fails, the instruction MUST roll back all state mutations performed since that instruction began.
 
 ---
 
@@ -110,7 +115,7 @@ The engine MUST provide the following properties.
 
 - `POS_SCALE = 1_000_000`.
 - `price: u64` is quote-token atomic units per `1` base.
-- Every external price input, including `oracle_price`, `exec_price`, `resolved_price`, and any stored funding-price sample, MUST satisfy `0 < price <= MAX_ORACLE_PRICE`.
+- Every external price input, including `oracle_price`, `exec_price`, `live_oracle_price`, `resolved_price`, and any stored funding-price sample, MUST satisfy `0 < price <= MAX_ORACLE_PRICE`.
 - The engine stores position bases as signed fixed-point base quantities:
   - `basis_pos_q_i: i128`, units `(base * POS_SCALE)`.
 - Oracle notional:
@@ -126,9 +131,9 @@ The engine MUST provide the following properties.
 - `FUNDING_DEN = 1_000_000_000`.
 - `F_side_num` has units `(ADL scale) * (quote atomic units per 1 base) * FUNDING_DEN`.
 
-### 1.4 Normative bounds
+### 1.4 Normative bounds and configuration
 
-The following bounds are normative and MUST be enforced.
+Global hard bounds:
 
 - `MAX_VAULT_TVL = 10_000_000_000_000_000`
 - `MAX_ORACLE_PRICE = 1_000_000_000_000`
@@ -137,47 +142,74 @@ The following bounds are normative and MUST be enforced.
 - `MAX_OI_SIDE_Q = 100_000_000_000_000`
 - `MAX_ACCOUNT_NOTIONAL = 100_000_000_000_000_000_000`
 - `MAX_PROTOCOL_FEE_ABS = 1_000_000_000_000_000_000_000_000_000_000_000_000`
-- `MAX_ABS_FUNDING_E9_PER_SLOT = 1_000_000_000`
+- `GLOBAL_MAX_ABS_FUNDING_E9_PER_SLOT = 1_000_000_000`
 - `MAX_TRADING_FEE_BPS = 10_000`
 - `MAX_INITIAL_BPS = 10_000`
 - `MAX_MAINTENANCE_BPS = 10_000`
 - `MAX_LIQUIDATION_FEE_BPS = 10_000`
 - `MAX_MATERIALIZED_ACCOUNTS = 1_000_000`
 - `MAX_ACTIVE_POSITIONS_PER_SIDE` MUST be finite and MUST NOT exceed `MAX_MATERIALIZED_ACCOUNTS`
-- `MAX_ACCOUNT_POSITIVE_PNL = 100_000_000_000_000_000_000_000_000_000_000`
-- `MAX_PNL_POS_TOT = 100_000_000_000_000_000_000_000_000_000_000_000_000`
+- `MAX_ACCOUNT_POSITIVE_PNL_LIVE = 100_000_000_000_000_000_000_000_000_000_000`
+- `MAX_PNL_POS_TOT_LIVE = 100_000_000_000_000_000_000_000_000_000_000_000_000`
 - `MIN_A_SIDE = 100_000_000_000_000`
 - `MAX_WARMUP_SLOTS = 18_446_744_073_709_551_615`
 - `MAX_RESOLVE_PRICE_DEVIATION_BPS = 10_000`
 
-The `ADL_ONE` and `MIN_A_SIDE` values above are intentionally paired: before a side enters `DrainOnly`, one-step same-epoch A-decay dust at `MAX_OI_SIDE_Q` is bounded to economically negligible q-units per position rather than whole-base-unit jumps.
-- `0 <= I_floor <= MAX_VAULT_TVL`
-- `0 <= min_liquidation_abs <= liquidation_fee_cap <= MAX_PROTOCOL_FEE_ABS`
+Immutable per-market configuration:
+
+- `cfg_h_min`
+- `cfg_h_max`
+- `cfg_maintenance_bps`
+- `cfg_initial_bps`
+- `cfg_trading_fee_bps`
+- `cfg_liquidation_fee_bps`
+- `cfg_liquidation_fee_cap`
+- `cfg_min_liquidation_abs`
+- `cfg_min_initial_deposit`
+- `cfg_min_nonzero_mm_req`
+- `cfg_min_nonzero_im_req`
+- `cfg_insurance_floor`
+- `cfg_resolve_price_deviation_bps`
+- `cfg_max_active_positions_per_side`
+- `cfg_max_accrual_dt_slots`
+- `cfg_max_abs_funding_e9_per_slot`
 
 Configured values MUST satisfy:
 
-- `0 < MIN_INITIAL_DEPOSIT <= MAX_VAULT_TVL`
-- `0 < MIN_NONZERO_MM_REQ < MIN_NONZERO_IM_REQ <= MIN_INITIAL_DEPOSIT`
-- `0 <= maintenance_bps <= initial_bps <= MAX_INITIAL_BPS`
-- `0 <= H_min <= H_max <= MAX_WARMUP_SLOTS`
-- for live accrued instructions, `H_lock` MUST satisfy either `H_lock == 0` or `H_min <= H_lock <= H_max`
-- `0 <= resolve_price_deviation_bps <= MAX_RESOLVE_PRICE_DEVIATION_BPS`
-- `A_side > 0` whenever `OI_eff_side > 0` and the side is still representable
+- `0 < cfg_min_initial_deposit <= MAX_VAULT_TVL`
+- `0 < cfg_min_nonzero_mm_req < cfg_min_nonzero_im_req <= cfg_min_initial_deposit`
+- `0 <= cfg_maintenance_bps <= cfg_initial_bps <= MAX_INITIAL_BPS`
+- `0 <= cfg_h_min <= cfg_h_max <= MAX_WARMUP_SLOTS`
+- live instruction admission pairs MUST satisfy `0 <= admit_h_min <= admit_h_max <= cfg_h_max`
+- if `admit_h_min > 0`, then `admit_h_min >= cfg_h_min`
+- for live instructions that may create fresh reserve, `admit_h_max > 0` and `admit_h_max >= cfg_h_min`
+- `0 <= cfg_resolve_price_deviation_bps <= MAX_RESOLVE_PRICE_DEVIATION_BPS`
+- `0 <= cfg_insurance_floor <= MAX_VAULT_TVL`
+- `0 <= cfg_min_liquidation_abs <= cfg_liquidation_fee_cap <= MAX_PROTOCOL_FEE_ABS`
+- `0 < cfg_max_active_positions_per_side <= MAX_ACTIVE_POSITIONS_PER_SIDE`
+- `0 < cfg_max_accrual_dt_slots <= MAX_WARMUP_SLOTS`
+- `0 <= cfg_max_abs_funding_e9_per_slot <= GLOBAL_MAX_ABS_FUNDING_E9_PER_SLOT`
+- exact init-time funding-envelope validation:
+  - `ADL_ONE * MAX_ORACLE_PRICE * cfg_max_abs_funding_e9_per_slot * cfg_max_accrual_dt_slots <= i128::MAX`
+  - this validation MUST be performed in an exact wide signed domain of at least 256 bits, or a formally equivalent exact method
 
-If the deployment also defines a stale-market resolution delay `permissionless_resolve_stale_slots`, market initialization MUST additionally require:
+If the deployment also defines a stale-market resolution delay `permissionless_resolve_stale_slots` and expects permissionless resolution to remain callable after that delay, then initialization MUST additionally require:
 
-- `H_max <= permissionless_resolve_stale_slots`
+- `permissionless_resolve_stale_slots <= cfg_max_accrual_dt_slots`
 
-The bounds `MAX_ACCOUNT_POSITIVE_PNL` and `MAX_PNL_POS_TOT` are **live-market** safety caps. They MUST hold whenever `market_mode == Live`. After `market_mode == Resolved`, local reconciliation and payout preparation MAY exceed those live caps, provided all resulting persistent values remain representable in their stored integer types and all payout arithmetic remains exact and conservative.
+Deployments that rely only on privileged degenerate recovery resolution MAY omit `permissionless_resolve_stale_slots` entirely.
+
+The bounds `MAX_ACCOUNT_POSITIVE_PNL_LIVE` and `MAX_PNL_POS_TOT_LIVE` are **live-market** safety caps. They MUST hold whenever `market_mode == Live`. After `market_mode == Resolved`, local reconciliation and payout preparation MAY exceed those live caps, provided all resulting persistent values remain representable in their stored integer types and all payout arithmetic remains exact and conservative.
 
 ### 1.5 Trusted time and oracle requirements
 
 - `now_slot` in every top-level instruction MUST come from trusted runtime slot metadata or an equivalent trusted source.
-- `oracle_price` MUST come from a validated configured oracle feed.
+- `oracle_price` inputs MUST come from validated configured oracle feeds or trusted privileged settlement sources, depending on the instruction’s trust boundary.
 - Any helper or instruction that accepts `now_slot` MUST require `now_slot >= current_slot`.
 - Any call to `accrue_market_to(now_slot, oracle_price, funding_rate_e9_per_slot)` MUST require `now_slot >= slot_last`.
+- Every live accrual MUST require `dt = now_slot - slot_last <= cfg_max_accrual_dt_slots`.
 - `current_slot` and `slot_last` MUST be monotonically nondecreasing.
-- The engine MUST NOT overload any strictly positive price value as an uninitialized sentinel for `P_last`, `fund_px_last`, or any equivalent stored price field. If an implementation needs an initialization flag, it MUST use a separate dedicated state predicate.
+- The engine MUST NOT overload any strictly positive price value as an uninitialized sentinel for `P_last`, `fund_px_last`, or any equivalent stored price field.
 
 ### 1.6 Required exact helpers
 
@@ -189,54 +221,53 @@ Implementations MUST provide exact checked helpers for at least:
 - exact floor and ceil multiply-divide helpers,
 - `fee_debt_u128_checked(fee_credits_i)`,
 - `fee_credit_headroom_u128_checked(fee_credits_i)`,
-- `wide_signed_mul_div_floor_from_kf_pair(abs_basis, k_then, k_now_exact, f_then, f_now_exact, den)`, where `k_then` and `f_then` are persistent i128 snapshots and `k_now_exact` and `f_now_exact` may be either persistent i128 values or exact wide signed values. The helper MUST use at least exact 256-bit signed intermediates, or a formally equivalent exact method.
+- `wide_signed_mul_div_floor_from_kf_pair(abs_basis, k_then, k_now_exact, f_then, f_now_exact, den)`, where `k_then` and `f_then` are persistent i128 snapshots and `k_now_exact` and `f_now_exact` may be either persistent i128 values or exact wide signed values.
 
 Its canonical law is:
 
-`wide_signed_mul_div_floor_from_kf_pair(abs_basis, k_then, k_now_exact, f_then, f_now_exact, den)`
+`wide_signed_mul_div_floor_from_kf_pair(abs_basis, k_then, k_now_exact, f_then, f_now_exact, den)`  
 `= floor( abs_basis * ( ((k_now_exact - k_then) * FUNDING_DEN) + (f_now_exact - f_then) ) / (den * FUNDING_DEN) )`
 
-with floor toward negative infinity in the exact widened signed domain. Implementations MUST NOT add `ΔK` and `ΔF` directly without this `FUNDING_DEN` un-scaling.
+with floor toward negative infinity in the exact widened signed domain. The helper MUST use at least exact 256-bit signed intermediates, or a formally equivalent exact method. Implementations MUST NOT add `ΔK` and `ΔF` directly without this `FUNDING_DEN` un-scaling.
 
 ### 1.7 Arithmetic requirements
 
 The engine MUST satisfy all of the following.
 
 1. Every product involving `A_side`, `K_side`, `F_side_num`, `k_snap_i`, `f_snap_i`, `basis_pos_q_i`, `effective_pos_q(i)`, `price`, the raw funding numerator `fund_px_0 * funding_rate_e9_per_slot * dt`, trade-haircut numerators, trade-open counterfactual positive-aggregate numerators, scheduled-bucket release numerators, or ADL deltas MUST use checked arithmetic or an exact checked multiply-divide helper that is mathematically equivalent to the full-width product.
-2. When `funding_rate_e9_per_slot != 0` and `dt > 0`, `accrue_market_to` MUST apply the exact total funding delta over the full interval `dt`. Implementations MAY use internal chunking only if it is exactly equivalent to the total-delta law and does not require an unbounded runtime loop proportional to `dt`. Mark-to-market is applied once before funding.
+2. `accrue_market_to` MUST apply the exact total funding delta over the full interval `dt`. Implementations MAY use internal chunking only if it is exactly equivalent to the total-delta law and does not require an unbounded runtime loop proportional to `dt`.
 3. The conservation check `V >= C_tot + I` and any `Residual` computation MUST use checked addition for `C_tot + I`.
 4. Signed division with positive denominator MUST use exact conservative floor division.
 5. Exact multiply-divide helpers MUST return the exact quotient even when the exact product exceeds native `u128`, provided the final quotient fits.
 6. `PendingWarmupTot = PNL_pos_tot - PNL_matured_pos_tot` MUST use checked subtraction.
 7. Haircut paths `floor(ReleasedPos_i * h_num / h_den)`, `floor(PosPNL_i * g_num / g_den)`, and the exact candidate-open trade-haircut path of §3.4 MUST use exact multiply-divide helpers.
-8. Funding transfer MUST use the same exact total `fund_num_total = fund_px_0 * funding_rate_e9_per_slot * dt` value for both sides’ `F_side_num` deltas, with opposite signs. The engine MUST NOT introduce per-chunk or per-step rounding inside `accrue_market_to`.
+8. Funding transfer MUST use the same exact total `fund_num_total = fund_px_0 * funding_rate_e9_per_slot * dt` value for both sides’ `F_side_num` deltas, with opposite signs. The engine MUST NOT introduce per-step or per-chunk rounding inside `accrue_market_to`.
 9. `fund_num_total`, each `A_side * fund_num_total` product, and each live mark-to-market `A_side * (oracle_price - P_last)` product MUST be computed in an exact wide signed domain of at least 256 bits, or a formally equivalent exact method. `K_side` and `F_side_num` are cumulative across epochs. Implementations MUST use checked arithmetic and fail conservatively on persistent `i128` overflow.
 10. Same-epoch or epoch-mismatch settlement MUST combine `K_side` and `F_side_num` through the exact helper `wide_signed_mul_div_floor_from_kf_pair`. The helper MUST accept exact wide signed terminal values such as `K_epoch_start_side + resolved_k_terminal_delta_side`, even when that terminal sum is not itself persisted as a live `K_side`.
 11. The ADL quote-deficit path MUST compute `delta_K_abs = ceil(D_rem * A_old * POS_SCALE / OI_before)` using exact wide arithmetic.
 12. If a K-index delta magnitude is representable but `K_opp + delta_K_exact` overflows `i128`, the engine MUST route `D_rem` through `record_uninsured_protocol_loss` while still continuing quantity socialization.
 13. `PNL_i` MUST be maintained in `[i128::MIN + 1, i128::MAX]`, and `fee_credits_i` in `[i128::MIN + 1, 0]`.
 14. Every decrement of `stored_pos_count_*`, `stale_account_count_*`, or `phantom_dust_bound_*_q` MUST use checked subtraction.
-15. Every increment of `stored_pos_count_*`, `phantom_dust_bound_*_q`, `epoch_side`, `C_tot`, `PNL_pos_tot`, `PNL_matured_pos_tot`, `V`, or `I` MUST use checked addition and MUST enforce the relevant bound.
+15. Every increment of `stored_pos_count_*`, `phantom_dust_bound_*_q`, `epoch_side`, `materialized_account_count`, `neg_pnl_account_count`, `C_tot`, `PNL_pos_tot`, `PNL_matured_pos_tot`, `V`, or `I` MUST use checked addition and MUST enforce the relevant bound.
 16. `trade_notional <= MAX_ACCOUNT_NOTIONAL` MUST be enforced before charging trade fees.
-17. Any out-of-range price input, invalid oracle read, invalid `H_lock`, invalid `funding_rate_e9_per_slot`, or non-monotonic slot input MUST fail conservatively before state mutation.
+17. Any out-of-range price input, invalid oracle read, invalid live admission pair, invalid `funding_rate_e9_per_slot`, invalid degenerate-resolution inputs, or non-monotonic slot input MUST fail conservatively before state mutation.
 18. `charge_fee_to_insurance` MUST cap its applied fee at the account’s exact collectible capital-plus-fee-debt headroom. It MUST never set `fee_credits_i < -(i128::MAX)`.
 19. Any direct fee-credit repayment path MUST cap its applied amount at the exact current `FeeDebt_i`. It MUST never set `fee_credits_i > 0`.
 20. Any direct insurance top-up or direct fee-credit repayment path that increases `V` or `I` MUST use checked addition and MUST enforce `MAX_VAULT_TVL`.
 21. Scheduled- and pending-bucket mutations MUST preserve the invariants of §2.1 and MUST use checked arithmetic.
 22. The exact counterfactual trade-open computation MUST recompute the account’s positive-PnL contribution and the global positive-PnL aggregate with the candidate trade’s own positive slippage gain removed.
 23. Any wrapper-owned fee amount routed through the canonical helper MUST satisfy `fee_abs <= MAX_PROTOCOL_FEE_ABS`.
-24. Fresh reserve MUST NOT be merged into an older scheduled bucket unless that bucket was itself created in the current slot, has the same `H_lock`, and has `sched_release_q == 0`.
-25. Pending-bucket horizon updates MUST be monotone nondecreasing with `pending_horizon_i = max(pending_horizon_i, H_lock)` whenever new reserve is merged into an existing pending bucket.
-26. If `reserve_mode` does not create new reserve (`ImmediateRelease` or `UseHLock(0)`), `PNL_matured_pos_tot` MUST increase only by the true newly released increment.
+24. Fresh reserve MUST NOT be merged into an older scheduled bucket unless that bucket was itself created in the current slot, has the same admitted horizon, and has `sched_release_q == 0`.
+25. Pending-bucket horizon updates MUST be monotone nondecreasing with `pending_horizon_i = max(pending_horizon_i, admitted_h_eff)` whenever new reserve is merged into an existing pending bucket.
+26. If a live positive increase occurs, the engine MUST admit it through `admit_fresh_reserve_h_lock`; the only path that may immediately release positive PnL without live admission is `ImmediateReleaseResolvedOnly` on resolved markets.
 27. Funding exactness MUST NOT depend on a bare global remainder with no per-account snapshot. Any retained fractional precision across calls MUST be represented through `F_side_num` and `f_snap_i`.
 28. Any strict risk-reducing fee-neutral comparison MUST add back `fee_equity_impact_i`, not nominal fee.
 29. `max_safe_flat_conversion_released` MUST use at least 256-bit exact intermediates, or a formally equivalent exact wide comparison, whenever `E_before * h_den` would exceed native `u128`.
 30. Any helper that computes bucket maturity from `elapsed / sched_horizon` MUST clamp `elapsed` at `sched_horizon` before invoking an exact multiply-divide helper whose unclamped final quotient could exceed `u128` even though the clamped economic answer is `sched_anchor_q`.
-29. Any helper precondition reachable from a top-level instruction MUST fail conservatively rather than panic or assert on caller-controlled inputs or mutable market state.
-30. The instruction-local touched-account set MUST never silently drop an account; if capacity is exceeded, the instruction MUST fail conservatively.
-31. `phantom_dust_bound_long_q` and `phantom_dust_bound_short_q` are bounded by `u128` representability; any attempted overflow is a conservative failure.
-32. After `market_mode == Resolved`, local reconciliation MAY exceed the live-only caps `MAX_ACCOUNT_POSITIVE_PNL` and `MAX_PNL_POS_TOT`, but every resulting persistent value MUST remain representable in its stored integer type and every payout computation MUST remain exact and conservative.
+31. Any helper precondition reachable from a top-level instruction MUST fail conservatively rather than panic or assert on caller-controlled inputs or mutable market state.
+32. `phantom_dust_bound_long_q` and `phantom_dust_bound_short_q` are bounded by `u128` representability; any attempted overflow is a conservative failure.
 33. Even after `market_mode == Resolved`, aggregate persistent quantities stored as `u128` — including `PNL_pos_tot` and `PNL_matured_pos_tot` — MUST remain representable in `u128`; any reconciliation or terminal-close path that would overflow them MUST fail conservatively rather than wrap.
+34. All touched-account and instruction-local admission-state structures in `ctx` MUST be provisioned to hold the maximum number of distinct accounts any top-level instruction in this revision can touch or admit; if capacity would be exceeded, the instruction MUST fail conservatively.
 
 ---
 
@@ -286,11 +317,11 @@ Reserve invariants on live markets:
 - if `sched_present_i`:
   - `0 < sched_anchor_q_i`
   - `0 < sched_remaining_q_i <= sched_anchor_q_i`
-  - `H_min <= sched_horizon_i <= H_max`
+  - `cfg_h_min <= sched_horizon_i <= cfg_h_max`
   - `0 <= sched_release_q_i <= sched_anchor_q_i`
 - if `pending_present_i`:
   - `0 < pending_remaining_q_i`
-  - `H_min <= pending_horizon_i <= H_max`
+  - `cfg_h_min <= pending_horizon_i <= cfg_h_max`
 - the pending bucket is always economically newer than the scheduled bucket
 - if `R_i == 0`, both buckets MUST be absent
 - if `sched_present_i == false`, the pending bucket MAY still be present
@@ -315,7 +346,6 @@ The engine stores at least:
 
 - `V: u128`
 - `I: u128`
-- `I_floor: u128`
 - `current_slot: u64`
 - `P_last: u64`
 - `slot_last: u64`
@@ -343,19 +373,21 @@ The engine stores at least:
 - `phantom_dust_bound_long_q: u128`
 - `phantom_dust_bound_short_q: u128`
 - `materialized_account_count: u64`
-- `neg_pnl_account_count: u64` — exact number of materialized accounts with `PNL_i < 0`
-- `C_tot: u128 = Σ C_i`
-- `PNL_pos_tot: u128 = Σ max(PNL_i, 0)`
-- `PNL_matured_pos_tot: u128 = Σ ReleasedPos_i`
+- `neg_pnl_account_count: u64`
+- `C_tot: u128`
+- `PNL_pos_tot: u128`
+- `PNL_matured_pos_tot: u128`
+
+Immutable per-market configuration fields from §1.4 are stored in engine state and are part of the market instance.
 
 Resolved-market state:
 
 - `market_mode ∈ {Live, Resolved}`
 - `resolved_price: u64`
-- `resolved_live_price: u64` — the trusted live price used for the final live-sync accrual immediately before resolution
+- `resolved_live_price: u64`
 - `resolved_slot: u64`
-- `resolved_k_long_terminal_delta: i128` — final settlement mark delta carried separately from persistent live `K_long`
-- `resolved_k_short_terminal_delta: i128` — final settlement mark delta carried separately from persistent live `K_short`
+- `resolved_k_long_terminal_delta: i128`
+- `resolved_k_short_terminal_delta: i128`
 - `resolved_payout_snapshot_ready: bool`
 - `resolved_payout_h_num: u128`
 - `resolved_payout_h_den: u128`
@@ -371,7 +403,7 @@ Global invariants:
 - `0 <= neg_pnl_account_count <= materialized_account_count <= MAX_MATERIALIZED_ACCOUNTS`
 - `F_long_num` and `F_short_num` MUST remain representable as `i128`
 - if `market_mode == Live`:
-  - `PNL_matured_pos_tot <= PNL_pos_tot <= MAX_PNL_POS_TOT`
+  - `PNL_matured_pos_tot <= PNL_pos_tot <= MAX_PNL_POS_TOT_LIVE`
   - `resolved_price == 0`
   - `resolved_live_price == 0`
   - `resolved_k_long_terminal_delta == 0`
@@ -390,39 +422,48 @@ Every top-level live instruction that uses the standard lifecycle MUST initializ
 
 - `pending_reset_long: bool`
 - `pending_reset_short: bool`
-- `H_lock_shared: u64`
-- `touched_accounts[]` — a deduplicated instruction-local list of touched account storage indices
+- `admit_h_min_shared: u64`
+- `admit_h_max_shared: u64`
+- `touched_accounts[]` — deduplicated touched storage indices
+- `h_max_sticky_accounts[]` — per-instruction set of storage indices for which `admit_h_max` has already been required in the current instruction
 
-If an implementation uses a fixed-capacity touched set, that capacity MUST be sufficient for the maximum number of distinct accounts any single top-level instruction in this revision can touch. If capacity would be exceeded, the instruction MUST fail conservatively. Silent truncation is forbidden.
+Capacity rules:
+
+- `ctx.touched_accounts[]` capacity MUST be at least the maximum number of distinct accounts any single top-level instruction in this revision can touch.
+- `ctx.h_max_sticky_accounts[]` capacity MUST be at least the maximum number of distinct accounts any single top-level instruction in this revision can both touch and create fresh reserve for.
+- Implementations MAY choose to size both structures equally, which is sufficient in this revision.
+- If insertion into either structure would exceed capacity, the instruction MUST fail conservatively.
 
 ### 2.4 Configuration immutability
 
 No external instruction in this revision may change:
 
-- `H_min`
-- `H_max`
-- `trading_fee_bps`
-- `maintenance_bps`
-- `initial_bps`
-- `liquidation_fee_bps`
-- `liquidation_fee_cap`
-- `min_liquidation_abs`
-- `MIN_INITIAL_DEPOSIT`
-- `MIN_NONZERO_MM_REQ`
-- `MIN_NONZERO_IM_REQ`
-- `I_floor`
-- `resolve_price_deviation_bps`
-- `MAX_ACTIVE_POSITIONS_PER_SIDE`
+- `cfg_h_min`
+- `cfg_h_max`
+- `cfg_maintenance_bps`
+- `cfg_initial_bps`
+- `cfg_trading_fee_bps`
+- `cfg_liquidation_fee_bps`
+- `cfg_liquidation_fee_cap`
+- `cfg_min_liquidation_abs`
+- `cfg_min_initial_deposit`
+- `cfg_min_nonzero_mm_req`
+- `cfg_min_nonzero_im_req`
+- `cfg_insurance_floor`
+- `cfg_resolve_price_deviation_bps`
+- `cfg_max_active_positions_per_side`
+- `cfg_max_accrual_dt_slots`
+- `cfg_max_abs_funding_e9_per_slot`
 
 ### 2.5 Materialized-account capacity
 
 The engine MUST track the number of currently materialized account slots. That count MUST NOT exceed `MAX_MATERIALIZED_ACCOUNTS`.
 
-A missing account is one whose slot is not currently materialized. Missing accounts MUST NOT be auto-materialized by `settle_account`, `withdraw`, `execute_trade`, `liquidate`, `resolve_market`, `force_close_resolved`, or `keeper_crank`.
+A missing account is one whose slot is not currently materialized. Missing accounts MUST NOT be auto-materialized by `settle_account`, `withdraw`, `execute_trade`, `close_account`, `liquidate`, `resolve_market`, `force_close_resolved`, or `keeper_crank`.
 
 Only the following path MAY materialize a missing account:
 
-- `deposit(i, amount, now_slot)` with `amount >= MIN_INITIAL_DEPOSIT`.
+- `deposit(i, amount, now_slot)` with `amount >= cfg_min_initial_deposit`.
 
 ### 2.6 Canonical zero-position defaults
 
@@ -457,7 +498,7 @@ It MAY succeed only if all of the following hold:
 
 - account `i` is materialized,
 - trusted `now_slot >= current_slot`,
-- `0 <= C_i < MIN_INITIAL_DEPOSIT`,
+- `0 <= C_i < cfg_min_initial_deposit`,
 - `PNL_i == 0`,
 - `R_i == 0`,
 - both reserve buckets are absent,
@@ -474,7 +515,7 @@ On success, it MUST:
 - reset local fields to canonical zero
 - mark the slot missing or reusable
 - decrement `materialized_account_count`
-- require `neg_pnl_account_count` is unchanged (the reclaim precondition already requires `PNL_i == 0`)
+- require `neg_pnl_account_count` is unchanged (the reclaim precondition already requires `PNL_i == 0`).
 
 ### 2.9 Initial market state
 
@@ -482,7 +523,6 @@ At market initialization, the engine MUST set:
 
 - `V = 0`
 - `I = 0`
-- `I_floor = configured I_floor`
 - `C_tot = 0`
 - `PNL_pos_tot = 0`
 - `PNL_matured_pos_tot = 0`
@@ -573,7 +613,7 @@ Define:
 - if `market_mode == Resolved`, `ReleasedPos_i = PosPNL_i`
 - on live markets, `PendingWarmupTot = PNL_pos_tot - PNL_matured_pos_tot = Σ R_i`
 
-Reserved fresh positive PnL increases `PNL_pos_tot` immediately but MUST NOT increase `PNL_matured_pos_tot` until warmup release.
+Reserved fresh positive PnL increases `PNL_pos_tot` immediately but MUST NOT increase `PNL_matured_pos_tot` until warmup release or explicit touch-time acceleration.
 
 ### 3.3 Matured withdrawal and conversion haircut `h`
 
@@ -649,7 +689,7 @@ Interpretation:
 - `Eq_withdraw_raw_i` is the extraction lane
 - `Eq_trade_open_raw_i` is the only compliant risk-increasing trade approval metric
 - `Eq_maint_raw_i` is the maintenance lane
-- `Eq_trade_raw_i` is a derived informational quantity in this revision; no approval rule consumes it directly
+- `Eq_trade_raw_i` is informational only in this revision
 - strict risk-reducing comparisons MUST use exact widened `Eq_maint_raw_i`, never a clamped net quantity
 
 ---
@@ -664,7 +704,7 @@ When changing `C_i`, the engine MUST update `C_tot` by the exact signed delta an
 
 When changing stored `basis_pos_q_i` from `old` to `new`, the engine MUST update `stored_pos_count_long` and `stored_pos_count_short` exactly once using the sign flags of `old` and `new`, then write `basis_pos_q_i = new`.
 
-Any transition that increments a side-count — including 0-to-nonzero attachments and sign flips — MUST enforce `MAX_ACTIVE_POSITIONS_PER_SIDE`.
+Any transition that increments a side-count — including `0 -> nonzero` and sign flips — MUST enforce `cfg_max_active_positions_per_side`.
 
 ### 4.3 `promote_pending_to_scheduled(i)`
 
@@ -688,14 +728,14 @@ Effects:
 
 This helper MUST NOT change `R_i`.
 
-### 4.4 `append_new_reserve(i, reserve_add, H_lock)`
+### 4.4 `append_new_reserve(i, reserve_add, admitted_h_eff)`
 
 Preconditions:
 
 - `reserve_add > 0`
 - `market_mode == Live`
-- `H_lock > 0`
-- `H_min <= H_lock <= H_max`
+- `admitted_h_eff > 0`
+- `cfg_h_min <= admitted_h_eff <= cfg_h_max`
 - `current_slot` is already the trusted slot anchor for the current instruction state
 
 Effects:
@@ -706,11 +746,11 @@ Effects:
      - `sched_remaining_q = reserve_add`
      - `sched_anchor_q = reserve_add`
      - `sched_start_slot = current_slot`
-     - `sched_horizon = H_lock`
+     - `sched_horizon = admitted_h_eff`
      - `sched_release_q = 0`
 3. else if the scheduled bucket is present, the pending bucket is absent, and all of the following hold:
    - `sched_start_slot == current_slot`
-   - `sched_horizon == H_lock`
+   - `sched_horizon == admitted_h_eff`
    - `sched_release_q == 0`
    then exact same-slot merge into the scheduled bucket is permitted:
    - `sched_remaining_q += reserve_add`
@@ -718,18 +758,11 @@ Effects:
 4. else if the pending bucket is absent:
    - create a pending bucket with:
      - `pending_remaining_q = reserve_add`
-     - `pending_horizon = H_lock`
+     - `pending_horizon = admitted_h_eff`
 5. else:
    - `pending_remaining_q += reserve_add`
-   - `pending_horizon = max(pending_horizon, H_lock)`
+   - `pending_horizon = max(pending_horizon, admitted_h_eff)`
 6. set `R_i += reserve_add`
-
-Normative consequences:
-
-- fresh reserve never inherits elapsed time from an older scheduled bucket
-- adding fresh reserve never resets the older scheduled bucket
-- repeated additions only ever mutate the newest pending bucket once an older scheduled bucket exists
-- if a fresh addition joins an existing pending bucket with a longer `pending_horizon_i`, inheriting that longer horizon is intentional conservative behavior; it must never shorten or accelerate any already-scheduled reserve
 
 ### 4.5 `apply_reserve_loss_newest_first(i, reserve_loss)`
 
@@ -760,14 +793,48 @@ Effects:
 3. set `R_i = 0`
 4. do **not** mutate `PNL_matured_pos_tot`
 
-### 4.7 `set_pnl(i, new_PNL, reserve_mode)`
+### 4.7 `admit_fresh_reserve_h_lock(i, fresh_positive_pnl_i, ctx, admit_h_min, admit_h_max) -> admitted_h_eff`
 
-`reserve_mode ∈ {UseHLock(H_lock), ImmediateRelease, NoPositiveIncreaseAllowed}`.
+Preconditions:
 
-Every persistent mutation of `PNL_i` after materialization that may change its sign across zero MUST go through this helper. The sole direct-mutation exception in this revision is `consume_released_pnl(i, x)` in §4.8, whose preconditions guarantee that `PNL_i` remains non-negative and `neg_pnl_account_count` is unchanged. Whenever this helper changes the sign of `PNL_i` across zero, it MUST update `neg_pnl_account_count` exactly once:
-- if `PNL_i < 0` before the write and `new_PNL >= 0`, decrement `neg_pnl_account_count`,
-- if `PNL_i >= 0` before the write and `new_PNL < 0`, increment `neg_pnl_account_count`,
-- otherwise leave `neg_pnl_account_count` unchanged.
+- `market_mode == Live`
+- account `i` is materialized
+- `fresh_positive_pnl_i > 0`
+- `0 <= admit_h_min <= admit_h_max <= cfg_h_max`
+- `admit_h_max > 0`
+- if `admit_h_min > 0`, then `admit_h_min >= cfg_h_min`
+- `admit_h_max >= cfg_h_min`
+
+Definitions:
+
+- `senior_sum = checked_add_u128(C_tot, I)`
+- `Residual_now = max(0, V - senior_sum)`
+- `matured_plus_fresh = checked_add_u128(PNL_matured_pos_tot, fresh_positive_pnl_i)`
+
+Admission law:
+
+1. if account `i` is present in `ctx.h_max_sticky_accounts[]`, return `admit_h_max`
+2. else:
+   - if `matured_plus_fresh <= Residual_now`, set `admitted_h_eff = admit_h_min`
+   - else set `admitted_h_eff = admit_h_max`
+3. if `admitted_h_eff == admit_h_max`, insert account `i` into `ctx.h_max_sticky_accounts[]`
+4. return `admitted_h_eff`
+
+Normative consequences:
+
+- live positive PnL cannot bypass admission
+- if `admit_h_min == 0`, immediate release is allowed only when current state admits it
+- if `admit_h_min > 0`, the fastest admitted live path is that positive minimum horizon
+- once an account requires `admit_h_max` in one instruction, later fresh positive increments on that same account in that instruction MUST also use `admit_h_max`
+- an earlier newest pending increment that was admitted at `admit_h_min` MAY later be conservatively lifted to `admit_h_max` if a later same-instruction increment on the same account requires `admit_h_max` and both share one pending bucket
+- this conservative lift may only affect the newest pending bucket; it MUST never rewrite an already-scheduled bucket
+
+
+### 4.8 `set_pnl(i, new_PNL, reserve_mode[, ctx])`
+
+`reserve_mode ∈ {UseAdmissionPair(admit_h_min, admit_h_max), ImmediateReleaseResolvedOnly, NoPositiveIncreaseAllowed}`.
+
+Every persistent mutation of `PNL_i` after materialization that may change its sign across zero MUST go through this helper. The optional `ctx` argument is required only when `reserve_mode == UseAdmissionPair(...)`; it is ignored or may be omitted on other modes. The sole direct-mutation exception in this revision is `consume_released_pnl(i, x)` in §4.10, whose preconditions guarantee that `PNL_i` remains non-negative and `neg_pnl_account_count` is unchanged.
 
 Let:
 
@@ -782,27 +849,32 @@ Procedure:
 All steps of this helper are part of one atomic top-level instruction effect under §0. If any later checked step fails, all earlier writes performed by this helper — including any mutation to `PNL_i`, `PNL_pos_tot`, `PNL_matured_pos_tot`, `neg_pnl_account_count`, `R_i`, the scheduled bucket, or the pending bucket — MUST roll back atomically with the enclosing instruction.
 
 1. require `new_PNL != i128::MIN`
-2. if `market_mode == Live`, require `new_pos <= MAX_ACCOUNT_POSITIVE_PNL`
+2. if `market_mode == Live`, require `new_pos <= MAX_ACCOUNT_POSITIVE_PNL_LIVE`
 3. if `market_mode == Resolved`, require `new_pos <= i128::MAX as u128`
 4. compute `PNL_pos_tot_after` by applying the exact delta from `old_pos` to `new_pos` in checked arithmetic
-5. if `market_mode == Live`, require `PNL_pos_tot_after <= MAX_PNL_POS_TOT`
+5. if `market_mode == Live`, require `PNL_pos_tot_after <= MAX_PNL_POS_TOT_LIVE`
 
 If `new_pos > old_pos`:
 
 6. `reserve_add = new_pos - old_pos`
 7. if `reserve_mode == NoPositiveIncreaseAllowed`, fail conservatively before any persistent mutation
-8. if `reserve_mode == UseHLock(H_lock)` and `H_lock != 0`, require `market_mode == Live` and `H_min <= H_lock <= H_max` before any persistent mutation
-9. if `reserve_mode == ImmediateRelease` or `reserve_mode == UseHLock(0)`:
+8. if `reserve_mode == ImmediateReleaseResolvedOnly` and `market_mode == Live`, fail conservatively before any persistent mutation
+9. if `reserve_mode == ImmediateReleaseResolvedOnly`:
+   - require `market_mode == Resolved`
    - set `PNL_pos_tot = PNL_pos_tot_after`
-   - set `PNL_i = new_PNL` and update `neg_pnl_account_count` according to `old_neg` and `new_neg`
+   - set `PNL_i = new_PNL` and update `neg_pnl_account_count` exactly once if sign crosses zero
    - add `reserve_add` to `PNL_matured_pos_tot`
    - require `PNL_matured_pos_tot <= PNL_pos_tot`
    - return
-10. otherwise:
+10. if `reserve_mode == UseAdmissionPair(admit_h_min, admit_h_max)`:
+   - require `market_mode == Live`
+   - `admitted_h_eff = admit_fresh_reserve_h_lock(i, reserve_add, ctx, admit_h_min, admit_h_max)`
    - set `PNL_pos_tot = PNL_pos_tot_after`
-   - set `PNL_i = new_PNL` and update `neg_pnl_account_count` according to `old_neg` and `new_neg`
-   - call `append_new_reserve(i, reserve_add, H_lock)`
-   - leave `PNL_matured_pos_tot` unchanged
+   - set `PNL_i = new_PNL` and update `neg_pnl_account_count` exactly once if sign crosses zero
+   - if `admitted_h_eff == 0`:
+     - add `reserve_add` to `PNL_matured_pos_tot`
+   - else:
+     - call `append_new_reserve(i, reserve_add, admitted_h_eff)`
    - require `R_i <= max(PNL_i, 0)` and `PNL_matured_pos_tot <= PNL_pos_tot`
    - return
 
@@ -810,21 +882,52 @@ If `new_pos <= old_pos`:
 
 11. `pos_loss = old_pos - new_pos`
 12. if `market_mode == Live`:
-    - `reserve_loss = min(pos_loss, R_i)`
-    - if `reserve_loss > 0`, call `apply_reserve_loss_newest_first(i, reserve_loss)`
-    - `matured_loss = pos_loss - reserve_loss`
+   - `reserve_loss = min(pos_loss, R_i)`
+   - if `reserve_loss > 0`, call `apply_reserve_loss_newest_first(i, reserve_loss)`
+   - `matured_loss = pos_loss - reserve_loss`
 13. if `market_mode == Resolved`:
-    - require `R_i == 0`
-    - `matured_loss = pos_loss`
+   - require `R_i == 0`
+   - `matured_loss = pos_loss`
 14. if `matured_loss > 0`, subtract `matured_loss` from `PNL_matured_pos_tot`
 15. set `PNL_pos_tot = PNL_pos_tot_after`
-16. set `PNL_i = new_PNL` and update `neg_pnl_account_count` according to `old_neg` and `new_neg`
+16. set `PNL_i = new_PNL` and update `neg_pnl_account_count` exactly once if sign crosses zero
 17. if `new_pos == 0` and `market_mode == Live`, require `R_i == 0` and both buckets absent
 18. require `PNL_matured_pos_tot <= PNL_pos_tot`
 
-The decrease-branch ordering at steps 14 then 15 is intentional: subtracting `matured_loss` before writing `PNL_pos_tot_after` preserves `PNL_matured_pos_tot <= PNL_pos_tot` at every intermediate step.
+### 4.9 `admit_outstanding_reserve_on_touch(i)`
 
-### 4.8 `consume_released_pnl(i, x)`
+Preconditions:
+
+- `market_mode == Live`
+- account `i` is materialized
+
+Definitions:
+
+- `reserve_total = (sched_remaining_q_i if sched_present_i else 0) + (pending_remaining_q_i if pending_present_i else 0)`
+- `senior_sum = checked_add_u128(C_tot, I)`
+- `Residual_now = max(0, V - senior_sum)`
+- `matured_plus_reserve = checked_add_u128(PNL_matured_pos_tot, reserve_total)`
+
+Acceleration law:
+
+1. if `reserve_total == 0`, return
+2. if `matured_plus_reserve <= Residual_now`:
+   - increase `PNL_matured_pos_tot` by `reserve_total`
+   - clear both buckets
+   - set `R_i = 0`
+   - require `PNL_matured_pos_tot <= PNL_pos_tot`
+   - require `R_i <= max(PNL_i, 0)`
+   - return
+3. else return
+
+Normative consequences:
+
+- acceleration never extends a horizon; it only removes reserve when current state safely admits immediate release
+- acceleration is monotone: a bucket accelerated once cannot un-accelerate
+- acceleration preserves goals 6 and 7: reserve is removed, not reset
+- acceleration cannot be griefed: a third party cannot force non-acceleration, and acceleration is strictly more favorable to the user than non-acceleration
+
+### 4.10 `consume_released_pnl(i, x)`
 
 This helper removes only matured released positive PnL on a live account and MUST leave both reserve buckets unchanged.
 
@@ -838,11 +941,11 @@ Effects:
 1. decrease `PNL_i` by exactly `x`
 2. decrease `PNL_pos_tot` by exactly `x`
 3. decrease `PNL_matured_pos_tot` by exactly `x`
-4. leave `neg_pnl_account_count` unchanged, because the precondition `x <= ReleasedPos_i` guarantees the account remains non-negative after the write
+4. leave `neg_pnl_account_count` unchanged because the precondition guarantees the account remains non-negative after the write
 5. leave `R_i`, the scheduled bucket, and the pending bucket unchanged
 6. require `PNL_matured_pos_tot <= PNL_pos_tot`
 
-### 4.9 `advance_profit_warmup(i)`
+### 4.11 `advance_profit_warmup(i)`
 
 Preconditions:
 
@@ -854,22 +957,23 @@ Procedure:
 2. if the scheduled bucket is absent and the pending bucket is present, call `promote_pending_to_scheduled(i)`
 3. if the scheduled bucket is still absent, return
 4. let `elapsed = current_slot - sched_start_slot`
-5. let `sched_total = if elapsed >= sched_horizon { sched_anchor_q } else { mul_div_floor_u128(sched_anchor_q, elapsed as u128, sched_horizon as u128) }`, computed via an exact multiply-divide helper or a formally equivalent exact method
-6. require `sched_total >= sched_release_q`
-7. `sched_increment = sched_total - sched_release_q`
-8. `release = min(sched_remaining_q, sched_increment)`
-9. if `release > 0`:
+5. let `effective_elapsed = min(elapsed, sched_horizon)`
+6. let `sched_total = mul_div_floor_u128(sched_anchor_q, effective_elapsed as u128, sched_horizon as u128)`
+7. require `sched_total >= sched_release_q`
+8. `sched_increment = sched_total - sched_release_q`
+9. `release = min(sched_remaining_q, sched_increment)`
+10. if `release > 0`:
    - `sched_remaining_q -= release`
    - `R_i -= release`
    - `PNL_matured_pos_tot += release`
-10. set `sched_release_q = sched_total`
-11. if the scheduled bucket is now empty:
+11. set `sched_release_q = sched_total`
+12. if the scheduled bucket is now empty:
    - clear it
    - if the pending bucket is present, call `promote_pending_to_scheduled(i)`
-12. if `R_i == 0`, require both buckets absent
-13. require `PNL_matured_pos_tot <= PNL_pos_tot`
+13. if `R_i == 0`, require both buckets absent
+14. require `PNL_matured_pos_tot <= PNL_pos_tot`
 
-### 4.10 `attach_effective_position(i, new_eff_pos_q)`
+### 4.12 `attach_effective_position(i, new_eff_pos_q)`
 
 This helper converts a current effective quantity into a new position basis at the current side state.
 
@@ -889,12 +993,12 @@ If `new_eff_pos_q != 0`, it MUST:
 - set `f_snap_i = F_side_num(new_eff_pos_q)`
 - set `epoch_snap_i = epoch_side(new_eff_pos_q)`
 
-### 4.11 Phantom-dust helpers
+### 4.13 Phantom-dust helpers
 
 - `inc_phantom_dust_bound(side)` increments by exactly `1` q-unit.
 - `inc_phantom_dust_bound_by(side, amount_q)` increments by exactly `amount_q`.
 
-### 4.12 `max_safe_flat_conversion_released(i, x_cap, h_num, h_den)`
+### 4.14 `max_safe_flat_conversion_released(i, x_cap, h_num, h_den)`
 
 This helper returns the largest `x_safe <= x_cap` such that converting `x_safe` released profit on a live flat account cannot make the account’s exact post-conversion raw maintenance equity negative.
 
@@ -907,7 +1011,7 @@ Implementation law:
 5. let `haircut_loss_num = h_den - h_num`
 6. return `min(x_cap, floor(E_before * h_den / haircut_loss_num))` using an exact capped multiply-divide with at least 256-bit intermediates, or an equivalent exact wide comparison
 
-### 4.13 `compute_trade_pnl(size_q, oracle_price, exec_price)`
+### 4.15 `compute_trade_pnl(size_q, oracle_price, exec_price)`
 
 For a bilateral trade where `size_q > 0` means account `a` buys base from account `b`, the execution-slippage PnL applied before fees MUST be:
 
@@ -917,7 +1021,7 @@ For a bilateral trade where `size_q > 0` means account `a` buys base from accoun
 
 This helper MUST use checked signed arithmetic and exact conservative floor division.
 
-### 4.14 `charge_fee_to_insurance(i, fee_abs) -> FeeChargeOutcome`
+### 4.16 `charge_fee_to_insurance(i, fee_abs) -> FeeChargeOutcome`
 
 Preconditions:
 
@@ -950,11 +1054,9 @@ Effects:
 
 This helper MUST NOT mutate `PNL_i`, `PNL_pos_tot`, `PNL_matured_pos_tot`, reserve state, or any `K_side`.
 
-`fee_dropped_i` does not reduce account equity and therefore MUST NOT be added back in strict risk-reducing fee-neutral comparisons. Deployments that wish to reject strict risk-reducing trades when `fee_dropped_i > 0` MAY impose that stricter wrapper policy above the engine.
+### 4.17 Insurance-loss helpers
 
-### 4.15 Insurance-loss helpers
-
-- `use_insurance_buffer(loss_abs)` spends insurance down to `I_floor` and returns the remainder.
+- `use_insurance_buffer(loss_abs)` spends insurance down to `cfg_insurance_floor` and returns the remainder.
 - `record_uninsured_protocol_loss(loss_abs)` leaves the uncovered loss represented through `Residual` and junior haircuts.
 - `absorb_protocol_loss(loss_abs)` = `use_insurance_buffer` then `record_uninsured_protocol_loss` if needed.
 
@@ -999,7 +1101,7 @@ For a bilateral trade with old and new effective positions for both counterparti
 
 These exact after-values MUST be used both for gating and for final writeback.
 
-### 5.3 `settle_side_effects_live(i, H_lock)`
+### 5.3 `settle_side_effects_live(i, ctx)`
 
 When touching account `i` on a live market:
 
@@ -1009,7 +1111,7 @@ When touching account `i` on a live market:
 4. if `epoch_snap_i == epoch_s`:
    - `q_eff_new = mul_div_floor_u128(abs(basis_pos_q_i), A_s, a_basis_i)`
    - `pnl_delta = wide_signed_mul_div_floor_from_kf_pair(abs(basis_pos_q_i), k_snap_i, K_s, f_snap_i, F_s_num, den)`
-   - `set_pnl(i, PNL_i + pnl_delta, UseHLock(H_lock))`
+   - `set_pnl(i, PNL_i + pnl_delta, UseAdmissionPair(ctx.admit_h_min_shared, ctx.admit_h_max_shared), ctx)`
    - if `q_eff_new == 0`:
      - increment the appropriate phantom-dust bound
      - zero the basis
@@ -1023,7 +1125,7 @@ When touching account `i` on a live market:
    - require `epoch_snap_i + 1 == epoch_s`
    - require `stale_account_count_s > 0`
    - `pnl_delta = wide_signed_mul_div_floor_from_kf_pair(abs(basis_pos_q_i), k_snap_i, K_epoch_start_s, f_snap_i, F_epoch_start_s_num, den)`
-   - `set_pnl(i, PNL_i + pnl_delta, UseHLock(H_lock))`
+   - `set_pnl(i, PNL_i + pnl_delta, UseAdmissionPair(ctx.admit_h_min_shared, ctx.admit_h_max_shared), ctx)`
    - zero the basis
    - decrement `stale_account_count_s`
    - reset snapshots
@@ -1047,13 +1149,11 @@ Procedure:
 6. let `resolved_k_terminal_delta_s` denote `resolved_k_long_terminal_delta` on the long side and `resolved_k_short_terminal_delta` on the short side
 7. let `k_terminal_s_exact = (K_epoch_start_s as wide_signed) + (resolved_k_terminal_delta_s as wide_signed)`
 8. let `f_terminal_s_exact = F_epoch_start_s_num`
-9. compute `pnl_delta` against `(k_terminal_s_exact, f_terminal_s_exact)` via `wide_signed_mul_div_floor_from_kf_pair`
-10. `set_pnl(i, PNL_i + pnl_delta, ImmediateRelease)`
+9. compute `pnl_delta = wide_signed_mul_div_floor_from_kf_pair(abs(basis_pos_q_i), k_snap_i, k_terminal_s_exact, f_snap_i, f_terminal_s_exact, den)`
+10. `set_pnl(i, PNL_i + pnl_delta, ImmediateReleaseResolvedOnly)`
 11. zero the basis
 12. decrement `stale_account_count_s`
 13. reset snapshots
-
-If a side was already `ResetPending` before resolution, its `resolved_k_terminal_delta_s` MAY be zero; stale accounts on that side then reconcile only to the pre-existing epoch-start snapshot.
 
 ### 5.5 `accrue_market_to(now_slot, oracle_price, funding_rate_e9_per_slot)`
 
@@ -1064,23 +1164,25 @@ This helper MUST:
 1. require `market_mode == Live`
 2. require trusted `now_slot >= slot_last`
 3. require validated `0 < oracle_price <= MAX_ORACLE_PRICE`
-4. require `abs(funding_rate_e9_per_slot) <= MAX_ABS_FUNDING_E9_PER_SLOT`
+4. require `abs(funding_rate_e9_per_slot) <= cfg_max_abs_funding_e9_per_slot`
 5. let `dt = now_slot - slot_last`
-6. snapshot `OI_long_0 = OI_eff_long`, `OI_short_0 = OI_eff_short`, and `fund_px_0 = fund_px_last`
-7. mark-to-market once:
+6. require `dt <= cfg_max_accrual_dt_slots`
+7. snapshot `OI_long_0 = OI_eff_long`, `OI_short_0 = OI_eff_short`, and `fund_px_0 = fund_px_last`
+8. mark-to-market once:
    - `ΔP = oracle_price - P_last`
    - if `OI_long_0 > 0`, compute `delta_k_long = A_long * ΔP` in an exact wide signed domain; if the resulting persistent `K_long` would overflow `i128`, fail conservatively; else apply it
    - if `OI_short_0 > 0`, compute `delta_k_short = -A_short * ΔP` in an exact wide signed domain; if the resulting persistent `K_short` would overflow `i128`, fail conservatively; else apply it
-8. funding transfer:
+9. funding transfer:
    - if `funding_rate_e9_per_slot != 0` and `dt > 0` and both snapped OI sides are nonzero:
      - compute `fund_num_total = fund_px_0 * funding_rate_e9_per_slot * dt` in an exact wide signed domain of at least 256 bits, or a formally equivalent exact method
      - compute each `A_side * fund_num_total` product in the same exact wide signed domain, or a formally equivalent exact method
-     - apply `F_long_num -= A_long * fund_num_total`
-     - apply `F_short_num += A_short * fund_num_total`
-     - if the resulting persistent `F_side_num` value would overflow `i128`, fail conservatively
-9. update `slot_last = now_slot`
-10. update `P_last = oracle_price`
-11. update `fund_px_last = oracle_price`
+     - if the resulting persistent `F_long_num` or `F_short_num` would overflow `i128`, fail conservatively
+     - else apply both updates exactly:
+       - `F_long_num -= A_long * fund_num_total`
+       - `F_short_num += A_short * fund_num_total`
+10. update `slot_last = now_slot`
+11. update `P_last = oracle_price`
+12. update `fund_px_last = oracle_price`
 
 Because this helper is only defined as part of a top-level atomic instruction under §0, any overflow or conservative failure in a later leg of the helper or later instruction logic MUST roll back any earlier tentative `K_side`, `F_side_num`, `P_last`, or `fund_px_last` writes from the same top-level call.
 
@@ -1130,11 +1232,9 @@ This helper MUST:
    - set `OI_eff_short = 0`
    - set both pending-reset flags true
 
-Insurance-first ordering in this helper is intentional. Bankruptcy deficit is senior to junior PnL and therefore hits available insurance before the engine determines whether any residual quote loss can also be represented through opposing-side `K` updates. Zero-OI and zero-stored-position-count branches may therefore consume insurance and still route the remaining deficit through `record_uninsured_protocol_loss`. Any resulting increase in `Residual` for remaining junior claimants is an intentional consequence of insurance seniority, not a failure of ADL bookkeeping.
+Insurance-first ordering in this helper is intentional. Bankruptcy deficit is senior to junior PnL and therefore hits available insurance before the engine determines whether any residual quote loss can also be represented through opposing-side `K` updates. Zero-OI and zero-stored-position-count branches may therefore consume insurance and still route the remaining deficit through `record_uninsured_protocol_loss`.
 
-`OI_eff_side` is the authoritative side-level aggregate tracker used by later global state transitions. Because account-level effective positions are individually floored, the sum of per-account same-epoch floor quantities on a side need not equal `OI_eff_side` after `A_side` decay. Any such mismatch MUST be treated only as bounded phantom dust tracked by `phantom_dust_bound_*_q` and reconciled only through §5.7 end-of-instruction dust clearance and reset rules. It MUST NOT be reinterpreted as hidden protocol inventory, minted PnL, or a violation of zero-sum accounting outside those explicit dust rules.
-
-With `ADL_ONE = 10^15` and `MIN_A_SIDE = 10^14`, one-step same-epoch A-decay truncation remains bounded to economically negligible q-units before a side can remain live in `DrainOnly`; the residual mismatch is therefore treated as bounded dust rather than economically material exposure.
+`OI_eff_side` is the authoritative side-level aggregate tracker used by later global state transitions. Because account-level effective positions are individually floored, the sum of per-account same-epoch floor quantities on a side need not equal `OI_eff_side` after `A_side` decay. Any such mismatch MUST be treated only as bounded phantom dust tracked by `phantom_dust_bound_*_q` and reconciled only through §5.7 end-of-instruction dust clearance and reset rules.
 
 ### 5.7 `schedule_end_of_instruction_resets(ctx)`
 
@@ -1179,8 +1279,6 @@ Procedure:
 4. **DrainOnly zero-OI scheduling**
    - if `mode_long == DrainOnly` and `OI_eff_long == 0`, set `pending_reset_long = true`
    - if `mode_short == DrainOnly` and `OI_eff_short == 0`, set `pending_reset_short = true`
-
-These dust-clear branches are intended only for phantom-dust-dominated residual OI. They MUST NOT clear real surviving economic exposure; the exact side-count, OI-symmetry, and phantom-dust-bound conditions above are the normative guards that enforce that distinction.
 
 ### 5.8 `finalize_end_of_instruction_resets(ctx)`
 
@@ -1239,8 +1337,6 @@ After any operation that increases `C_i`, or after a full current-state authorit
    - add `pay` to `fee_credits_i`
    - `I = I + pay`
 
-This sweep leaves `Eq_maint_raw_i`, `Eq_trade_raw_i`, and `Eq_withdraw_raw_i` unchanged because capital and fee debt move one for one.
-
 ### 6.5 `touch_account_live_local(i, ctx)`
 
 This is the canonical live local touch.
@@ -1250,12 +1346,13 @@ Procedure:
 1. require `market_mode == Live`
 2. require account `i` is materialized
 3. add `i` to `ctx.touched_accounts[]` if not already present
-4. `advance_profit_warmup(i)`
-5. `settle_side_effects_live(i, ctx.H_lock_shared)`
-6. `settle_losses_from_principal(i)`
-7. if `effective_pos_q(i) == 0` and `PNL_i < 0`, resolve uncovered flat loss
-8. MUST NOT auto-convert
-9. MUST NOT fee-sweep
+4. `admit_outstanding_reserve_on_touch(i)`
+5. `advance_profit_warmup(i)`
+6. `settle_side_effects_live(i, ctx)`
+7. `settle_losses_from_principal(i)`
+8. if `effective_pos_q(i) == 0` and `PNL_i < 0`, resolve uncovered flat loss
+9. MUST NOT auto-convert
+10. MUST NOT fee-sweep
 
 ### 6.6 `finalize_touched_accounts_post_live(ctx)`
 
@@ -1266,13 +1363,11 @@ Procedure:
 1. compute one shared post-live conversion snapshot:
    - `Residual_snapshot = max(0, V - (C_tot + I))`
    - `PNL_matured_pos_tot_snapshot = PNL_matured_pos_tot`
-   - if `PNL_matured_pos_tot_snapshot == 0`, the snapshot is defined as **not whole** for auto-conversion purposes
-   - if `PNL_matured_pos_tot_snapshot > 0`:
+   - if `PNL_matured_pos_tot_snapshot == 0`, define `whole_snapshot = false`
+   - else:
      - `h_snapshot_num = min(Residual_snapshot, PNL_matured_pos_tot_snapshot)`
      - `h_snapshot_den = PNL_matured_pos_tot_snapshot`
      - `whole_snapshot = (h_snapshot_num == h_snapshot_den)`
-   - else:
-     - define `whole_snapshot = false`
 2. iterate `ctx.touched_accounts[]` in deterministic ascending storage-index order:
    - if `basis_pos_q_i == 0`, `ReleasedPos_i > 0`, and `whole_snapshot == true`:
      - `released = ReleasedPos_i`
@@ -1292,7 +1387,7 @@ A market is **positive-payout ready** only when all of the following hold:
 - `stored_pos_count_short == 0`
 - `neg_pnl_account_count == 0`
 
-`neg_pnl_account_count` is therefore the exact O(1) readiness aggregate for remaining negative claims. Implementations MUST maintain it exactly through `set_pnl` and preserve it explicitly on the sole direct non-sign-changing exception `consume_released_pnl`, rather than by ad hoc snapshot-time iteration.
+`neg_pnl_account_count` is therefore the exact O(1) readiness aggregate for remaining negative claims.
 
 ### 6.8 `capture_resolved_payout_snapshot_if_needed()`
 
@@ -1336,6 +1431,7 @@ Procedure:
 6. require `PNL_i == 0`, `R_i == 0`, both reserve buckets absent, and `basis_pos_q_i == 0`
 7. reset local fields and free the slot
 8. require `V >= C_tot + I`
+9. return `payout`
 
 ### 6.10 `force_close_resolved_terminal_positive(i) -> payout`
 
@@ -1365,8 +1461,9 @@ Procedure:
 9. require `PNL_i == 0`, `R_i == 0`, both reserve buckets absent, and `basis_pos_q_i == 0`
 10. reset local fields and free the slot
 11. require `V >= C_tot + I`
+12. return `payout`
 
-Impossible states — for example `resolved_payout_snapshot_ready == true` with `PNL_i > 0` but `resolved_payout_h_den == 0` — MUST fail conservatively rather than falling back to `y = x`. Under the readiness and snapshot rules of §§6.7–6.8, this precondition is expected to be unreachable in valid execution and remains as defense in depth.
+Impossible states — for example `resolved_payout_snapshot_ready == true` with `PNL_i > 0` but `resolved_payout_h_den == 0` — MUST fail conservatively rather than falling back to `y = x`.
 
 ---
 
@@ -1378,14 +1475,12 @@ This revision has no engine-native recurring maintenance fee. The engine core de
 
 Define:
 
-- `fee = mul_div_ceil_u128(trade_notional, trading_fee_bps, 10_000)`
+- `fee = mul_div_ceil_u128(trade_notional, cfg_trading_fee_bps, 10_000)`
 
 Rules:
 
-- if `trading_fee_bps == 0` or `trade_notional == 0`, then `fee = 0`
-- if `trading_fee_bps > 0` and `trade_notional > 0`, then `fee >= 1`
-
-The fee MUST be charged using `charge_fee_to_insurance(i, fee)`.
+- if `cfg_trading_fee_bps == 0` or `trade_notional == 0`, then `fee = 0`
+- if `cfg_trading_fee_bps > 0` and `trade_notional > 0`, then `fee >= 1`
 
 ### 7.2 Liquidation fees
 
@@ -1394,22 +1489,12 @@ For a liquidation that closes `q_close_q` at `oracle_price`:
 - if `q_close_q == 0`, `liq_fee = 0`
 - else:
   - `closed_notional = mul_div_floor_u128(q_close_q, oracle_price, POS_SCALE)`
-  - `liq_fee_raw = mul_div_ceil_u128(closed_notional, liquidation_fee_bps, 10_000)`
-  - `liq_fee = min(max(liq_fee_raw, min_liquidation_abs), liquidation_fee_cap)`
+  - `liq_fee_raw = mul_div_ceil_u128(closed_notional, cfg_liquidation_fee_bps, 10_000)`
+  - `liq_fee = min(max(liq_fee_raw, cfg_min_liquidation_abs), cfg_liquidation_fee_cap)`
 
 ### 7.3 Optional wrapper-owned account fees
 
 A wrapper MAY impose additional account fees by routing an amount `fee_abs` through `charge_fee_to_insurance(i, fee_abs)`, provided `fee_abs <= MAX_PROTOCOL_FEE_ABS`.
-
-### 7.4 Fee debt as margin liability
-
-`FeeDebt_i`:
-
-- MUST reduce `Eq_maint_raw_i`, `Eq_trade_raw_i`, `Eq_trade_open_raw_i`, and `Eq_withdraw_raw_i`
-- MUST be swept whenever capital becomes available and is no longer senior-encumbered by already-realized trading losses on the same local state
-- MUST NOT directly change `Residual`, `PNL_pos_tot`, or `PNL_matured_pos_tot`
-- includes unpaid native trading fees, native liquidation fees, and any wrapper-owned account fees routed through the canonical helper
-- any explicit fee amount beyond collectible capacity is dropped rather than written into `PNL_i` or `D`
 
 ---
 
@@ -1428,8 +1513,8 @@ If `effective_pos_q(i) == 0`:
 
 Else:
 
-- `MM_req_i = max(mul_div_floor_u128(Notional_i, maintenance_bps, 10_000), MIN_NONZERO_MM_REQ)`
-- `IM_req_i = max(mul_div_floor_u128(Notional_i, initial_bps, 10_000), MIN_NONZERO_IM_REQ)`
+- `MM_req_i = max(mul_div_floor_u128(Notional_i, cfg_maintenance_bps, 10_000), cfg_min_nonzero_mm_req)`
+- `IM_req_i = max(mul_div_floor_u128(Notional_i, cfg_initial_bps, 10_000), cfg_min_nonzero_im_req)`
 
 Healthy conditions:
 
@@ -1503,12 +1588,12 @@ For `execute_trade`, this prospective check MUST use the exact bilateral candida
 
 ### 9.0 Standard live instruction lifecycle
 
-`H_lock` and `funding_rate_e9_per_slot` are wrapper-owned logical inputs, not public caller-owned fields. Public or permissionless wrappers MUST derive them internally.
+`(admit_h_min, admit_h_max)` and `funding_rate_e9_per_slot` are wrapper-owned logical inputs, not public caller-owned fields. Public or permissionless wrappers MUST derive them internally.
 
 Unless explicitly noted otherwise, a live external state-mutating operation that depends on current market state executes in this order:
 
-1. validate monotonic slot, oracle input, funding-rate bound, and `H_lock` bound
-2. initialize fresh `ctx` with `H_lock_shared = H_lock`
+1. validate monotonic slot, oracle input, funding-rate bound, and admission-pair bound
+2. initialize fresh `ctx` with `admit_h_min_shared = admit_h_min`, `admit_h_max_shared = admit_h_max`
 3. call `accrue_market_to(now_slot, oracle_price, funding_rate_e9_per_slot)` exactly once
 4. set `current_slot = now_slot`
 5. perform the endpoint’s exact current-state inner execution
@@ -1516,10 +1601,9 @@ Unless explicitly noted otherwise, a live external state-mutating operation that
 7. call `schedule_end_of_instruction_resets(ctx)` exactly once
 8. call `finalize_end_of_instruction_resets(ctx)` exactly once
 9. assert `OI_eff_long == OI_eff_short` at the end of every live top-level instruction that can mutate side state or live exposure
+10. require `V >= C_tot + I`
 
-At the boundary of **every** top-level instruction — including pure capital-flow instructions that do not call `accrue_market_to` — all global invariants of §2.2 MUST hold again. In particular, the implementation MUST leave `V >= C_tot + I` true before returning.
-
-### 9.1 `settle_account(i, oracle_price, now_slot, funding_rate_e9_per_slot, H_lock)`
+### 9.1 `settle_account(i, oracle_price, now_slot, funding_rate_e9_per_slot, admit_h_min, admit_h_max)`
 
 1. require `market_mode == Live`
 2. require account `i` is materialized
@@ -1531,6 +1615,7 @@ At the boundary of **every** top-level instruction — including pure capital-fl
 8. schedule resets
 9. finalize resets
 10. assert `OI_eff_long == OI_eff_short`
+11. require `V >= C_tot + I`
 
 ### 9.2 `deposit(i, amount, now_slot)`
 
@@ -1541,7 +1626,7 @@ Procedure:
 1. require `market_mode == Live`
 2. require `now_slot >= current_slot`
 3. if account `i` is missing:
-   - require `amount >= MIN_INITIAL_DEPOSIT`
+   - require `amount >= cfg_min_initial_deposit`
    - materialize the account
 4. set `current_slot = now_slot`
 5. require `V + amount <= MAX_VAULT_TVL`
@@ -1553,8 +1638,6 @@ Procedure:
 11. require `V >= C_tot + I`
 
 ### 9.2.1 `deposit_fee_credits(i, amount, now_slot)`
-
-This is direct external repayment of fee debt.
 
 1. require `market_mode == Live`
 2. require account `i` is materialized
@@ -1581,8 +1664,6 @@ This is direct external repayment of fee debt.
 
 ### 9.2.3 `charge_account_fee(i, fee_abs, now_slot)`
 
-Optional wrapper-facing pure fee instruction.
-
 1. require `market_mode == Live`
 2. require account `i` is materialized
 3. require `now_slot >= current_slot`
@@ -1592,10 +1673,6 @@ Optional wrapper-facing pure fee instruction.
 7. require `V >= C_tot + I`
 
 ### 9.2.4 `settle_flat_negative_pnl(i, now_slot)`
-
-Permissionless live-only cleanup path for an already-flat authoritative account carrying negative `PNL_i`.
-
-This instruction is **not** a pure capital-flow instruction. It is an authoritative PnL-cleanup path for an already-flat account and MAY therefore absorb realized losses without calling `accrue_market_to`.
 
 1. require `market_mode == Live`
 2. require account `i` is materialized
@@ -1609,7 +1686,7 @@ This instruction is **not** a pure capital-flow instruction. It is an authoritat
 10. require `PNL_i == 0`
 11. require `V >= C_tot + I`
 
-### 9.3 `withdraw(i, amount, oracle_price, now_slot, funding_rate_e9_per_slot, H_lock)`
+### 9.3 `withdraw(i, amount, oracle_price, now_slot, funding_rate_e9_per_slot, admit_h_min, admit_h_max)`
 
 1. require `market_mode == Live`
 2. require account `i` is materialized
@@ -1619,16 +1696,15 @@ This instruction is **not** a pure capital-flow instruction. It is an authoritat
 6. `touch_account_live_local(i, ctx)`
 7. `finalize_touched_accounts_post_live(ctx)`
 8. require `amount <= C_i`
-9. require post-withdraw capital is either `0` or `>= MIN_INITIAL_DEPOSIT`
+9. require post-withdraw capital is either `0` or `>= cfg_min_initial_deposit`
 10. if `effective_pos_q(i) != 0`, require withdrawal health on the hypothetical post-withdraw state where both `V` and `C_tot` decrease by `amount`
 11. apply `set_capital(i, C_i - amount)` and `V = V - amount`
 12. schedule resets
 13. finalize resets
 14. assert `OI_eff_long == OI_eff_short`
+15. require `V >= C_tot + I`
 
-### 9.3.1 `convert_released_pnl(i, x_req, oracle_price, now_slot, funding_rate_e9_per_slot, H_lock)`
-
-Explicit voluntary conversion of matured released positive PnL for any live account.
+### 9.3.1 `convert_released_pnl(i, x_req, oracle_price, now_slot, funding_rate_e9_per_slot, admit_h_min, admit_h_max)`
 
 1. require `market_mode == Live`
 2. require account `i` is materialized
@@ -1647,8 +1723,9 @@ Explicit voluntary conversion of matured released positive PnL for any live acco
 15. schedule resets
 16. finalize resets
 17. assert `OI_eff_long == OI_eff_short`
+18. require `V >= C_tot + I`
 
-### 9.4 `execute_trade(a, b, oracle_price, now_slot, funding_rate_e9_per_slot, H_lock, size_q, exec_price)`
+### 9.4 `execute_trade(a, b, oracle_price, now_slot, funding_rate_e9_per_slot, admit_h_min, admit_h_max, size_q, exec_price)`
 
 `size_q > 0` means account `a` buys base from account `b`.
 
@@ -1672,8 +1749,8 @@ Procedure:
 16. enforce `MAX_OI_SIDE_Q`
 17. reject any trade that would increase OI on a blocked side
 18. compute `trade_pnl_a` and `trade_pnl_b` via `compute_trade_pnl(size_q, oracle_price, exec_price)` and apply execution-slippage PnL before fees:
-   - `set_pnl(a, PNL_a + trade_pnl_a, UseHLock(H_lock))`
-   - `set_pnl(b, PNL_b + trade_pnl_b, UseHLock(H_lock))`
+   - `set_pnl(a, PNL_a + trade_pnl_a, UseAdmissionPair(admit_h_min, admit_h_max), ctx)`
+   - `set_pnl(b, PNL_b + trade_pnl_b, UseAdmissionPair(admit_h_min, admit_h_max), ctx)`
 19. attach the resulting effective positions
 20. write the exact candidate OI after-values
 21. settle post-trade losses from principal for both accounts
@@ -1688,14 +1765,39 @@ Procedure:
      - `((Eq_maint_raw_post_i + fee_equity_impact_i) - MM_req_post_i) > (Eq_maint_raw_pre_i - MM_req_pre_i)`
      - `min(Eq_maint_raw_post_i + fee_equity_impact_i, 0) >= min(Eq_maint_raw_pre_i, 0)`
    - else reject
-
-The zero-position branch intentionally uses the same fee-neutral shortfall comparison principle as the strict risk-reducing branch. Step 22’s pre-fee guard still requires `PNL_i >= 0` before fees, so this rule removes both the current-trade-fee dust trap and the pre-existing-fee-debt flat-exit trap without permitting bankruptcy deficits to be dumped onto the protocol.
 26. `finalize_touched_accounts_post_live(ctx)`
 27. schedule resets
 28. finalize resets
 29. assert `OI_eff_long == OI_eff_short`
+30. require `V >= C_tot + I`
 
-### 9.5 `liquidate(i, oracle_price, now_slot, funding_rate_e9_per_slot, H_lock, policy)`
+### 9.5 `close_account(i, oracle_price, now_slot, funding_rate_e9_per_slot, admit_h_min, admit_h_max) -> payout`
+
+Owner-facing close path for a clean live account.
+
+1. require `market_mode == Live`
+2. require account `i` is materialized
+3. initialize `ctx`
+4. accrue market
+5. set `current_slot`
+6. `touch_account_live_local(i, ctx)`
+7. `finalize_touched_accounts_post_live(ctx)`
+8. require `basis_pos_q_i == 0`
+9. require `PNL_i == 0`
+10. require `R_i == 0` and both reserve buckets absent
+11. require `FeeDebt_i == 0`
+12. let `payout = C_i`
+13. if `payout > 0`:
+    - `set_capital(i, 0)`
+    - `V = V - payout`
+14. free the slot
+15. schedule resets
+16. finalize resets
+17. assert `OI_eff_long == OI_eff_short`
+18. require `V >= C_tot + I`
+19. return `payout`
+
+### 9.6 `liquidate(i, oracle_price, now_slot, funding_rate_e9_per_slot, admit_h_min, admit_h_max, policy)`
 
 `policy ∈ {FullClose, ExactPartial(q_close_q)}`.
 
@@ -1711,8 +1813,9 @@ The zero-position branch intentionally uses the same fee-neutral shortfall compa
 10. schedule resets
 11. finalize resets
 12. assert `OI_eff_long == OI_eff_short`
+13. require `V >= C_tot + I`
 
-### 9.6 `keeper_crank(now_slot, oracle_price, funding_rate_e9_per_slot, H_lock, ordered_candidates[], max_revalidations)`
+### 9.7 `keeper_crank(now_slot, oracle_price, funding_rate_e9_per_slot, admit_h_min, admit_h_max, ordered_candidates[], max_revalidations)`
 
 `ordered_candidates[]` is keeper-supplied and untrusted. It MAY be empty; an empty call is a valid “accrue-only plus finalize” instruction.
 
@@ -1731,48 +1834,68 @@ The zero-position branch intentionally uses the same fee-neutral shortfall compa
 8. schedule resets
 9. finalize resets
 10. assert `OI_eff_long == OI_eff_short`
+11. require `V >= C_tot + I`
 
-Deployments on constrained runtimes SHOULD choose `max_revalidations` small enough that one `keeper_crank` plus exact wide arithmetic and touched-account finalization fits within the runtime’s per-instruction compute budget.
+Candidate order in this instruction is **keeper policy**, not an engine-level fairness guarantee. Different valid candidate orders can change which accounts receive faster or slower reserve admission or touch-time acceleration in that instruction. This affects only user-side warmup timing and operational UX, never solvency, conservation, or correctness. Deployments that require deterministic UX SHOULD canonicalize candidates by ascending storage index after their own off-chain risk bucketing.
 
-### 9.7 `resolve_market(resolved_price, live_oracle_price, now_slot, funding_rate_e9_per_slot)`
+### 9.8 `resolve_market(resolved_price, live_oracle_price, now_slot, funding_rate_e9_per_slot)`
 
 Privileged deployment-owned transition.
 
-This instruction is self-synchronizing. It first accrues the live market state to `now_slot` using the trusted current live oracle price and the wrapper-owned current funding rate. It then stores the final settlement mark as separate resolved terminal `K` deltas rather than performing a second persistent settlement accrue into live `K_side`. This keeps the final settlement shift exact while avoiding any requirement that cumulative live `K_side` itself absorb the terminal price move.
+This instruction has two privileged branches:
+
+- **ordinary self-synchronizing resolution**, which first accrues the live market state to `now_slot` using the trusted current live oracle price and the wrapper-owned current funding rate, then stores the final settlement mark as separate resolved terminal `K` deltas; and
+- **degenerate recovery resolution**, which is available only when the wrapper explicitly supplies degenerate live-sync inputs (`live_oracle_price = P_last` and `funding_rate_e9_per_slot = 0`), in which case the instruction resolves directly from the last synchronized live mark and intentionally applies no additional live accrual after `slot_last`.
+
+Procedure:
 
 1. require `market_mode == Live`
 2. require `now_slot >= current_slot` and `now_slot >= slot_last`
 3. require validated `0 < live_oracle_price <= MAX_ORACLE_PRICE`
 4. require validated `0 < resolved_price <= MAX_ORACLE_PRICE`
-5. call `accrue_market_to(now_slot, live_oracle_price, funding_rate_e9_per_slot)`
-6. set `current_slot = now_slot`
-7. require exact settlement-band check against the trusted live-sync price:
-   - `abs(resolved_price - live_oracle_price) * 10_000 <= resolve_price_deviation_bps * live_oracle_price`
-   - both `live_oracle_price` and `resolved_price` are privileged wrapper-trusted inputs on this path; the band is an internal consistency guard, not an independent oracle-integrity proof
-8. compute resolved terminal mark deltas in exact checked signed arithmetic:
+5. if `live_oracle_price == P_last` and `funding_rate_e9_per_slot == 0`:
+   - set `current_slot = now_slot`
+   - set `slot_last = now_slot`
+   - set `resolved_live_price_candidate = P_last`
+   - set `used_degenerate_resolution_branch = true`
+6. else:
+   - require `now_slot - slot_last <= cfg_max_accrual_dt_slots`
+   - call `accrue_market_to(now_slot, live_oracle_price, funding_rate_e9_per_slot)`
+   - set `current_slot = now_slot`
+   - set `resolved_live_price_candidate = live_oracle_price`
+   - set `used_degenerate_resolution_branch = false`
+7. if `used_degenerate_resolution_branch == false`:
+   - require exact settlement-band check:
+     - `abs(resolved_price - resolved_live_price_candidate) * 10_000 <= cfg_resolve_price_deviation_bps * resolved_live_price_candidate`
+     - both `resolved_live_price_candidate` and `resolved_price` are privileged wrapper-trusted inputs on this path; on the ordinary branch the band is an internal consistency guard, not an independent oracle-integrity proof
+8. else:
+   - skip the ordinary live-sync settlement band check
+   - the degenerate branch relies entirely on trusted wrapper settlement inputs and must be used only when explicitly permitted by the deployment’s settlement policy
+9. compute resolved terminal mark deltas in exact checked signed arithmetic:
    - if `mode_long == ResetPending`, set `resolved_k_long_terminal_delta = 0`
-   - else compute `resolved_k_long_terminal_delta = A_long * (resolved_price - live_oracle_price)` and require representable as persistent `i128`
+   - else compute `resolved_k_long_terminal_delta = A_long * (resolved_price - resolved_live_price_candidate)` and require representable as persistent `i128`
    - if `mode_short == ResetPending`, set `resolved_k_short_terminal_delta = 0`
-   - else compute `resolved_k_short_terminal_delta = -A_short * (resolved_price - live_oracle_price)` and require representable as persistent `i128`
+   - else compute `resolved_k_short_terminal_delta = -A_short * (resolved_price - resolved_live_price_candidate)` and require representable as persistent `i128`
    - these terminal deltas MUST NOT be added into persistent live `K_side`
-9. set `market_mode = Resolved`
-10. set `resolved_price = resolved_price`
-11. set `resolved_live_price = live_oracle_price`
-12. set `resolved_slot = now_slot`
-13. clear resolved payout snapshot state
-14. set `PNL_matured_pos_tot = PNL_pos_tot`
-15. set `OI_eff_long = 0` and `OI_eff_short = 0`
-16. for each side:
-    - if `mode_side != ResetPending`, invoke `begin_full_drain_reset(side)`
-    - if the resulting side state is `ResetPending` and `stale_account_count_side == 0` and `stored_pos_count_side == 0`, invoke `finalize_side_reset(side)`
-17. require both open-interest sides are zero
-18. require `V >= C_tot + I`
+10. set `market_mode = Resolved`
+11. set `resolved_price = resolved_price`
+12. set `resolved_live_price = resolved_live_price_candidate`
+13. set `resolved_slot = now_slot`
+14. clear resolved payout snapshot state
+15. set `PNL_matured_pos_tot = PNL_pos_tot`
+16. set `OI_eff_long = 0` and `OI_eff_short = 0`
+17. for each side:
+   - if `mode_side != ResetPending`, invoke `begin_full_drain_reset(side)`
+   - if the resulting side state is `ResetPending` and `stale_account_count_side == 0` and `stored_pos_count_side == 0`, invoke `finalize_side_reset(side)`
+18. require both open-interest sides are zero
+19. require `V >= C_tot + I`
 
-Under §0, steps 5 through 18 are one atomic transition. If any check fails — including live-sync accrual, terminal-delta representability, or reset-finalization checks — the market remains live and all intermediate writes roll back with the enclosing instruction.
+Under §0, steps 5 through 19 are one atomic transition. If any check fails — including ordinary live-sync accrual, degenerate-input validation, terminal-delta representability, or reset-finalization checks — the market remains live and all intermediate writes roll back with the enclosing instruction.
 
-If cumulative live `K_side` or `F_side_num` headroom is tight, the privileged wrapper MAY intentionally choose a degenerate live-sync leg — for example `live_oracle_price = P_last` and/or `funding_rate_e9_per_slot = 0` — **only if** doing so is consistent with the deployment’s explicit settlement policy. In that operational recovery mode, step 5 applies little or no additional live-state shift, while step 8 still carries the final settlement move through `resolved_k_*_terminal_delta`.
+The ordinary branch is the normative path. The degenerate branch exists only to preserve privileged resolution liveness when applying additional live accrual would be impossible or undesirable under the deployment’s explicit settlement policy — for example because `dt > cfg_max_accrual_dt_slots` or cumulative live `K_side` or `F_side_num` headroom is tight.
 
-### 9.8 `force_close_resolved(i, now_slot)`
+
+### 9.9 `force_close_resolved(i, now_slot)`
 
 Multi-stage resolved-market progress path.
 
@@ -1795,17 +1918,13 @@ A zero payout MUST NOT be the sole encoding of “not yet closeable.”
 11. require `OI_eff_long == OI_eff_short`
 12. if `PNL_i <= 0`, return `Closed { payout }` from `force_close_resolved_terminal_nonpositive(i)`
 13. if `PNL_i > 0`:
-    - if the market is not positive-payout ready:
-      - require `V >= C_tot + I`
-      - return `ProgressOnly` after persisting the local reconciliation
-    - if the shared resolved payout snapshot is not ready, capture it
-    - return `Closed { payout }` from `force_close_resolved_terminal_positive(i)`
+   - if the market is not positive-payout ready:
+     - require `V >= C_tot + I`
+     - return `ProgressOnly` after persisting the local reconciliation
+   - if the shared resolved payout snapshot is not ready, capture it
+   - return `Closed { payout }` from `force_close_resolved_terminal_positive(i)`
 
-Under `ProgressOnly`, the instruction MAY persist local reconciliation side effects — including changes to `PNL_i`, reserve clearing, stale-account counters, and decreases to `I` from flat-loss absorption — but it MUST NOT transfer any terminal payout from `V`.
-
-Because §0 requires top-level instruction atomicity, no observer may see an interleaving between local reconciliation, aggregate-counter maintenance, snapshot capture, and the eventual `ProgressOnly` or `Closed` outcome within one call.
-
-### 9.9 `reclaim_empty_account(i, now_slot)`
+### 9.10 `reclaim_empty_account(i, now_slot)`
 
 1. require `market_mode == Live`
 2. require account `i` is materialized
@@ -1814,6 +1933,7 @@ Because §0 requires top-level instruction atomicity, no observer may see an int
 5. set `current_slot = now_slot`
 6. require final reclaim eligibility of §2.8
 7. execute the reclamation effects of §2.8
+8. require `V >= C_tot + I`
 
 ---
 
@@ -1838,7 +1958,7 @@ Because §0 requires top-level instruction atomicity, no observer may see an int
 An implementation MUST include tests covering at least the following.
 
 1. `V >= C_tot + I` always.
-2. Positive `set_pnl` increases raise `R_i` by the same delta and do not immediately increase `PNL_matured_pos_tot`.
+2. Positive `set_pnl` increases raise `R_i` by the same delta and do not immediately increase `PNL_matured_pos_tot` unless admitted at `h_eff = 0`.
 3. Fresh unwarmed manipulated PnL cannot satisfy withdrawal checks or principal conversion.
 4. Aggregate positive PnL admitted through `g` is bounded by `Residual`.
 5. `Eq_trade_open_raw_i` exactly neutralizes the candidate trade’s own positive slippage.
@@ -1864,16 +1984,16 @@ An implementation MUST include tests covering at least the following.
 25. Epoch gaps larger than one are rejected as corruption.
 26. If `A_candidate == 0` with `OI_post > 0`, the engine force-drains both sides instead of reverting.
 27. If ADL `delta_K_abs` is non-representable or `K_opp + delta_K_exact` overflows, quantity socialization still proceeds and the remainder routes through `record_uninsured_protocol_loss`.
-28. `enqueue_adl` spends insurance down to `I_floor` before any remaining bankruptcy loss is socialized or left as junior undercollateralization.
+28. `enqueue_adl` spends insurance down to `cfg_insurance_floor` before any remaining bankruptcy loss is socialized or left as junior undercollateralization.
 29. The exact ADL dust-bound increment matches §5.6 step 10 and the unilateral and bilateral dust-clear conditions match §5.7 exactly.
-30. The exact total funding delta `fund_num_total = fund_px_last_before * funding_rate_e9_per_slot * dt` is applied symmetrically to both sides’ `F_side_num` updates with opposite signs, without per-step or per-chunk rounding.
+30. Funding accrual uses exact 256-bit-or-equivalent intermediates for both `fund_num_total` and each `A_side * fund_num_total` product, with symmetry preserved.
 31. A flat account with negative `PNL_i` resolves through `absorb_protocol_loss` only in the allowed already-authoritative flat-account paths.
 32. Reset finalization reopens a side once `ResetPending` preconditions are fully satisfied.
 33. `deposit` settles realized losses before fee sweep.
-34. A missing account cannot be materialized by a deposit smaller than `MIN_INITIAL_DEPOSIT`.
+34. A missing account cannot be materialized by a deposit smaller than `cfg_min_initial_deposit`.
 35. The strict risk-reducing trade exemption uses exact widened raw maintenance buffers and exact widened raw maintenance shortfall.
 36. The strict risk-reducing trade exemption adds back `fee_equity_impact_i`, not nominal fee.
-37. Any side-count increment — including a sign flip — enforces `MAX_ACTIVE_POSITIONS_PER_SIDE`.
+37. Any side-count increment — including a sign flip — enforces `cfg_max_active_positions_per_side`.
 38. A flat trade cannot bypass ADL by leaving negative `PNL_i` behind.
 39. Live flat dust accounts can be reclaimed safely.
 40. Missing-account safety: ordinary live and resolved paths do not auto-materialize missing accounts.
@@ -1888,34 +2008,33 @@ An implementation MUST include tests covering at least the following.
 49. No positive resolved payout occurs until stale-account reconciliation is complete across both sides and the shared payout snapshot is locked.
 50. A resolved account with `PNL_i <= 0` can close immediately after local reconciliation, even while unrelated positive claims are still waiting for the shared snapshot.
 51. Every positive terminal resolved close uses the same captured resolved payout snapshot.
-52. Live instructions reject invalid `H_lock` and invalid `funding_rate_e9_per_slot`.
+52. Live instructions reject invalid admission pairs and invalid `funding_rate_e9_per_slot`.
 53. `deposit`, `deposit_fee_credits`, `top_up_insurance_fund`, and `charge_account_fee` do not draw insurance.
 54. `settle_flat_negative_pnl` is a live-only permissionless cleanup path that does not mutate side state.
-55. `resolve_market` first synchronizes live accrual to `now_slot` using the trusted current live oracle price and wrapper-owned current funding rate, then stores the final settlement mark as separate resolved terminal `K` deltas rather than a second persistent settlement accrue.
-56. `resolve_market` rejects settlement prices outside the immutable band around the trusted live-sync price used for that instruction.
+55. On its ordinary branch, `resolve_market` self-synchronizes live accrual to `now_slot` and stores the final settlement mark as separate resolved terminal deltas.
+56. On its ordinary branch, `resolve_market` rejects settlement prices outside the immutable band around the trusted live-sync price used for that instruction; on its degenerate branch, that ordinary live-sync band check is intentionally bypassed.
 57. Resolved local reconciliation applies the stored `resolved_k_*_terminal_delta` exactly on sides that were still live at resolution, and applies zero terminal delta on sides that were already `ResetPending`.
 58. Under open-interest symmetry, end-of-instruction reset scheduling preserves `OI_eff_long == OI_eff_short`.
-59. The simplified two-bucket warmup design never accelerates release relative to the sampled bucket horizons.
-60. Positive resolved payouts do not begin until the market is positive-payout ready per §6.7, or an exact equivalent readiness predicate is true.
-61. `neg_pnl_account_count` exactly matches iteration over materialized accounts with `PNL_i < 0` after every path that mutates `PNL_i`.
-62. The touched-account set cannot silently drop an account; if capacity would be exceeded, the instruction fails conservatively.
-63. Whole-only automatic flat conversion in §6.6 uses the exact helper sequence `consume_released_pnl` then `set_capital`.
-64. `force_close_resolved` exposes an explicit progress-versus-close outcome; a zero payout is never the sole encoding of “not yet closeable.”
-65. The positive resolved-close path fails conservatively, not permissively, if a snapshot is marked ready with a zero payout denominator while some account still has `PNL_i > 0`.
-66. `advance_profit_warmup` computes scheduled maturity through an exact multiply-divide helper or a formally equivalent exact method and does not fail merely because `sched_anchor_q * elapsed` would overflow a narrow intermediate while the final quotient fits.
-67. `set_pnl` rejects `NoPositiveIncreaseAllowed` and invalid nonzero live `H_lock` inputs before any persistent mutation, and any later failure rolls back reserve state as well as PnL aggregates.
-68. `settle_side_effects_resolved` requires reserve-cleared resolved state (`R_i == 0` and both buckets absent), or an equivalent prior `prepare_account_for_resolved_touch(i)`.
-69. `ProgressOnly` from `force_close_resolved` may persist local reconciliation and insurance use, but never transfers payout from `V`.
-70. Any valid positive `P_last` or `fund_px_last` value is never treated as an uninitialized sentinel.
-71. On strict risk-reducing trades, `fee_dropped_i` is not added back; only `fee_equity_impact_i` reverses the actual raw-equity change.
-72. The live mark-to-market leg of `accrue_market_to` fails conservatively if the resulting persistent `K_side` would overflow `i128`.
-73. Resolved local reconciliation may exceed the live-only caps `MAX_ACCOUNT_POSITIVE_PNL` and `MAX_PNL_POS_TOT` when all resulting persistent values remain representable and the market can still reach snapshot capture and terminal close.
-74. Funding accrual uses exact 256-bit-or-equivalent intermediates for both `fund_num_total` and each `A_side * fund_num_total` product, with stress coverage near i128 wrap boundaries.
-75. `force_close_resolved` and both resolved terminal-close helpers preserve `V >= C_tot + I` on both `Closed` and progress-only outcomes.
-76. After any `A_side` decay in ADL, the difference between authoritative `OI_eff_side` and the sum of per-account same-epoch floor quantities on that side is bounded only by the corresponding `phantom_dust_bound_side_q`, and subsequent mark moves do not mint unbacked PnL outside the explicit dust-clear and reset rules of §5.7.
-77. In Resolved mode, any local reconciliation or terminal-close path that would overflow persistent `u128` aggregates such as `PNL_pos_tot` or `PNL_matured_pos_tot` fails conservatively rather than wrapping.
-78. `resolve_market` remains callable under tight live `K` or `F` headroom when the wrapper intentionally chooses a degenerate live-sync leg permitted by its settlement policy, and the final settlement move is still carried exactly by `resolved_k_*_terminal_delta`.
-79. A voluntary trade that closes an account exactly to flat is not rejected solely because explicit post-trade fees create local fee debt; the zero-position branch uses `Eq_maint_raw_post_i + fee_equity_impact_i` while the pre-fee `PNL_i >= 0` guard still prevents bankruptcy-dumping closes.
+59. Positive resolved payouts do not begin until the market is positive-payout ready per §6.7.
+60. `neg_pnl_account_count` exactly matches iteration over materialized accounts with `PNL_i < 0` after every path that mutates `PNL_i`.
+61. The touched-account set and instruction-local `h_max` sticky state cannot silently drop an account; if capacity would be exceeded, the instruction fails conservatively.
+62. Whole-only automatic flat conversion in §6.6 uses the exact helper sequence `consume_released_pnl` then `set_capital`.
+63. `force_close_resolved` exposes an explicit progress-versus-close outcome; a zero payout is never the sole encoding of “not yet closeable.”
+64. The positive resolved-close path fails conservatively, not permissively, if a snapshot is marked ready with a zero payout denominator while some account still has `PNL_i > 0`.
+65. `advance_profit_warmup` clamps `elapsed` at `sched_horizon` and therefore does not fail merely because an unclamped quotient would exceed `u128`.
+66. Live positive reserve creation cannot use `ImmediateReleaseResolvedOnly`.
+67. Within one instruction, once an account requires `admit_h_max`, later fresh positive increases on that account also use `admit_h_max`; an earlier newest pending increment may be conservatively lifted, but under-admission is forbidden.
+68. `admit_outstanding_reserve_on_touch` either accelerates all outstanding reserve or leaves it unchanged; it never extends or resets reserve horizons.
+69. A live live-accrual instruction with `dt > cfg_max_accrual_dt_slots` fails conservatively; privileged `resolve_market` may proceed only through its explicit degenerate branch.
+70. Market initialization rejects any `(cfg_max_abs_funding_e9_per_slot, cfg_max_accrual_dt_slots)` pair that violates the exact funding-envelope inequality.
+71. The degenerate branch of `resolve_market` requires `live_oracle_price = P_last` and `funding_rate_e9_per_slot = 0` and may be used whenever the deployment’s settlement policy explicitly allows resolving directly from the last synchronized live mark.
+72. A voluntary trade that closes an account exactly to flat is not rejected solely because current-trade fees create or increase fee debt; the zero-position branch uses the same fee-neutral shortfall-comparison principle as strict risk reduction.
+73. `max_safe_flat_conversion_released` uses 256-bit-or-equivalent arithmetic and does not silently overflow on `E_before * h_den`.
+74. Candidate ordering in `keeper_crank` may affect warmup UX but not solvency, conservation, or correctness.
+75. Resolved local reconciliation may exceed live-only caps while still failing conservatively on any `u128` aggregate overflow.
+76. `close_account` cannot be used to forgive unpaid fee debt; unresolved debt must be repaid or reclaimed through the dust path.
+77. After any `A_side` decay in ADL, any mismatch between authoritative `OI_eff_side` and summed per-account same-epoch floor quantities is bounded and resolved only through explicit phantom-dust rules.
+78. Long-running markets with little matured-PnL extraction eventually see `Residual` become scarce relative to `PNL_matured_pos_tot`, causing fresh reserve admission to select slower horizons more often; this is operationally visible but must never break safety or correctness.
 
 ---
 
@@ -1924,50 +2043,69 @@ An implementation MUST include tests covering at least the following.
 The following are deployment-wrapper obligations.
 
 1. **Do not expose caller-controlled live policy inputs.**  
-   `H_lock` and `funding_rate_e9_per_slot` are wrapper-owned internal inputs. Public or permissionless wrappers MUST derive them internally and MUST NOT accept arbitrary caller-chosen values.
-2. **Authority-gate market resolution and supply trusted live-sync inputs.**  
-   `resolve_market` is a privileged deployment-owned transition. A compliant wrapper MUST source both `live_oracle_price` and `resolved_price` from the deployment’s trusted settlement sources or policy, and MUST source the wrapper-owned current funding rate used for the live-sync leg inside `resolve_market`.
+   `(admit_h_min, admit_h_max)` and `funding_rate_e9_per_slot` are wrapper-owned internal inputs. Public or permissionless wrappers MUST derive them internally and MUST NOT accept arbitrary caller-chosen values.
+
+2. **Authority-gate market resolution and supply trusted inputs for both ordinary and degenerate branches.**  
+   `resolve_market` is a privileged deployment-owned transition. A compliant wrapper MUST source both `live_oracle_price` and `resolved_price` from the deployment’s trusted settlement sources or policy, and MUST source the wrapper-owned current funding rate used for the ordinary live-sync leg inside `resolve_market`. If the wrapper intentionally uses the degenerate recovery branch, it MUST pass `live_oracle_price = P_last` and `funding_rate_e9_per_slot = 0` and MUST do so only when that behavior is explicitly permitted by the deployment’s settlement policy.
+
 3. **Do not emulate resolution with a separate prior accrual transaction as the normal path.**  
-   Because `resolve_market` is self-synchronizing in this revision, a compliant wrapper MUST invoke it directly with trusted live-sync inputs for ordinary operation. A separate pre-accrual transaction is not required and MUST NOT be treated as the normative path, though a deployment MAY use an explicit pre-accrual or headroom-management flow as an operational recovery tool if it is trying to avoid cumulative `K` or `F` saturation before resolution. When such recovery is necessary and the deployment’s disclosed settlement policy permits it, the wrapper MAY intentionally choose degenerate live-sync inputs such as `live_oracle_price = P_last` and/or `funding_rate_e9_per_slot = 0`, so that little or no additional live-state shift is applied in step 5 and the final settlement move is carried by `resolved_k_*_terminal_delta`.
-4. **Public wrappers SHOULD enforce execution-price admissibility.**  
-   A sufficient rule is `abs(exec_price - oracle_price) * 10_000 <= max_trade_price_deviation_bps * oracle_price`, with `max_trade_price_deviation_bps <= 2 * trading_fee_bps`.
-5. **Use oracle notional for wrapper-side exposure ranking.**
-6. **Keep user-owned value-moving operations account-authorized.**  
-   User-owned value-moving paths include `deposit`, `withdraw`, `execute_trade`, and `convert_released_pnl`. Intended permissionless progress paths are `settle_account`, `liquidate`, `reclaim_empty_account`, `settle_flat_negative_pnl`, `force_close_resolved`, and `keeper_crank`.
-7. **If desired, tighten the dropped-fee policy above the engine.**  
-   The core engine’s strict risk-reducing comparison is defined by actual `fee_equity_impact_i` only. A deployment that wishes to reject strict risk-reducing trades whenever `fee_dropped_i > 0` MAY impose that stricter wrapper rule above the engine.
+   Because `resolve_market` is self-synchronizing in this revision, a compliant wrapper MUST invoke it directly with trusted live-sync inputs for ordinary operation. A separate pre-accrual transaction is not required and MUST NOT be treated as the normative path, though a deployment MAY use an explicit pre-accrual or headroom-management flow as an operational recovery tool if it is trying to avoid cumulative `K` or `F` saturation before resolution. If live accrual would still be unsafe or impossible, the wrapper MAY instead use the privileged degenerate branch inside `resolve_market`.
+
+4. **Respect the funding envelope operationally.**  
+   A compliant deployment MUST monitor `slot_last`, `cfg_max_accrual_dt_slots`, and `cfg_max_abs_funding_e9_per_slot` so the market is actively cranked or ordinarily resolved before the engine’s live accrual envelope is exceeded. If the deployment enables permissionless stale resolution, it MUST choose `permissionless_resolve_stale_slots <= cfg_max_accrual_dt_slots`. If the envelope is exceeded anyway, only the privileged degenerate branch remains available.
+
+5. **Public wrappers SHOULD enforce execution-price admissibility.**  
+   A sufficient rule is `abs(exec_price - oracle_price) * 10_000 <= max_trade_price_deviation_bps * oracle_price`, with `max_trade_price_deviation_bps <= 2 * cfg_trading_fee_bps`.
+
+6. **Use oracle notional for wrapper-side exposure ranking.**
+
+7. **Keep user-owned value-moving operations account-authorized.**  
+   User-owned value-moving paths include `deposit`, `withdraw`, `execute_trade`, `close_account`, and `convert_released_pnl`. Intended permissionless progress paths are `settle_account`, `liquidate`, `reclaim_empty_account`, `settle_flat_negative_pnl`, `force_close_resolved`, and `keeper_crank`.
+
 8. **Do not expose pure wrapper-owned account fees carelessly.**  
    `charge_account_fee` performs no maintenance gating of its own. A compliant public wrapper MUST either restrict it to already-safe contexts or pair it with a same-instruction live-touch health-check flow when used on accounts that may still carry live risk.
-9. **Provide a post-snapshot resolved-close progress path.**  
+
+9. **If desired, tighten the dropped-fee policy above the engine.**  
+   The core engine’s strict risk-reducing comparison is defined by actual `fee_equity_impact_i` only. A deployment that wishes to reject strict risk-reducing trades whenever `fee_dropped_i > 0` MAY impose that stricter wrapper rule above the engine.
+
+10. **Provide a post-snapshot resolved-close progress path.**  
    Because `force_close_resolved` is intentionally multi-stage, a compliant deployment SHOULD provide either a self-service retry path or a permissionless batch or incentive path that sweeps positive resolved accounts after the shared payout snapshot is ready.
-10. **Set account-opening economics high enough to resist slot-griefing.**  
-   A compliant deployment MUST choose `MIN_INITIAL_DEPOSIT` and any account-opening fee or equivalent economic barrier so that exhausting the configured materialized-account capacity is economically prohibitive relative to the deployment’s threat model.
-11. **Size runtime batches to actual compute limits.**  
+
+11. **Set account-opening economics high enough to resist slot-griefing.**  
+   A compliant deployment MUST choose `cfg_min_initial_deposit` and any account-opening fee or equivalent economic barrier so that exhausting the configured materialized-account capacity is economically prohibitive relative to the deployment’s threat model.
+
+12. **Size runtime batches to actual compute limits.**  
    On constrained runtimes, a compliant deployment MUST choose `max_revalidations`, batch-close sizes, and any wrapper-side multi-account composition so one instruction fits the runtime’s per-instruction compute budget.
-12. **Plan market lifecycle before K/F headroom exhaustion.**  
+
+13. **Plan market lifecycle before K/F headroom exhaustion.**  
    A compliant deployment SHOULD monitor cumulative `K_side` and `F_side_num` headroom and resolve or migrate the market before approaching persistent `i128` saturation.
-13. **If more throughput is required than one market state can provide, shard at the deployment layer.**  
+
+14. **If more throughput is required than one market state can provide, shard at the deployment layer.**  
    One market instance serializes writes by design. A deployment that requires higher throughput SHOULD shard across multiple market instances rather than assuming runtime-level parallelism inside one market.
 
-14. **Provide an operator recovery path for impossible invariant-breach orphans if the deployment requires one.**  
+15. **If deterministic keeper UX is desired, canonicalize candidate order.**  
+   The engine intentionally treats keeper candidate order as policy. A deployment that wants deterministic warmup-admission or acceleration UX across keepers SHOULD canonicalize `ordered_candidates[]`, for example by ascending storage index after off-chain risk bucketing.
+
+16. **Surface matured-pool saturation to users.**  
+   In long-running markets where users do not convert or withdraw matured profit, `PNL_matured_pos_tot` can grow close to `Residual`, causing fresh reserve admission to select slower horizons more often. Deployments SHOULD surface this state in UI and MAY prompt users to settle or extract matured claims when appropriate.
+
+17. **Provide an operator recovery path for impossible invariant-breach orphans if the deployment requires one.**  
    The core engine intentionally fails conservatively if resolved reconciliation encounters a state that violates the epoch-gap or reset invariants. A deployment that wants an explicit operational escape hatch for such impossible states SHOULD provide a privileged migration or recovery path above the engine rather than weakening the engine’s conservative-failure rules.
 
 ---
 
-## 13. Solana deployment considerations (operational, non-normative)
+## 13. Operational notes (non-normative)
 
-The economic rules above are exact and intentionally conservative. On Solana-like runtimes, the main remaining constraints are operational rather than mathematical:
+1. **Wide exact arithmetic costs compute.** Exact 256-bit-or-equivalent multiply-divide and signed floor arithmetic are materially more expensive than native 128-bit operations. Keepers and wrappers should use bounded candidate sets and avoid oversized multi-account transactions.
 
-1. **Wide exact arithmetic costs compute.**  
-   Exact 256-bit-or-equivalent multiply-divide and signed floor arithmetic are substantially more expensive than native 128-bit operations. Keepers and wrappers should therefore use bounded candidate sets and avoid oversized multi-account transactions.
-2. **One market account serializes one market.**  
-   Because core instructions update shared market aggregates (`V`, `I`, `C_tot`, `PNL_pos_tot`, `A_side`, `K_side`, `F_side_num`, and so on), one market instance is throughput-serialized by design. This is an expected tradeoff of exact shared-state accounting, not a correctness defect.
-3. **Account-capacity griefing is economic, not mathematical.**  
-   If `MIN_INITIAL_DEPOSIT` or any account-opening fee is set too low, an attacker can economically spam materialization. The engine’s reclaim path preserves eventual liveness, but the deployment must still choose parameters that make the attack unattractive and should incentivize reclaim.
-4. **Resolution paths should stay thin.**  
-   Even though `resolve_market` is now self-synchronizing, wrappers should keep the resolution path small in transaction size and compute. Precompute external checks off chain where possible, avoid unnecessary CPI fanout in the same transaction, and remember that the settlement band is checking consistency between wrapper-trusted prices, not supplying an independent oracle guarantee.
-   If live `K_side` or `F_side_num` headroom is tight, deployments may prefer a degenerate live-sync leg as described in §12.3 so the terminal settlement move is carried by resolved terminal deltas instead of additional live-state shift.
-5. **Multi-instruction keeper progress is normal.**  
-   Because `keeper_crank` intentionally stops further live-OI-dependent processing once a reset is pending, volatile periods may require multiple successive keeper instructions. Off-chain keepers should prioritize the highest-risk candidates first, consider separating likely-reset-triggering bankruptcies from ordinary maintenance sweeps, and be prepared to resume after reset finalization.
-6. **Batch positive resolved closes are recommended when practical.**  
-   The engine defines exact single-account progress and terminal-close semantics. Deployments that expect many resolved accounts should strongly consider a batched wrapper or incentive path for post-snapshot sweeping to reduce transaction overhead.
+2. **One market account serializes one market.** Because core instructions update shared market aggregates (`V`, `I`, `C_tot`, `PNL_pos_tot`, `A_side`, `K_side`, `F_side_num`, and so on), one market instance is throughput-serialized by design.
+
+3. **Account-capacity griefing is economic, not mathematical.** If `cfg_min_initial_deposit` or any account-opening fee is set too low, an attacker can economically spam materialization. The engine’s reclaim path preserves eventual liveness, but the deployment must still choose parameters that make the attack unattractive and should incentivize reclaim.
+
+4. **Resolution paths should stay thin.** Even though `resolve_market` is self-synchronizing, wrappers should keep the resolution path small in transaction size and compute. Precompute external checks off chain where possible, avoid unnecessary CPI fanout in the same transaction, and remember that the settlement band checks consistency between wrapper-trusted prices rather than supplying an independent oracle guarantee.
+
+5. **Multi-instruction keeper progress is normal.** Because `keeper_crank` intentionally stops further live-OI-dependent processing once a reset is pending, volatile periods may require multiple successive keeper instructions.
+
+6. **Batch positive resolved closes are recommended when practical.** The engine defines exact single-account progress and terminal-close semantics. Deployments that expect many resolved accounts should strongly consider a batched wrapper or incentive path for post-snapshot sweeping to reduce transaction overhead.
+
+7. **Funding envelopes are an engine safety boundary, not only a wrapper preference.** The engine-enforced pair `(cfg_max_abs_funding_e9_per_slot, cfg_max_accrual_dt_slots)` is what prevents dormant-market funding accrual from overflowing persistent `F_side_num`. Wrapper policy should stay comfortably inside that envelope; if the envelope is exceeded anyway, only the privileged degenerate branch of `resolve_market` remains live.

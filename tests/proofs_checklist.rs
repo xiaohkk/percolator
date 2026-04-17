@@ -62,7 +62,7 @@ fn proof_a7_fee_credits_bounds_after_trade() {
     kani::assume(size > 0 && size <= 10 * POS_SCALE as i128);
 
     let result = engine.execute_trade_not_atomic(
-        a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size, DEFAULT_ORACLE, 0i128, 0);
+        a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size, DEFAULT_ORACLE, 0i128, 0, 0);
 
     if result.is_ok() {
         let fc = engine.accounts[a as usize].fee_credits.get();
@@ -123,13 +123,13 @@ fn proof_f8_loss_seniority_in_touch() {
     engine.deposit_not_atomic(b, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
     let size = (50 * POS_SCALE) as i128;
-    engine.execute_trade_not_atomic(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size, DEFAULT_ORACLE, 0i128, 0).unwrap();
+    engine.execute_trade_not_atomic(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size, DEFAULT_ORACLE, 0i128, 0, 0).unwrap();
 
     let capital_before = engine.accounts[a as usize].capital.get();
 
     // Price crash → negative PnL for long
     let slot2 = DEFAULT_SLOT + 10;
-    let mut ctx = InstructionContext::new_with_h_lock(0);
+    let mut ctx = InstructionContext::new_with_admission(0, 0);
     let _ = engine.accrue_market_to(slot2, 800, 0);
     engine.current_slot = slot2;
     let _ = engine.touch_account_live_local(a as usize, &mut ctx);
@@ -161,7 +161,7 @@ fn proof_b7_oi_balance_after_trade() {
     kani::assume(size > 0 && size <= 100 * POS_SCALE as i128);
 
     let result = engine.execute_trade_not_atomic(
-        a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size, DEFAULT_ORACLE, 0i128, 0);
+        a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size, DEFAULT_ORACLE, 0i128, 0, 0);
     if result.is_ok() {
         assert!(engine.oi_eff_long_q == engine.oi_eff_short_q,
             "B7: OI_long == OI_short after trade");
@@ -189,7 +189,7 @@ fn proof_b1_conservation_after_trade_with_fees() {
     kani::assume(size > 0 && size <= 50 * POS_SCALE as i128);
 
     let result = engine.execute_trade_not_atomic(
-        a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size, DEFAULT_ORACLE, 0i128, 0);
+        a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size, DEFAULT_ORACLE, 0i128, 0, 0);
     if result.is_ok() {
         assert!(engine.check_conservation(),
             "B1: conservation after trade with fees");
@@ -214,7 +214,7 @@ fn proof_e8_position_bound_enforcement() {
 
     let oversize = (MAX_POSITION_ABS_Q + 1) as i128;
     let result = engine.execute_trade_not_atomic(
-        a, b, DEFAULT_ORACLE, DEFAULT_SLOT, oversize, DEFAULT_ORACLE, 0i128, 0);
+        a, b, DEFAULT_ORACLE, DEFAULT_SLOT, oversize, DEFAULT_ORACLE, 0i128, 0, 0);
     assert!(result.is_err(), "E8: oversize trade must be rejected");
 
     kani::cover!(true, "oversize rejected");
@@ -271,7 +271,7 @@ fn proof_g4_drain_only_blocks_oi_increase() {
     let size: i128 = kani::any();
     kani::assume(size > 0 && size <= 50 * POS_SCALE as i128);
     let result = engine.execute_trade_not_atomic(
-        a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size, DEFAULT_ORACLE, 0i128, 0);
+        a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size, DEFAULT_ORACLE, 0i128, 0, 0);
 
     assert!(result.is_err(), "G4: DrainOnly must block OI increase");
 
@@ -307,7 +307,7 @@ fn proof_goal5_no_same_trade_bootstrap() {
     // excluded from trade-open equity.
     let exec_price = 900u64;
     let result = engine.execute_trade_not_atomic(
-        a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size, exec_price, 0i128, 0);
+        a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size, exec_price, 0i128, 0, 0);
 
     // The trade's own +10k slippage must NOT count toward IM.
     // trade_open equity = C(10k) + min(PNL_trade_open, 0) + haircutted_released_trade_open
@@ -321,7 +321,7 @@ fn proof_goal5_no_same_trade_bootstrap() {
     // Verify: try a MUCH larger trade that would only pass with bootstrap
     let big_size = (200 * POS_SCALE) as i128; // 200k notional, IM=20k
     let big_result = engine.execute_trade_not_atomic(
-        a, b, DEFAULT_ORACLE, DEFAULT_SLOT, big_size, exec_price, 0i128, 0);
+        a, b, DEFAULT_ORACLE, DEFAULT_SLOT, big_size, exec_price, 0i128, 0, 0);
 
     // With only 10k capital and slippage excluded, IM=20k cannot be met
     assert!(big_result.is_err(),
@@ -421,7 +421,7 @@ fn proof_goal27_finalize_path_independent() {
     engine.set_pnl(b as usize, 20_000);
 
     // Touch a then b
-    let mut ctx1 = InstructionContext::new_with_h_lock(0);
+    let mut ctx1 = InstructionContext::new_with_admission(0, 0);
     ctx1.add_touched(a);
     ctx1.add_touched(b);
 
@@ -429,7 +429,7 @@ fn proof_goal27_finalize_path_independent() {
     let mut engine2 = engine.clone();
 
     // Touch b then a (reversed order)
-    let mut ctx2 = InstructionContext::new_with_h_lock(0);
+    let mut ctx2 = InstructionContext::new_with_admission(0, 0);
     ctx2.add_touched(b);
     ctx2.add_touched(a);
 
