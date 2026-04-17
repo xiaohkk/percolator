@@ -461,7 +461,9 @@ fn test_warmup_full_conversion_after_period() {
     let (mut engine, a, b) = setup_two_users(100_000, 100_000);
     let oracle = 1000u64;
     let slot = 1u64;
-    let h_lock = 10u64; // non-zero h_lock so PnL goes through cohort queue
+    let h_lock = 10u64;
+
+    let capital_initial = engine.accounts[a as usize].capital.get();
 
     let size_q = make_size_q(50);
     engine.execute_trade_not_atomic(a, b, oracle, slot, size_q, oracle, 0i128, h_lock, h_lock).expect("trade");
@@ -475,30 +477,32 @@ fn test_warmup_full_conversion_after_period() {
         engine.accrue_market_to(slot2, new_oracle, 0).unwrap();
         engine.current_slot = slot2;
         engine.touch_account_live_local(a as usize, &mut ctx).unwrap();
-        engine.finalize_touched_accounts_post_live(&ctx);
+        engine.finalize_touched_accounts_post_live(&ctx).unwrap();
     }
 
     // Close position so profit conversion can happen (only for flat accounts)
     let close_q = make_size_q(50);
     engine.execute_trade_not_atomic(b, a, new_oracle, slot2, close_q, new_oracle, 0i128, h_lock, h_lock).expect("close");
 
-    let capital_before = engine.accounts[a as usize].capital.get();
-
-    // Wait beyond cohort horizon and touch — cohort matures, releasing PnL
-    let slot3 = slot2 + 200; // well beyond h_lock=10
+    // Wait beyond cohort horizon and touch — under v12.18 acceleration, profit may
+    // already have been converted during the close trade's finalize (when b's loss
+    // made residual grow to admit h=1). Either way, after the full horizon passes,
+    // capital must reflect the profit relative to the initial capital.
+    let slot3 = slot2 + 200;
     engine.keeper_crank_not_atomic(slot3, new_oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64, 0i128, h_lock, h_lock).expect("crank2");
     {
         let mut ctx = InstructionContext::new_with_admission(h_lock, h_lock);
         engine.accrue_market_to(slot3, new_oracle, 0).unwrap();
         engine.current_slot = slot3;
         engine.touch_account_live_local(a as usize, &mut ctx).unwrap();
-        engine.finalize_touched_accounts_post_live(&ctx);
+        engine.finalize_touched_accounts_post_live(&ctx).unwrap();
     }
 
-    let capital_after = engine.accounts[a as usize].capital.get();
-    // Capital should increase after cohort maturity (position is flat, whole-only conversion)
-    assert!(capital_after > capital_before,
-        "after full warmup period, profit must be converted to capital");
+    let capital_final = engine.accounts[a as usize].capital.get();
+    // Capital must include the realized profit relative to initial capital.
+    // Acceleration may have converted during the close trade; either way final > initial.
+    assert!(capital_final > capital_initial,
+        "after full warmup period, profit must be reflected in capital");
     assert!(engine.check_conservation());
 }
 

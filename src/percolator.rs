@@ -1,6 +1,6 @@
-//! Formally Verified Risk Engine for Perpetual DEX — v12.17.0
+//! Formally Verified Risk Engine for Perpetual DEX — v12.18.0
 //!
-//! Implements the v12.17.0 spec.
+//! Implements the v12.18.0 spec.
 //!
 //! This module implements a formally verified risk engine that guarantees:
 //! 1. Protected principal for flat accounts
@@ -2884,7 +2884,10 @@ impl RiskEngine {
             return Err(RiskError::Overflow); // touched-set capacity exceeded
         }
 
-        // Step 4: advance cohort-based warmup
+        // Step 4: accelerate outstanding reserve if h=1 admits (spec §4.9)
+        self.admit_outstanding_reserve_on_touch(idx)?;
+
+        // Step 5: advance cohort-based warmup
         self.advance_profit_warmup(idx)?;
 
         // Step 5: settle side effects with H_lock for reserve routing
@@ -4310,7 +4313,7 @@ impl RiskEngine {
     /// Transition market from Live to Resolved at a price-bounded settlement price.
     /// Per spec §9.7 (v12.16.4): requires market already accrued through resolution slot
     /// (slot_last == current_slot == now_slot), eliminating retroactive funding erasure.
-    /// Self-synchronizing resolve_market (spec §9.7, v12.17.0).
+    /// Self-synchronizing resolve_market (spec §9.7, v12.18.0).
     /// First accrues live state, then stores terminal K deltas separately.
     pub fn resolve_market_not_atomic(
         &mut self,
