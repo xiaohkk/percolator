@@ -1987,25 +1987,24 @@ impl RiskEngine {
         loss - pay
     }
 
-    /// record_uninsured_protocol_loss (spec §4.17): after insurance drain,
-    /// any remaining uninsured loss is "represented through Residual and
-    /// junior haircuts". Implement by reducing V by the uninsured amount
-    /// (capped so V >= C_tot + I is preserved). This makes Residual shrink,
-    /// triggering h haircut when matured > Residual.
+    /// record_uninsured_protocol_loss (spec §4.17): bookkeeping no-op.
+    ///
+    /// After insurance is drained, any remaining uninsured loss is already
+    /// implicitly represented by the junior haircut mechanism: the forgiven
+    /// negative PnL leaves the matched positive PnL (matured_pos_tot) as an
+    /// unchanged claim against Residual = V - C_tot - I. When
+    /// matured_pos_tot > Residual, payouts scale by h = Residual/matured.
+    ///
+    /// MUST NOT drain V here — doing so would shrink Residual below its
+    /// natural post-forgiveness value and double-penalize junior holders
+    /// (first via h < 1, again via V reduction).
+    ///
+    /// Intuition: Alice +100, Bob -100, V = 50, insurance = 0. Forgiving Bob
+    /// leaves matured = 100, residual = 50 → h = 0.5, Alice gets 50. If we
+    /// also drained V by 50, residual would drop to 0 → Alice gets 0.
+    #[allow(unused_variables)]
     fn record_uninsured_protocol_loss(&mut self, loss: u128) {
-        if loss == 0 { return; }
-        let senior = self.c_tot.get().saturating_add(self.insurance_fund.balance.get());
-        let v = self.vault.get();
-        // Only drain from the Residual portion (V - senior). Cannot reduce V
-        // below senior (would violate conservation).
-        let residual = v.saturating_sub(senior);
-        let drain = core::cmp::min(loss, residual);
-        if drain > 0 {
-            self.vault = U128::new(v - drain);
-        }
-        // Any remaining loss beyond Residual is system-level insolvency — the
-        // engine stays consistent (V >= C_tot + I still holds) but matured
-        // holders will see h < 1 on subsequent operations.
+        // Intentional no-op. See doc comment.
     }
 
     /// absorb_protocol_loss (spec §4.17): use_insurance_buffer then
