@@ -321,7 +321,11 @@ pub struct Account {
     pub matcher_program: [u8; 32],
     pub matcher_context: [u8; 32],
 
-    /// Owner pubkey
+    /// Wrapper-owned owner pubkey (spec §2.1.1, non-normative).
+    /// Authorization is a wrapper responsibility; the engine never reads
+    /// `owner` for any spec-normative decision. `set_owner` is a defensive
+    /// helper that preserves the "zero iff unclaimed" convention — it
+    /// refuses to overwrite a nonzero owner and refuses to write zero.
     pub owner: [u8; 32],
 
     /// Fee credits

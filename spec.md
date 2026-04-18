@@ -359,13 +359,15 @@ Fee-credit and fee-slot bounds:
 
 #### 2.1.1 Wrapper-owned annotation fields (non-normative)
 
-An engine implementation MAY carry additional per-account fields used by the deployment wrapper for its own bookkeeping — typical examples include an account-kind tag (user vs LP), a matching-engine program id, and a matching-engine context id. These fields are **wrapper-owned opaque annotation**. The engine MUST:
+An engine implementation MAY carry additional per-account fields used by the deployment wrapper for its own bookkeeping — typical examples include an owner pubkey, an account-kind tag (user vs LP), a matching-engine program id, and a matching-engine context id. These fields are **wrapper-owned opaque annotation**. The engine MUST:
 
 - store and canonicalize them through its normal materialization / reset / init paths so they do not leak stale data across slot reuse;
-- **never** read them to decide any spec-normative behavior (margin health, liquidation eligibility, fee routing, reserve admission, accrual, resolution, reset lifecycle, conservation, or any other property enumerated in §0);
+- **never** read them to decide any spec-normative behavior (margin health, liquidation eligibility, fee routing, reserve admission, accrual, resolution, reset lifecycle, conservation, authorization, or any other property enumerated in §0);
 - treat them as inert payload on every engine-level path.
 
-Because these fields carry no engine-level semantics, they are outside the normative scope of this document. Deployments that do not need them MAY omit them from the Account struct entirely; deployments that do need them MAY carry any finite set of such opaque annotations. The engine’s spec-level behavior MUST be identical in either case.
+Authorization (who may call `deposit`, `withdraw`, `trade`, etc. on behalf of which account) is a **wrapper responsibility**, not an engine invariant. The engine MAY expose defensive helpers (e.g., a one-time `set_owner` that refuses to overwrite a nonzero owner or to write the zero pubkey) to preserve a "zero iff unclaimed" convention, but such helpers are conveniences for wrappers and carry no spec-level semantics.
+
+Because these fields carry no engine-level semantics, they are outside the normative scope of this document. Deployments that do not need them MAY omit them from the Account struct entirely; deployments that do need them MAY carry any finite set of such opaque annotations. The engine's spec-level behavior MUST be identical in either case.
 
 ### 2.2 Global engine state
 
