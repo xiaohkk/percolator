@@ -912,7 +912,7 @@ fn proof_force_close_resolved_with_position_conserves() {
 
     // Resolve properly (epoch increment for stale reconciliation)
     engine.resolve_market_not_atomic(ResolveMode::Ordinary, DEFAULT_ORACLE, DEFAULT_ORACLE, DEFAULT_SLOT + 1, 0).unwrap();
-    let result = engine.force_close_resolved_not_atomic(a, DEFAULT_SLOT + 2);
+    let result = engine.force_close_resolved_not_atomic(a);
     assert!(result.is_ok(), "force_close must succeed after proper resolve");
     assert!(engine.check_conservation());
 }
@@ -939,7 +939,7 @@ fn proof_force_close_resolved_with_profit_conserves() {
     engine.set_pnl_with_reserve(idx as usize, profit as i128,
         ReserveMode::ImmediateReleaseResolvedOnly, None).unwrap();
 
-    let result = engine.force_close_resolved_not_atomic(idx, DEFAULT_SLOT + 2);
+    let result = engine.force_close_resolved_not_atomic(idx);
     assert!(result.is_ok(), "force_close must succeed with positive PnL");
     let payout = result.unwrap().expect_closed("must be Closed");
     assert!(payout >= cap_before, "returned must include converted profit");
@@ -960,7 +960,7 @@ fn proof_force_close_resolved_flat_returns_capital() {
     engine.deposit_not_atomic(idx, dep as u128, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
     engine.resolve_market_not_atomic(ResolveMode::Ordinary, DEFAULT_ORACLE, DEFAULT_ORACLE, DEFAULT_SLOT + 1, 0).unwrap();
-    let result = engine.force_close_resolved_not_atomic(idx, DEFAULT_SLOT + 2);
+    let result = engine.force_close_resolved_not_atomic(idx);
     assert!(result.is_ok());
     let payout = result.unwrap().expect_closed("must be Closed");
     assert_eq!(payout, dep as u128, "flat account must return exact capital");
@@ -989,8 +989,8 @@ fn proof_force_close_resolved_position_conservation() {
     engine.resolve_market_not_atomic(ResolveMode::Ordinary, DEFAULT_ORACLE, DEFAULT_ORACLE, DEFAULT_SLOT + 1, 0).unwrap();
 
     // Reconcile both, then terminal close a
-    engine.reconcile_resolved_not_atomic(a, DEFAULT_SLOT + 1).unwrap();
-    engine.reconcile_resolved_not_atomic(b, DEFAULT_SLOT + 1).unwrap();
+    engine.reconcile_resolved_not_atomic(a).unwrap();
+    engine.reconcile_resolved_not_atomic(b).unwrap();
     let result = engine.close_resolved_terminal_not_atomic(a);
     assert!(result.is_ok());
     assert!(!engine.is_used(a as usize));
@@ -1018,10 +1018,10 @@ fn proof_force_close_resolved_pos_count_decrements() {
     let short_before = engine.stored_pos_count_short;
 
     engine.resolve_market_not_atomic(ResolveMode::Ordinary, DEFAULT_ORACLE, DEFAULT_ORACLE, DEFAULT_SLOT + 1, 0).unwrap();
-    engine.force_close_resolved_not_atomic(a, DEFAULT_SLOT + 2).unwrap();
+    engine.force_close_resolved_not_atomic(a).unwrap();
     assert_eq!(engine.stored_pos_count_long, long_before - 1);
 
-    engine.force_close_resolved_not_atomic(b, DEFAULT_SLOT + 3).unwrap();
+    engine.force_close_resolved_not_atomic(b).unwrap();
     assert_eq!(engine.stored_pos_count_short, short_before - 1);
 }
 
@@ -1042,7 +1042,7 @@ fn proof_force_close_resolved_fee_sweep_conservation() {
 
     engine.resolve_market_not_atomic(ResolveMode::Ordinary, DEFAULT_ORACLE, DEFAULT_ORACLE, DEFAULT_SLOT + 1, 0).unwrap();
     let ins_before = engine.insurance_fund.balance.get();
-    let result = engine.force_close_resolved_not_atomic(idx, DEFAULT_SLOT + 2);
+    let result = engine.force_close_resolved_not_atomic(idx);
     assert!(result.is_ok());
 
     // Insurance must have increased by swept amount

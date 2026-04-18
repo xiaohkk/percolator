@@ -1024,6 +1024,12 @@ impl RiskEngine {
     test_visible! {
     fn free_slot(&mut self, idx: u16) -> Result<()> {
         let i = idx as usize;
+        if i >= MAX_ACCOUNTS { return Err(RiskError::AccountNotFound); }
+        // Reject double-free: slot MUST be marked used. Without this guard
+        // a second free_slot on the same idx corrupted the freelist by
+        // creating a self-cycle at free_head and decremented counters past
+        // zero. Hardens the allocator against internal bugs.
+        if !self.is_used(i) { return Err(RiskError::CorruptState); }
         if self.accounts[i].pnl != 0 { return Err(RiskError::CorruptState); }
         if self.accounts[i].reserved_pnl != 0 { return Err(RiskError::CorruptState); }
         if self.accounts[i].position_basis_q != 0 { return Err(RiskError::CorruptState); }
@@ -1116,11 +1122,12 @@ impl RiskEngine {
         let i = idx as usize;
         let next = self.next_free[i];
         let prev = self.prev_free[i];
-        // Freelist-link consistency: the linear-scan predecessor used to
-        // implicitly guarantee that idx was reachable from the head. The
-        // doubly-linked O(1) unlink trusts the stored prev/next pointers;
-        // verify them before mutating neighbors so a corrupt prev_free or
-        // next_free cannot silently relink the wrong nodes.
+        // Freelist-link consistency. Two layers of defense:
+        //   (a) local back-pointer agreement — prev/next's reciprocal
+        //       pointer must point to idx;
+        //   (b) neighbor-used check — a truly-free neighbor is marked
+        //       unused in the bitmap. If a corrupt neighbor pointer
+        //       lands on an allocated slot, reject.
         if prev == u16::MAX {
             if self.free_head != idx {
                 self.materialized_account_count -= 1;
@@ -1131,9 +1138,17 @@ impl RiskEngine {
                 self.materialized_account_count -= 1;
                 return Err(RiskError::CorruptState);
             }
+            if self.is_used(prev as usize) {
+                self.materialized_account_count -= 1;
+                return Err(RiskError::CorruptState);
+            }
         }
         if next != u16::MAX {
             if self.prev_free[next as usize] != idx {
+                self.materialized_account_count -= 1;
+                return Err(RiskError::CorruptState);
+            }
+            if self.is_used(next as usize) {
                 self.materialized_account_count -= 1;
                 return Err(RiskError::CorruptState);
             }
@@ -1147,6 +1162,11 @@ impl RiskEngine {
         if next != u16::MAX {
             self.prev_free[next as usize] = prev;
         }
+        // Clear idx's freelist pointers now that it's allocated. Prevents
+        // stale values from later masquerading as valid free-list state
+        // if this slot is corrupted while in use.
+        self.next_free[i] = u16::MAX;
+        self.prev_free[i] = u16::MAX;
 
         self.set_used(idx as usize);
         self.num_used_accounts = self.num_used_accounts.checked_add(1)
@@ -2223,6 +2243,12 @@ impl RiskEngine {
     ///   collectible portion moves C → I and any shortfall becomes local
     ///   fee debt; uncollectible tail is dropped.
     /// - Advance `last_fee_slot` to `fee_slot_anchor`.
+    ///
+    /// Kept test-visible so tests and Kani proofs can exercise the explicit
+    /// anchor path. The public entrypoint (`sync_account_fee_to_slot_not_atomic`)
+    /// does NOT accept a caller-supplied anchor; it derives the anchor from
+    /// market mode (current_slot on Live, resolved_slot on Resolved).
+    test_visible! {
     fn sync_account_fee_to_slot(
         &mut self,
         idx: usize,
@@ -2268,6 +2294,7 @@ impl RiskEngine {
         }
         self.accounts[idx].last_fee_slot = fee_slot_anchor;
         Ok(())
+    }
     }
 
     // ========================================================================
@@ -4746,9 +4773,9 @@ impl RiskEngine {
     /// For positive-PnL on non-terminal markets, reconciliation persists and
     /// Ok(0) is returned (account stays open — re-call close_resolved_terminal
     /// after all accounts reconciled).
-    pub fn force_close_resolved_not_atomic(&mut self, idx: u16, now_slot: u64) -> Result<ResolvedCloseResult> {
+    pub fn force_close_resolved_not_atomic(&mut self, idx: u16) -> Result<ResolvedCloseResult> {
         // Phase 1: always reconcile (persists on success)
-        self.reconcile_resolved_not_atomic(idx, now_slot)?;
+        self.reconcile_resolved_not_atomic(idx)?;
 
         let i = idx as usize;
 
@@ -4770,25 +4797,19 @@ impl RiskEngine {
     /// Phase 1: Reconcile a resolved account. Materializes K-pair PnL,
     /// zeroes position, settles losses, absorbs insurance. Always persists
     /// on success. Idempotent on already-reconciled accounts.
-    pub fn reconcile_resolved_not_atomic(&mut self, idx: u16, now_slot: u64) -> Result<()> {
+    pub fn reconcile_resolved_not_atomic(&mut self, idx: u16) -> Result<()> {
         if self.market_mode != MarketMode::Resolved {
             return Err(RiskError::Unauthorized);
         }
         if idx as usize >= MAX_ACCOUNTS || !self.is_used(idx as usize) {
             return Err(RiskError::AccountNotFound);
         }
-        if now_slot < self.current_slot {
-            return Err(RiskError::Overflow);
-        }
-        // Spec §9.9: once Resolved, current_slot MUST NOT advance past
-        // self.resolved_slot. Previously the caller-supplied slot could
-        // ratchet current_slot arbitrarily high, breaking later honest
-        // calls and interfering with fee_slot_anchor <= resolved_slot
-        // checks. Cap advancement at the engine-stored resolution boundary.
-        if now_slot > self.resolved_slot {
-            return Err(RiskError::Overflow);
-        }
-        self.current_slot = now_slot;
+        // Resolved market is frozen at self.resolved_slot. No caller input
+        // for the slot anchor — the engine uses the stored boundary. This
+        // removes the earlier ratchet-past-resolved_slot footgun and
+        // eliminates the wrapper-integration hazard of passing wall-clock
+        // slots that the engine would reject.
+        self.current_slot = self.resolved_slot;
         let i = idx as usize;
 
         // Always clear reserve metadata (even flat accounts may have ghost bucket flags)
@@ -5245,32 +5266,49 @@ impl RiskEngine {
     /// (spec §9.0 step 5). Solana transaction atomicity guarantees the sync
     /// and the subsequent operation commit together or roll back together.
     ///
-    /// - On Live:     `fee_slot_anchor <= current_slot`.
-    /// - On Resolved: `fee_slot_anchor <= resolved_slot` (Goal 49 — no
+    /// The public entrypoint does NOT accept an arbitrary `fee_slot_anchor`.
+    /// Reviewer v12.18.5 gap: allowing a stale caller-supplied anchor let a
+    /// wrapper advance `current_slot` without booking recurring fees,
+    /// leaving subsequent health-sensitive ops to run against stale fee
+    /// debt. The engine now picks the anchor deterministically:
+    ///
+    /// - On Live:     `fee_slot_anchor = current_slot` (after advancing
+    ///   `current_slot` to `now_slot`).
+    /// - On Resolved: `fee_slot_anchor = resolved_slot` (Goal 49 — no
     ///   post-resolution fee accrual).
     ///
-    /// Charges exactly once over `[last_fee_slot, fee_slot_anchor]`. A double
-    /// call at the same anchor is a no-op. Newly materialized accounts start
-    /// at their materialization slot and are never back-charged (Goal 47).
+    /// Charges exactly once over `[last_fee_slot, fee_slot_anchor]`. A
+    /// second call with `now_slot == current_slot` is a no-op. Newly
+    /// materialized accounts start at their materialization slot and are
+    /// never back-charged (Goal 47).
     ///
-    /// Advances `current_slot` to `now_slot` on Live; on Resolved the value
-    /// of `now_slot` is checked but `current_slot` is not advanced past the
-    /// resolved freeze.
+    /// The internal `sync_account_fee_to_slot` helper (which accepts an
+    /// explicit anchor) remains available for tests and Kani proofs but
+    /// is not part of the public engine surface.
     pub fn sync_account_fee_to_slot_not_atomic(
         &mut self,
         idx: u16,
         now_slot: u64,
-        fee_slot_anchor: u64,
         fee_rate_per_slot: u128,
     ) -> Result<()> {
         if idx as usize >= MAX_ACCOUNTS || !self.is_used(idx as usize) {
             return Err(RiskError::AccountNotFound);
         }
         if now_slot < self.current_slot { return Err(RiskError::Overflow); }
-        if self.market_mode == MarketMode::Live {
-            self.current_slot = now_slot;
-        }
-        self.sync_account_fee_to_slot(idx as usize, fee_slot_anchor, fee_rate_per_slot)?;
+        let anchor = match self.market_mode {
+            MarketMode::Live => {
+                self.current_slot = now_slot;
+                self.current_slot
+            }
+            MarketMode::Resolved => {
+                // Respect Goal 49: anchor MUST NOT exceed resolved_slot.
+                // The caller-supplied `now_slot` is validated for
+                // monotonicity above but never used as the anchor on
+                // Resolved.
+                self.resolved_slot
+            }
+        };
+        self.sync_account_fee_to_slot(idx as usize, anchor, fee_rate_per_slot)?;
         self.assert_public_postconditions()?;
         Ok(())
     }
