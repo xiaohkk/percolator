@@ -1585,7 +1585,18 @@ impl RiskEngine {
     }
     }
 
-    /// set_position_basis_q (spec §4.4): update stored pos counts based on sign changes
+    /// set_position_basis_q (spec §4.4): update stored pos counts based on sign changes.
+    ///
+    /// Does NOT enforce `cfg_max_active_positions_per_side`. The cap is a
+    /// caller invariant, pre-validated in code paths that INCREMENT a
+    /// side (only `execute_trade_not_atomic` as of this revision). A
+    /// per-account check here would false-reject valid two-party trades
+    /// that swap cap-holding participants: attaching the new holder
+    /// first transiently pushes `stored_pos_count_side` to cap+1 before
+    /// the old holder is detached by the second attach. All other
+    /// `attach_effective_position` call sites (liquidation partial
+    /// reduction, liquidation full-close, resolve reconcile) never
+    /// increment a side, so no pre-check is needed there.
     test_visible! {
     fn set_position_basis_q(&mut self, idx: usize, new_basis: i128) -> Result<()> {
         let old = self.accounts[idx].position_basis_q;
@@ -1612,16 +1623,10 @@ impl RiskEngine {
                 Side::Long => {
                     self.stored_pos_count_long = self.stored_pos_count_long
                         .checked_add(1).ok_or(RiskError::CorruptState)?;
-                    if self.stored_pos_count_long > self.params.max_active_positions_per_side {
-                        return Err(RiskError::Overflow);
-                    }
                 }
                 Side::Short => {
                     self.stored_pos_count_short = self.stored_pos_count_short
                         .checked_add(1).ok_or(RiskError::CorruptState)?;
-                    if self.stored_pos_count_short > self.params.max_active_positions_per_side {
-                        return Err(RiskError::Overflow);
-                    }
                 }
             }
         }
@@ -3854,6 +3859,36 @@ impl RiskEngine {
         if (self.side_mode_short == SideMode::DrainOnly || self.side_mode_short == SideMode::ResetPending)
             && oi_short_after > self.oi_eff_short_q {
             return Err(RiskError::SideBlocked);
+        }
+
+        // Spec §1.4: per-side active-position cap. Pre-validate the NET
+        // delta across BOTH legs so a valid position swap at the cap
+        // (taker replacing maker on the same side) is not false-rejected
+        // by a transient per-account spike during the attach pair.
+        {
+            let long_before =
+                (side_of_i128(old_eff_a) == Some(Side::Long)) as i64
+                + (side_of_i128(old_eff_b) == Some(Side::Long)) as i64;
+            let long_after =
+                (side_of_i128(new_eff_a) == Some(Side::Long)) as i64
+                + (side_of_i128(new_eff_b) == Some(Side::Long)) as i64;
+            let short_before =
+                (side_of_i128(old_eff_a) == Some(Side::Short)) as i64
+                + (side_of_i128(old_eff_b) == Some(Side::Short)) as i64;
+            let short_after =
+                (side_of_i128(new_eff_a) == Some(Side::Short)) as i64
+                + (side_of_i128(new_eff_b) == Some(Side::Short)) as i64;
+            let final_long =
+                (self.stored_pos_count_long as i64) + long_after - long_before;
+            let final_short =
+                (self.stored_pos_count_short as i64) + short_after - short_before;
+            if final_long < 0 || final_short < 0 {
+                return Err(RiskError::CorruptState);
+            }
+            let cap = self.params.max_active_positions_per_side as i64;
+            if final_long > cap || final_short > cap {
+                return Err(RiskError::Overflow);
+            }
         }
 
         // Step 21: trade PnL alignment (spec §10.5)

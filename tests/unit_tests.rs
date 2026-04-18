@@ -662,6 +662,84 @@ fn idle_market_can_fast_forward_before_late_deposit() {
 }
 
 #[test]
+fn trade_at_position_cap_accepts_valid_replacement() {
+    // Regression (reviewer pass 7, blocker 1): when one side is at the
+    // active-position cap, a trade that REPLACES an existing holder on
+    // that side must not be falsely rejected by a transient per-account
+    // count spike during attach_effective_position. Both per-account
+    // count updates must be treated as a single net delta.
+    //
+    // Scenario at cap=1:
+    //   pre:   A=long,  B=short, C=flat
+    //   trade: C buys from A  ⇒ final A=flat, B=short, C=long
+    //   long_count: 1 → 1 (no net change), short_count: 1 → 1
+    // The intermediate state (attach C first ⇒ long_count=2) is an
+    // implementation artifact and must not be visible as an error.
+    let mut params = default_params();
+    params.max_active_positions_per_side = 1;
+    params.trading_fee_bps = 0;
+    params.maintenance_margin_bps = 0;
+    params.initial_margin_bps = 0;
+    params.min_nonzero_mm_req = 1;
+    params.min_nonzero_im_req = 2;
+    let px = 1_000u64;
+    let mut e = RiskEngine::new_with_market(params, 0, px);
+    e.deposit_not_atomic(0, 1_000_000, px, 0).unwrap();
+    e.deposit_not_atomic(1, 1_000_000, px, 0).unwrap();
+    e.deposit_not_atomic(2, 1_000_000, px, 0).unwrap();
+
+    let q = POS_SCALE as i128;
+    // A=1 buys from B=2: 1 becomes long, 2 becomes short. Caps full.
+    e.execute_trade_not_atomic(1, 2, px, 1, q, px, 0, 1, 100).unwrap();
+    assert_eq!(e.stored_pos_count_long, 1);
+    assert_eq!(e.stored_pos_count_short, 1);
+
+    // 0 buys from 1: 0 becomes long, 1 becomes flat. Valid: final long
+    // count is still 1. Engine must not reject on transient count=2.
+    let r = e.execute_trade_not_atomic(0, 1, px, 1, q, px, 0, 1, 100);
+    assert!(r.is_ok(),
+        "trade that replaces the cap-holding long must succeed (got {:?})", r);
+    assert_eq!(e.stored_pos_count_long, 1);
+    assert_eq!(e.stored_pos_count_short, 1);
+    // Verify the identity swap actually happened.
+    assert!(e.accounts[0].position_basis_q > 0, "0 should be long");
+    assert_eq!(e.accounts[1].position_basis_q, 0, "1 should be flat");
+    assert!(e.accounts[2].position_basis_q < 0, "2 should still be short");
+}
+
+#[test]
+fn trade_at_position_cap_still_rejects_real_overflow() {
+    // Companion to trade_at_position_cap_accepts_valid_replacement:
+    // the cap moved from set_position_basis_q to a pre-check in
+    // execute_trade_not_atomic. A trade whose NET delta genuinely
+    // exceeds the cap MUST still be rejected.
+    let mut params = default_params();
+    params.max_active_positions_per_side = 1;
+    params.trading_fee_bps = 0;
+    params.maintenance_margin_bps = 0;
+    params.initial_margin_bps = 0;
+    params.min_nonzero_mm_req = 1;
+    params.min_nonzero_im_req = 2;
+    let px = 1_000u64;
+    let mut e = RiskEngine::new_with_market(params, 0, px);
+    e.deposit_not_atomic(0, 1_000_000, px, 0).unwrap();
+    e.deposit_not_atomic(1, 1_000_000, px, 0).unwrap();
+    e.deposit_not_atomic(2, 1_000_000, px, 0).unwrap();
+    e.deposit_not_atomic(3, 1_000_000, px, 0).unwrap();
+
+    let q = POS_SCALE as i128;
+    // 1 becomes long, 2 becomes short. Both caps full.
+    e.execute_trade_not_atomic(1, 2, px, 1, q, px, 0, 1, 100).unwrap();
+    // 0 becomes long (buys), 3 becomes short (sells). Net +1 long, +1 short.
+    // Both final counts would be 2 > cap=1 → must reject.
+    let r = e.execute_trade_not_atomic(0, 3, px, 1, q, px, 0, 1, 100);
+    assert_eq!(r, Err(RiskError::Overflow));
+    // State must be unchanged on Err (validate-then-mutate).
+    assert_eq!(e.stored_pos_count_long, 1);
+    assert_eq!(e.stored_pos_count_short, 1);
+}
+
+#[test]
 #[should_panic(expected = "funding lifetime")]
 fn validate_params_rejects_short_funding_lifetime() {
     // Regression: validate_params must refuse any (max_rate, min_lifetime)
