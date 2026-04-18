@@ -662,6 +662,60 @@ fn idle_market_can_fast_forward_before_late_deposit() {
 }
 
 #[test]
+fn adl_k_write_preserves_future_mark_headroom() {
+    // Regression (reviewer pass 8): enqueue_adl's K-overflow fallback
+    // only catches the moment where the ADL K add itself overflows i128.
+    // A K value CAN still fit i128 yet land close enough to the boundary
+    // that the next valid oracle move makes accrue_market_to overflow K.
+    //
+    // After an ADL write, for any valid future oracle step
+    // |delta_p| <= MAX_ORACLE_PRICE, the resulting K (side s) MUST fit
+    // i128. The invariant is:
+    //     |K_s| + A_s * MAX_ORACLE_PRICE <= i128::MAX
+    // (A_s cannot increase; new A_s <= old A_s.)
+    //
+    // If the ADL K write would violate this, the deficit MUST route
+    // through record_uninsured_protocol_loss instead, matching the
+    // existing "overflow → implicit haircut" policy.
+    let mut params = default_params();
+    params.trading_fee_bps = 0;
+    params.maintenance_margin_bps = 0;
+    params.initial_margin_bps = 0;
+    params.min_nonzero_mm_req = 1;
+    params.min_nonzero_im_req = 2;
+    // Funding out of scope; pure K/mark headroom test.
+    params.max_abs_funding_e9_per_slot = 0;
+    params.max_accrual_dt_slots = 1;
+    params.min_funding_lifetime_slots = 1;
+    let mut engine = RiskEngine::new_with_market(params, 0, 1);
+
+    // Balanced live OI; construct state directly to isolate the K-headroom
+    // invariant (the shape is reachable through normal trade→liquidate→ADL
+    // flows — the reviewer's test exposes the missing invariant, not a
+    // direct-state-only bug).
+    engine.oi_eff_long_q = 2;
+    engine.oi_eff_short_q = 2;
+    engine.stored_pos_count_short = 1;
+    engine.stored_pos_count_long = 1;
+    let mut ctx = percolator::InstructionContext::new();
+    let a_ps = ADL_ONE.checked_mul(POS_SCALE).unwrap();
+    // Pick d so delta_k_abs ~ i128::MAX: ADL pushes K_short near the edge.
+    let d = ((i128::MAX as u128) / a_ps) * 2;
+    engine.enqueue_adl(&mut ctx, percolator::Side::Long, 1, d)
+        .expect("enqueue_adl");
+
+    // Post-ADL: either the deficit was routed through
+    // record_uninsured_protocol_loss (adl_coeff_short unchanged near 0),
+    // OR it was written to K but with enough headroom that mark-to-market
+    // at MAX_ORACLE_PRICE still works.
+    let r = engine.accrue_market_to(1, MAX_ORACLE_PRICE, 0);
+    assert!(r.is_ok(),
+        "after enqueue_adl, accrue_market_to at MAX_ORACLE_PRICE must not \
+         overflow K — either ADL must leave enough headroom or route the \
+         deficit through uninsured loss (got {:?})", r);
+}
+
+#[test]
 fn trade_at_position_cap_accepts_valid_replacement() {
     // Regression (reviewer pass 7, blocker 1): when one side is at the
     // active-position cap, a trade that REPLACES an existing holder on

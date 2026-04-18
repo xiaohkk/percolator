@@ -449,9 +449,16 @@ pub struct RiskParams {
     /// (cumulative bound must be at least as strong as per-call).
     ///
     /// Production deployments SHOULD pick a lifetime comfortably beyond
-    /// any planned market horizon (e.g., ~1e9 slots ≈ 127 years at 400ms
-    /// slots). Tests MAY set this equal to `max_accrual_dt_slots` to
-    /// preserve the prior per-call-only semantics.
+    /// any planned market horizon. At 400ms slots: ~7.9e7 slots/year, so
+    /// ~8e9 slots ≈ 100 years; ~1e10 slots ≈ 127 years. Tests MAY set
+    /// this equal to `max_accrual_dt_slots` to preserve the prior
+    /// per-call-only semantics.
+    ///
+    /// IMPORTANT deployment trap: at `max_abs_funding_e9_per_slot = 1e9`
+    /// (the GLOBAL ceiling), the invariant forces
+    /// `min_funding_lifetime_slots <= 170` — about 68 seconds at 400ms.
+    /// Deployments that want a multi-year lifetime MUST lower the rate
+    /// ceiling (e.g., rate <= ~170 gives >=100-year lifetime).
     ///
     /// Saturation at `max_abs_funding_e9_per_slot` is the worst case;
     /// realistic operating rates are orders of magnitude smaller, so the
@@ -2469,12 +2476,45 @@ impl RiskEngine {
                 Ok(delta_k_abs) => {
                     let delta_k = -(delta_k_abs as i128);
                     let k_opp = self.get_k_side(opp);
-                    match k_opp.checked_add(delta_k) {
+                    // Two-step headroom check (spec §5.6 clause 7):
+                    //   (a) the K add itself must fit i128 (checked_add)
+                    //   (b) the resulting K must leave room for any valid
+                    //       future mark-to-market step at MAX_ORACLE_PRICE
+                    //       on the same side: for side s with multiplier A_s,
+                    //           |new_k| + A_s * MAX_ORACLE_PRICE <= i128::MAX
+                    //       Without (b), a K value technically inside i128
+                    //       can still make the next accrue_market_to overflow
+                    //       when the oracle moves, bricking live accrual.
+                    //   A_s cannot grow post-ADL (new A <= old A), so using
+                    //   a_old for the headroom budget is conservative.
+                    let headroom_ok = match k_opp.checked_add(delta_k) {
+                        Some(new_k) => {
+                            let max_mark = U256::from_u128(a_old)
+                                .checked_mul(U256::from_u128(MAX_ORACLE_PRICE as u128));
+                            match max_mark {
+                                Some(mark) => {
+                                    // i128::MAX - |new_k| must be >= mark.
+                                    let abs_new_k = U256::from_u128(new_k.unsigned_abs());
+                                    let i128_max_u = U256::from_u128(i128::MAX as u128);
+                                    match i128_max_u.checked_sub(abs_new_k) {
+                                        Some(budget) => {
+                                            if mark <= budget { Some(new_k) } else { None }
+                                        }
+                                        None => None,
+                                    }
+                                }
+                                None => None,
+                            }
+                        }
+                        None => None,
+                    };
+                    match headroom_ok {
                         Some(new_k) => {
                             self.set_k_side(opp, new_k);
                         }
                         None => {
-                            // K-space overflow: route D_rem through record_uninsured (spec §1.7 clause 12).
+                            // K-space overflow OR insufficient future mark headroom:
+                            // route D_rem through record_uninsured (spec §1.7 clause 12).
                             self.record_uninsured_protocol_loss(d_rem);
                         }
                     }

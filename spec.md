@@ -200,7 +200,7 @@ Configured values MUST satisfy:
   - `cfg_min_funding_lifetime_slots >= cfg_max_accrual_dt_slots`
   - `ADL_ONE * MAX_ORACLE_PRICE * cfg_max_abs_funding_e9_per_slot * cfg_min_funding_lifetime_slots <= i128::MAX` (cumulative lifetime floor)
   - both validations MUST be performed in an exact wide signed domain of at least 256 bits, or a formally equivalent exact method
-  - `cfg_min_funding_lifetime_slots` is the deployment's guaranteed cumulative-F lifetime at sustained worst-case rate. Production deployments SHOULD pick a value comfortably beyond any planned market horizon (e.g., ~1e9 slots ≈ 127 years at 400ms slots). Realistic operating funding rates are orders of magnitude below the ceiling, so observed F-saturation horizons are typically far longer than this floor guarantees.
+  - `cfg_min_funding_lifetime_slots` is the deployment's guaranteed cumulative-F lifetime at sustained worst-case rate. Production deployments SHOULD pick a value comfortably beyond any planned market horizon (at 400ms slots: ~7.9e7 slots/year, so ~8e9 slots ≈ 100 years; ~1e10 slots ≈ 127 years). Deployments MUST NOT leave `cfg_max_abs_funding_e9_per_slot` at `GLOBAL_MAX_ABS_FUNDING_E9_PER_SLOT` (1e9) while also expecting a long lifetime — at that ceiling the invariant forces `cfg_min_funding_lifetime_slots <= 170`, i.e. ~68 seconds at 400ms slots. Deployments that want a multi-year lifetime MUST lower `cfg_max_abs_funding_e9_per_slot` accordingly (e.g., rate <= ~170 for a 100-year lifetime). Realistic operating funding rates are orders of magnitude below the configured ceiling, so observed F-saturation horizons are typically far longer than this floor guarantees.
 
 If the deployment also defines a stale-market resolution delay `permissionless_resolve_stale_slots` and expects permissionless resolution to remain callable after that delay, then initialization MUST additionally require:
 
@@ -1284,8 +1284,10 @@ This helper MUST:
    - `OI_post = OI_before - q_close_q`
 7. if `D_rem > 0`:
    - compute `delta_K_abs = ceil(D_rem * A_old * POS_SCALE / OI_before)` using exact wide arithmetic
-   - if the magnitude is non-representable or the signed `K_opp + delta_K_exact` overflows, route `D_rem` through `record_uninsured_protocol_loss`
-   - else apply `K_opp += delta_K_exact` with `delta_K_exact = -delta_K_abs`
+   - compute `K_candidate = K_opp + delta_K_exact` with `delta_K_exact = -delta_K_abs`
+   - require future-mark headroom: `|K_candidate| + A_old * MAX_ORACLE_PRICE <= i128::MAX`. This ensures any subsequent `accrue_market_to` with a valid oracle move cannot overflow `K_opp` in the mark-to-market step. `A_opp` cannot grow post-ADL (`A_new <= A_old`), so using `A_old` here is conservative.
+   - if the magnitude is non-representable, if the signed `K_opp + delta_K_exact` overflows, OR if the headroom requirement fails, route `D_rem` through `record_uninsured_protocol_loss`
+   - else apply `K_opp += delta_K_exact`
 8. if `OI_post == 0`:
    - set `OI_eff_opp = 0`
    - set both pending-reset flags true
