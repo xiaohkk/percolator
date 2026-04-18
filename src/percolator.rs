@@ -433,6 +433,31 @@ pub struct RiskParams {
     pub max_accrual_dt_slots: u64,
     /// Max |funding_rate_e9_per_slot| allowed (spec §1.4).
     pub max_abs_funding_e9_per_slot: u64,
+    /// Deployment-chosen cumulative funding lifetime floor (spec §1.4).
+    ///
+    /// Persisted `F_long_num` / `F_short_num` accumulate across calls and
+    /// are stored as `i128`. A sequence of envelope-valid accruals can
+    /// still drive them to the `i128` boundary over time. This parameter
+    /// encodes the minimum number of slots the deployment guarantees F
+    /// will stay within bounds at sustained `max_abs_funding_e9_per_slot`
+    /// on both sides.
+    ///
+    /// Init-time invariant:
+    ///   ADL_ONE * MAX_ORACLE_PRICE * max_abs_funding_e9_per_slot
+    ///     * min_funding_lifetime_slots <= i128::MAX
+    /// and `min_funding_lifetime_slots >= max_accrual_dt_slots`
+    /// (cumulative bound must be at least as strong as per-call).
+    ///
+    /// Production deployments SHOULD pick a lifetime comfortably beyond
+    /// any planned market horizon (e.g., ~1e9 slots ≈ 127 years at 400ms
+    /// slots). Tests MAY set this equal to `max_accrual_dt_slots` to
+    /// preserve the prior per-call-only semantics.
+    ///
+    /// Saturation at `max_abs_funding_e9_per_slot` is the worst case;
+    /// realistic operating rates are orders of magnitude smaller, so the
+    /// observed F-saturation horizon is typically far longer than this
+    /// parameter guarantees.
+    pub min_funding_lifetime_slots: u64,
     /// Per-market active-positions cap per side (spec §1.4).
     /// Invariant: max_active_positions_per_side <= max_accounts <= MAX_ACCOUNTS.
     pub max_active_positions_per_side: u64,
@@ -779,6 +804,35 @@ impl RiskEngine {
         };
         assert!(envelope_ok,
             "funding envelope: ADL_ONE * MAX_ORACLE_PRICE * max_abs_funding_e9_per_slot * max_accrual_dt_slots must fit i128 (spec §1.4)"
+        );
+
+        // Cumulative funding lifetime floor (spec §1.4):
+        // ADL_ONE * MAX_ORACLE_PRICE * max_abs_funding_e9_per_slot *
+        //   min_funding_lifetime_slots <= i128::MAX
+        // This bounds F_side_num from saturating via repeated envelope-
+        // valid accruals: over min_funding_lifetime_slots slots at the
+        // configured worst-case rate on both sides, F stays within i128.
+        assert!(
+            params.min_funding_lifetime_slots >= params.max_accrual_dt_slots,
+            "min_funding_lifetime_slots must be >= max_accrual_dt_slots \
+             (cumulative bound must be at least as strong as per-call, spec §1.4)"
+        );
+        let lifetime_ok = {
+            let adl = U256::from_u128(ADL_ONE);
+            let px = U256::from_u128(MAX_ORACLE_PRICE as u128);
+            let rate = U256::from_u128(params.max_abs_funding_e9_per_slot as u128);
+            let life = U256::from_u128(params.min_funding_lifetime_slots as u128);
+            let p1 = adl.checked_mul(px);
+            let p2 = p1.and_then(|v| v.checked_mul(rate));
+            let p3 = p2.and_then(|v| v.checked_mul(life));
+            let i128_max = U256::from_u128(i128::MAX as u128);
+            match p3 {
+                Some(v) => v <= i128_max,
+                None => false,
+            }
+        };
+        assert!(lifetime_ok,
+            "funding lifetime: ADL_ONE * MAX_ORACLE_PRICE * max_abs_funding_e9_per_slot * min_funding_lifetime_slots must fit i128 (spec §1.4)"
         );
     }
 

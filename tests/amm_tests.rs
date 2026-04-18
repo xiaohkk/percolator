@@ -26,6 +26,7 @@ fn default_params() -> RiskParams {
         resolve_price_deviation_bps: 1000,
         max_accrual_dt_slots: 1_000,
         max_abs_funding_e9_per_slot: 100_000_000,
+        min_funding_lifetime_slots: 1_000,
         max_active_positions_per_side: MAX_ACCOUNTS as u64,
     }
 }

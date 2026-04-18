@@ -178,6 +178,7 @@ Immutable per-market configuration:
 - `cfg_max_active_positions_per_side`
 - `cfg_max_accrual_dt_slots`
 - `cfg_max_abs_funding_e9_per_slot`
+- `cfg_min_funding_lifetime_slots`
 
 Configured values MUST satisfy:
 
@@ -195,8 +196,11 @@ Configured values MUST satisfy:
 - `0 < cfg_max_accrual_dt_slots <= MAX_WARMUP_SLOTS`
 - `0 <= cfg_max_abs_funding_e9_per_slot <= GLOBAL_MAX_ABS_FUNDING_E9_PER_SLOT`
 - exact init-time funding-envelope validation:
-  - `ADL_ONE * MAX_ORACLE_PRICE * cfg_max_abs_funding_e9_per_slot * cfg_max_accrual_dt_slots <= i128::MAX`
-  - this validation MUST be performed in an exact wide signed domain of at least 256 bits, or a formally equivalent exact method
+  - `ADL_ONE * MAX_ORACLE_PRICE * cfg_max_abs_funding_e9_per_slot * cfg_max_accrual_dt_slots <= i128::MAX` (per-call)
+  - `cfg_min_funding_lifetime_slots >= cfg_max_accrual_dt_slots`
+  - `ADL_ONE * MAX_ORACLE_PRICE * cfg_max_abs_funding_e9_per_slot * cfg_min_funding_lifetime_slots <= i128::MAX` (cumulative lifetime floor)
+  - both validations MUST be performed in an exact wide signed domain of at least 256 bits, or a formally equivalent exact method
+  - `cfg_min_funding_lifetime_slots` is the deployment's guaranteed cumulative-F lifetime at sustained worst-case rate. Production deployments SHOULD pick a value comfortably beyond any planned market horizon (e.g., ~1e9 slots ≈ 127 years at 400ms slots). Realistic operating funding rates are orders of magnitude below the ceiling, so observed F-saturation horizons are typically far longer than this floor guarantees.
 
 If the deployment also defines a stale-market resolution delay `permissionless_resolve_stale_slots` and expects permissionless resolution to remain callable after that delay, then initialization MUST additionally require:
 
@@ -2190,12 +2194,12 @@ The following are deployment-wrapper obligations.
 
    Idle / zero-funding / unilateral-OI markets (funding branch inactive — see §1.5 and §5.5) are exempt from the per-call `dt` bound, so an idle market does NOT brick after `cfg_max_accrual_dt_slots` of inactivity. The canonical recovery primitive is `accrue_market_to(now_slot, oracle, 0)`; it fast-forwards `slot_last` to `now_slot` without F/K deltas and restores normal envelope headroom for subsequent non-accruing endpoints (§9.2 – §9.2.4).
 
-4a. **Cumulative `F_side_num` is an operational budget, not a per-call invariant.**  
-   The per-call envelope (§1.4) bounds *one* accrual's F delta to fit `i128`, but persisted `F_long_num` and `F_short_num` accumulate across calls. At the configured worst case (`rate = cfg_max_abs_funding_e9_per_slot`, sustained both-sided OI), cumulative F can saturate `i128` within a small number of envelope-valid calls. This is a config-scoped liveness bound, not a universal engine guarantee:
+4a. **Cumulative `F_side_num` is bounded by `cfg_min_funding_lifetime_slots`.**  
+   The per-call envelope (§1.4) bounds *one* accrual's F delta to fit `i128`, but persisted `F_long_num` and `F_short_num` accumulate across calls. Initialization (§1.4) enforces a cumulative lifetime floor: at sustained worst-case rate `cfg_max_abs_funding_e9_per_slot` on both sides, F stays within `i128` for at least `cfg_min_funding_lifetime_slots` slots. Deployments MUST choose this parameter to cover their intended market horizon.
 
-   - At realistic operating rates (typical perpetual funding is orders of magnitude below the configured ceiling), cumulative saturation takes years to decades of continuous positive-sign funding in one direction, so this is not a human-timescale concern for most deployments.
+   - At realistic operating rates (typical perpetual funding is orders of magnitude below the configured ceiling), the observed saturation horizon is far longer than this floor — years to decades in most deployments. The floor is a worst-case guarantee, not an expected lifetime.
    - Deployments that intend to run at or near `cfg_max_abs_funding_e9_per_slot` as an operating rate MUST either (a) accept that cumulative saturation will eventually require `resolve_market` (ordinary, or degenerate if F headroom is already tight), or (b) implement a periodic market-rollover / settlement cycle shorter than the saturation horizon.
-   - A future engine revision MAY widen persisted `F_side_num` to an exact 256-bit signed domain or introduce a lazy F-renormalization to eliminate this bound. Until then, `cfg_max_abs_funding_e9_per_slot` is both a per-call safety bound and — when sustained — an upper bound on market lifetime.
+   - A future engine revision MAY widen persisted `F_side_num` to an exact 256-bit signed domain or introduce a lazy F-renormalization to eliminate this bound. Until then, `cfg_min_funding_lifetime_slots` is the init-enforced lower bound on market lifetime at the configured rate ceiling.
 
 5. **Public wrappers SHOULD enforce execution-price admissibility.**  
    A sufficient rule is `abs(exec_price - oracle_price) * 10_000 <= max_trade_price_deviation_bps * oracle_price`, with `max_trade_price_deviation_bps <= 2 * cfg_trading_fee_bps`.

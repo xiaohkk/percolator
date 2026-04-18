@@ -26,6 +26,7 @@ fn default_params() -> RiskParams {
         resolve_price_deviation_bps: 1000,
         max_accrual_dt_slots: 1_000,
         max_abs_funding_e9_per_slot: 100_000_000,
+        min_funding_lifetime_slots: 1_000,
         max_active_positions_per_side: MAX_ACCOUNTS as u64,
     }
 }
@@ -629,6 +630,61 @@ fn zero_funding_rate_can_fast_forward_beyond_max_accrual_dt() {
     assert!(r.is_ok(),
         "zero-funding market must fast-forward past max_dt (got {:?})", r);
     assert_eq!(engine.last_market_slot, hostile_slot);
+}
+
+#[test]
+fn idle_market_can_fast_forward_before_late_deposit() {
+    // Reviewer's regression: after a long idle gap, direct non-accruing
+    // paths (e.g. deposit) refuse the jump via check_live_accrual_envelope.
+    // But the market is not bricked because accrue_market_to(now, oracle, 0)
+    // is allowed on a zero-OI / zero-funding market and advances
+    // last_market_slot. The subsequent deposit then passes the envelope.
+    // This is the canonical idle-recovery sequence the spec points callers
+    // at (§8.4 clause 4).
+    let mut engine = RiskEngine::new(default_params());
+    let max_dt = engine.params.max_accrual_dt_slots;
+    let late = max_dt + 100;
+    let min = engine.params.min_initial_deposit.get();
+
+    // Direct deposit refuses the long jump.
+    assert_eq!(
+        engine.deposit_not_atomic(0, min, 1_000, late),
+        Err(RiskError::Overflow),
+        "direct deposit past the envelope must be rejected (prevents \
+         bricking via current_slot advance without last_market_slot)"
+    );
+    // But the market is recoverable: idle accrue fast-forwards.
+    assert!(engine.accrue_market_to(late, 1_000, 0).is_ok(),
+        "idle zero-OI / zero-rate accrue must fast-forward past max_dt");
+    // Now the deposit passes.
+    assert!(engine.deposit_not_atomic(0, min, 1_000, late).is_ok(),
+        "deposit at the post-fast-forward slot must succeed");
+}
+
+#[test]
+#[should_panic(expected = "funding lifetime")]
+fn validate_params_rejects_short_funding_lifetime() {
+    // Regression: validate_params must refuse any (max_rate, min_lifetime)
+    // pair that allows cumulative F saturation within min_lifetime_slots.
+    // Pick rate * lifetime > 1.7e11 / (ADL_ONE * MAX_ORACLE_PRICE). The
+    // per-call envelope is satisfied, but the cumulative bound is not.
+    let mut params = default_params();
+    params.max_accrual_dt_slots = 1;
+    params.max_abs_funding_e9_per_slot = 1_000_000;
+    // rate * lifetime = 1e6 * 1e6 = 1e12 > 1.7e11 → cumulative assert panics.
+    params.min_funding_lifetime_slots = 1_000_000;
+    let _e = RiskEngine::new(params);
+}
+
+#[test]
+#[should_panic(expected = "min_funding_lifetime_slots must be >=")]
+fn validate_params_rejects_lifetime_below_max_dt() {
+    // min_funding_lifetime_slots >= max_accrual_dt_slots: the cumulative
+    // bound must be at least as strong as the per-call bound.
+    let mut params = default_params();
+    params.max_accrual_dt_slots = 1_000;
+    params.min_funding_lifetime_slots = 500; // < max_dt → reject
+    let _e = RiskEngine::new(params);
 }
 
 #[test]
