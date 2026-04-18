@@ -161,6 +161,26 @@ pub enum MarketMode {
     Resolved = 1,
 }
 
+/// Resolve-branch selector for `resolve_market_not_atomic` (spec §9.8 v12.18.5).
+///
+/// Explicit selector per Goal 51: "the ordinary vs degenerate resolve_market
+/// branch MUST be chosen only from an explicit trusted wrapper mode input.
+/// Equality of economic values such as `live_oracle_price == P_last` or
+/// `funding_rate_e9_per_slot == 0` MUST NOT by itself force the degenerate
+/// branch." Value-based branch inference is forbidden.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResolveMode {
+    /// Self-synchronizing live-sync branch. Accrues market to `now_slot` using
+    /// the supplied `live_oracle_price` and `funding_rate_e9_per_slot`, then
+    /// enforces the deviation-band check against `resolved_price`.
+    Ordinary = 0,
+    /// Privileged recovery branch. Skips additional live accrual after
+    /// `slot_last` and skips the deviation-band check. MUST be entered only
+    /// when the wrapper explicitly selects it AND supplies `live_oracle_price
+    /// == P_last` AND `funding_rate_e9_per_slot == 0`.
+    Degenerate = 1,
+}
+
 /// Reserve mode for set_pnl (spec §4.8)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReserveMode {
@@ -1344,7 +1364,10 @@ impl RiskEngine {
                     // Only valid in Resolved mode (pre-validated above)
                     self.pnl_matured_pos_tot = self.pnl_matured_pos_tot.checked_add(reserve_add)
                         .ok_or(RiskError::Overflow)?;
+                    // Spec §4.8 step 18 (v12.18.5): invariant pair.
                     if self.pnl_matured_pos_tot > self.pnl_pos_tot { return Err(RiskError::CorruptState); }
+                    let pos_pnl_final: u128 = if new_pnl > 0 { new_pnl as u128 } else { 0 };
+                    if self.accounts[idx].reserved_pnl > pos_pnl_final { return Err(RiskError::CorruptState); }
                     return Ok(());
                 }
                 ReserveMode::UseAdmissionPair(admit_h_min, admit_h_max) => {
@@ -1358,7 +1381,10 @@ impl RiskEngine {
                     } else {
                         self.append_or_route_new_reserve(idx, reserve_add, self.current_slot, admitted_h_eff)?;
                     }
+                    // Spec §4.8 step 18 (v12.18.5): invariant pair.
                     if self.pnl_matured_pos_tot > self.pnl_pos_tot { return Err(RiskError::CorruptState); }
+                    let pos_pnl_final: u128 = if new_pnl > 0 { new_pnl as u128 } else { 0 };
+                    if self.accounts[idx].reserved_pnl > pos_pnl_final { return Err(RiskError::CorruptState); }
                     return Ok(());
                 }
             }
@@ -1400,7 +1426,10 @@ impl RiskEngine {
                 if self.accounts[idx].pending_present != 0 { return Err(RiskError::CorruptState); }
             }
 
+            // Spec §4.8 step 18 (v12.18.5): invariant pair.
             if self.pnl_matured_pos_tot > self.pnl_pos_tot { return Err(RiskError::CorruptState); }
+            let pos_pnl_final: u128 = if new_pnl > 0 { new_pnl as u128 } else { 0 };
+            if self.accounts[idx].reserved_pnl > pos_pnl_final { return Err(RiskError::CorruptState); }
             return Ok(());
         }
     }
@@ -4553,6 +4582,7 @@ impl RiskEngine {
     /// First accrues live state, then stores terminal K deltas separately.
     pub fn resolve_market_not_atomic(
         &mut self,
+        resolve_mode: ResolveMode,
         resolved_price: u64,
         live_oracle_price: u64,
         now_slot: u64,
@@ -4571,31 +4601,34 @@ impl RiskEngine {
             return Err(RiskError::Overflow);
         }
 
-        // Degenerate branch: when live_oracle_price equals last accrued price
-        // and funding rate is zero, accrue_market_to would be a no-op for K/F
-        // state, so we skip it. This is a pure performance optimization — NOT
-        // a trust bypass. The band check still runs unconditionally below.
-        //
-        // Prior versions skipped the band check in this branch, but the
-        // discriminator (accidental value match) does not distinguish "dead
-        // oracle, wrapper governance" from "live oracle that happens to be
-        // unchanged". Skipping band check for the latter accepted out-of-band
-        // resolved_price whenever the oracle was flat. Fixed: band check
-        // always runs; wrappers needing a dead-oracle override must widen
-        // resolve_price_deviation_bps via governance first.
-        let skip_accrue = live_oracle_price == self.last_oracle_price && funding_rate_e9 == 0;
+        // Explicit branch selection per spec §9.8 v12.18.5 / Goal 51.
+        // Value-detected branch selection is forbidden: a flat live oracle
+        // must NOT automatically enter the degenerate branch.
+        let used_degenerate = match resolve_mode {
+            ResolveMode::Degenerate => {
+                // Degenerate branch requires these trusted equalities.
+                if live_oracle_price != self.last_oracle_price {
+                    return Err(RiskError::Overflow);
+                }
+                if funding_rate_e9 != 0 {
+                    return Err(RiskError::Overflow);
+                }
+                self.current_slot = now_slot;
+                self.last_market_slot = now_slot;
+                true
+            }
+            ResolveMode::Ordinary => {
+                // Ordinary branch: accrue to now_slot using live inputs.
+                // Even when `live == P_last && rate == 0`, the ordinary
+                // branch stays ordinary (spec test 85).
+                self.accrue_market_to(now_slot, live_oracle_price, funding_rate_e9)?;
+                false
+            }
+        };
 
-        if skip_accrue {
-            self.current_slot = now_slot;
-            self.last_market_slot = now_slot;
-        } else {
-            self.accrue_market_to(now_slot, live_oracle_price, funding_rate_e9)?;
-        }
-
-        // Band check runs on BOTH branches. In the skip-accrue case
-        // last_oracle_price is unchanged; in the accrue case it equals
-        // live_oracle_price after accrue.
-        {
+        // Band check runs on the ordinary branch only. The degenerate branch
+        // relies entirely on trusted wrapper inputs (spec §9.8 step 9).
+        if !used_degenerate {
             let p_last = self.last_oracle_price;
             let p_last_i = p_last as i128;
             let p_res = resolved_price as i128;

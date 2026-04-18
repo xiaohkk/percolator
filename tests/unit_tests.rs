@@ -2445,7 +2445,7 @@ fn test_force_close_resolved_with_open_position() {
     engine.execute_trade_not_atomic(a, b, 1000, 100, size, 1000, 0i128, 0, 100).unwrap();
 
     // Account has open position — force_close settles K-pair PnL and zeros it
-    engine.resolve_market_not_atomic(1000, 1000, 100, 0).unwrap();
+    engine.resolve_market_not_atomic(ResolveMode::Ordinary, 1000, 1000, 100, 0).unwrap();
     let result = engine.force_close_resolved_not_atomic(a, 101);
     assert!(result.is_ok(), "force_close must handle open positions");
     assert!(!engine.is_used(a as usize));
@@ -2465,7 +2465,7 @@ fn test_force_close_resolved_with_negative_pnl() {
 
     // Move price down so account a (long) has loss, then resolve at that price
     engine.keeper_crank_not_atomic(101, 900, &[] as &[(u16, Option<LiquidationPolicy>)], 0, 0i128, 0, 100).unwrap();
-    engine.resolve_market_not_atomic(900, 900, 102, 0).unwrap();
+    engine.resolve_market_not_atomic(ResolveMode::Ordinary, 900, 900, 102, 0).unwrap();
     let result = engine.force_close_resolved_not_atomic(a, 103);
     assert!(result.is_ok(), "force_close must handle negative pnl: {:?}", result);
     assert!(!engine.is_used(a as usize));
@@ -2535,7 +2535,7 @@ fn test_resolved_two_phase_no_deadlock() {
     // Price up within 10% band — a gets positive PnL, b negative
     let resolve_price = 1050u64;
     engine.accrue_market_to(200, resolve_price, 0).unwrap();
-    engine.resolve_market_not_atomic(resolve_price, resolve_price, 200, 0).unwrap();
+    engine.resolve_market_not_atomic(ResolveMode::Ordinary, resolve_price, resolve_price, 200, 0).unwrap();
 
     // Phase 1: reconcile both (persists progress, no deadlock)
     engine.reconcile_resolved_not_atomic(a, 200).unwrap();
@@ -2569,7 +2569,7 @@ fn test_force_close_combined_convenience() {
     engine.execute_trade_not_atomic(a, b, 1000, 100, (100 * POS_SCALE) as i128, 1000, 0i128, 0, 100).unwrap();
     let resolve_price = 1050u64;
     engine.accrue_market_to(200, resolve_price, 0).unwrap();
-    engine.resolve_market_not_atomic(resolve_price, resolve_price, 200, 0).unwrap();
+    engine.resolve_market_not_atomic(ResolveMode::Ordinary, resolve_price, resolve_price, 200, 0).unwrap();
 
     // First call on positive-PnL account: reconciles, may be Deferred
     let a_result = engine.force_close_resolved_not_atomic(a, 200).unwrap();
@@ -2614,7 +2614,7 @@ fn test_force_close_same_epoch_positive_k_pair_pnl() {
 
 
     // Resolve market via proper entry point
-    engine.resolve_market_not_atomic(1500, 1500, 200, 0).unwrap();
+    engine.resolve_market_not_atomic(ResolveMode::Ordinary, 1500, 1500, 200, 0).unwrap();
 
     // Phase 1: reconcile loser (b) first — zeroes their position
     let _b_returned = engine.force_close_resolved_not_atomic(b, 200).unwrap().expect_closed("force_close");
@@ -2641,7 +2641,7 @@ fn test_force_close_same_epoch_negative_k_pair_pnl() {
 
     // Price drops, then resolve at that price
     engine.keeper_crank_not_atomic(200, 500, &[] as &[(u16, Option<LiquidationPolicy>)], 64, 0i128, 0, 100).unwrap();
-    engine.resolve_market_not_atomic(500, 500, 200, 0).unwrap();
+    engine.resolve_market_not_atomic(ResolveMode::Ordinary, 500, 500, 200, 0).unwrap();
 
     let cap_before = engine.accounts[a as usize].capital.get();
     let result = engine.force_close_resolved_not_atomic(a, 201);
@@ -2724,7 +2724,7 @@ fn test_force_close_stored_pos_count_tracks() {
     assert_eq!(engine.stored_pos_count_long, 1);
     assert_eq!(engine.stored_pos_count_short, 1);
 
-    engine.resolve_market_not_atomic(1000, 1000, 100, 0).unwrap();
+    engine.resolve_market_not_atomic(ResolveMode::Ordinary, 1000, 1000, 100, 0).unwrap();
     let r = engine.force_close_resolved_not_atomic(a, 101);
     assert!(r.is_ok(), "force_close a: {:?}", r);
     assert_eq!(engine.stored_pos_count_long, 0, "long count must decrement");
@@ -2771,7 +2771,7 @@ fn test_force_close_decrements_positions() {
     assert!(engine.stored_pos_count_short > 0);
 
     // resolve_market zeroes OI; force_close zeroes positions
-    engine.resolve_market_not_atomic(1000, 1000, 100, 0).unwrap();
+    engine.resolve_market_not_atomic(ResolveMode::Ordinary, 1000, 1000, 100, 0).unwrap();
     assert_eq!(engine.oi_eff_long_q, 0, "resolve_market zeroes OI");
 
     // Close both sides — position counts go to 0
@@ -2793,7 +2793,7 @@ fn test_force_close_both_sides_sequential() {
 
     engine.execute_trade_not_atomic(a, b, 1000, 100, (100 * POS_SCALE) as i128, 1000, 0i128, 0, 100).unwrap();
 
-    engine.resolve_market_not_atomic(1000, 1000, 100, 0).unwrap();
+    engine.resolve_market_not_atomic(ResolveMode::Ordinary, 1000, 1000, 100, 0).unwrap();
 
     // Close a first (reconcile, may not get terminal payout yet)
     let a_returned = engine.force_close_resolved_not_atomic(a, 100).unwrap().expect_closed("force_close");
@@ -3190,7 +3190,7 @@ fn test_resolve_market_basic() {
     // Accrue to resolution slot first (v12.16.4 requirement)
     engine.accrue_market_to(200, 1000, 0).unwrap();
     // Resolve at the same price
-    let result = engine.resolve_market_not_atomic(1000, 1000, 200, 0);
+    let result = engine.resolve_market_not_atomic(ResolveMode::Ordinary, 1000, 1000, 200, 0);
     assert!(result.is_ok());
     assert!(engine.market_mode == MarketMode::Resolved);
     assert_eq!(engine.resolved_price, 1000);
@@ -3207,7 +3207,7 @@ fn test_resolve_market_rejects_out_of_band_price() {
     // resolve_price_deviation_bps = 1000 (10%)
     // Self-sync accrues at live_oracle=1000 first → P_last=1000
     // Then checks resolved=1200 against P_last=1000 → 20% deviation, rejected.
-    let result = engine.resolve_market_not_atomic(1200, 1000, 200, 0);
+    let result = engine.resolve_market_not_atomic(ResolveMode::Ordinary, 1200, 1000, 200, 0);
     assert!(result.is_err(), "price outside settlement band must be rejected");
 }
 
@@ -3219,7 +3219,7 @@ fn test_resolve_market_accepts_in_band_price() {
 
     // Accrue to resolution slot first (v12.16.4 requirement)
     engine.accrue_market_to(200, 1000, 0).unwrap();
-    let result = engine.resolve_market_not_atomic(1050, 1050, 200, 0); // 5% deviation, within 10% band
+    let result = engine.resolve_market_not_atomic(ResolveMode::Ordinary, 1050, 1050, 200, 0); // 5% deviation, within 10% band
     assert!(result.is_ok());
 }
 
@@ -3390,7 +3390,7 @@ fn audit_6_deposit_materialize_needs_live_gate() {
     let _a = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(_a, 100_000, 1000, 100).unwrap();
     engine.accrue_market_to(100, 1000, 0).unwrap();
-    engine.resolve_market_not_atomic(1000, 1000, 100, 0).unwrap();
+    engine.resolve_market_not_atomic(ResolveMode::Ordinary, 1000, 1000, 100, 0).unwrap();
 
     // Try to deposit into an unused slot on a Resolved market — must reject.
     let unused_idx = engine.free_head;
@@ -3517,11 +3517,18 @@ fn sync_account_fee_to_slot_charges_rate_times_dt() {
     // Sync 10 slots forward at rate 3 → collects 30 into insurance from capital.
     let c_before = engine.accounts[idx as usize].capital.get();
     let i_before = engine.insurance_fund.balance.get();
+    let v_before = engine.vault.get();
     engine.sync_account_fee_to_slot_not_atomic(idx, 110, 110, 3).unwrap();
 
     assert_eq!(engine.accounts[idx as usize].last_fee_slot, 110);
     assert_eq!(engine.accounts[idx as usize].capital.get(), c_before - 30);
     assert_eq!(engine.insurance_fund.balance.get(), i_before + 30);
+    // Invariant: vault unchanged (fee moves C → I, not V).
+    assert_eq!(engine.vault.get(), v_before);
+    // Invariant: last_fee_slot <= current_slot on Live.
+    assert!(engine.accounts[idx as usize].last_fee_slot <= engine.current_slot);
+    // Postcondition check: conservation still holds.
+    assert!(engine.check_conservation());
 }
 
 #[test]
@@ -3541,9 +3548,46 @@ fn sync_account_fee_to_slot_rejects_anchor_in_past() {
     let mut engine = RiskEngine::new(default_params());
     let idx = engine.free_head;
     engine.deposit_not_atomic(idx, 1_000_000, 1000, 500).unwrap();
+    // Snapshot full state for mutation-check.
+    let c_before = engine.accounts[idx as usize].capital.get();
+    let i_before = engine.insurance_fund.balance.get();
+    let fc_before = engine.accounts[idx as usize].fee_credits.get();
+    let last_before = engine.accounts[idx as usize].last_fee_slot;
+    assert_eq!(last_before, 500);
+
     // Try to sync backwards — must reject.
+    // now_slot = 500 passes the now_slot >= current_slot check (current=500).
+    // anchor = 400 < last_fee_slot = 500 → internal helper returns Err(Overflow).
     let r = engine.sync_account_fee_to_slot_not_atomic(idx, 500, 400, 5);
     assert_eq!(r, Err(RiskError::Overflow));
+
+    // No state change: last_fee_slot, capital, insurance, fee_credits unchanged.
+    assert_eq!(engine.accounts[idx as usize].last_fee_slot, last_before);
+    assert_eq!(engine.accounts[idx as usize].capital.get(), c_before);
+    assert_eq!(engine.insurance_fund.balance.get(), i_before);
+    assert_eq!(engine.accounts[idx as usize].fee_credits.get(), fc_before);
+}
+
+#[test]
+fn sync_account_fee_to_slot_rejects_now_slot_in_past() {
+    // Exercises the outer check (line 5186) rather than the internal helper.
+    let mut engine = RiskEngine::new(default_params());
+    let idx = engine.free_head;
+    engine.deposit_not_atomic(idx, 1_000_000, 1000, 500).unwrap();
+    // now_slot = 400 < current_slot = 500 → outer check returns Err.
+    let r = engine.sync_account_fee_to_slot_not_atomic(idx, 400, 400, 5);
+    assert_eq!(r, Err(RiskError::Overflow));
+    // State unchanged.
+    assert_eq!(engine.current_slot, 500);
+    assert_eq!(engine.accounts[idx as usize].last_fee_slot, 500);
+}
+
+#[test]
+fn sync_account_fee_to_slot_rejects_missing_account() {
+    let mut engine = RiskEngine::new(default_params());
+    // Index 99 is beyond MAX_ACCOUNTS (=64 in test mode), or at least unused.
+    let r = engine.sync_account_fee_to_slot_not_atomic(99, 100, 100, 5);
+    assert_eq!(r, Err(RiskError::AccountNotFound));
 }
 
 #[test]
@@ -3567,15 +3611,68 @@ fn sync_account_fee_to_slot_caps_at_max_protocol_fee_abs() {
     let idx = engine.free_head;
     engine.deposit_not_atomic(idx, 1_000_000, 1000, 100).unwrap();
 
+    let i_before = engine.insurance_fund.balance.get();
+    let v_before = engine.vault.get();
+    let c_tot_before = engine.c_tot.get();
+
     // Large-but-representable rate: dt=100, rate = MAX_PROTOCOL_FEE_ABS / 50
     // → fee_abs_raw = 2 * MAX_PROTOCOL_FEE_ABS, capped at MAX_PROTOCOL_FEE_ABS.
     let rate = MAX_PROTOCOL_FEE_ABS / 50;
     let r = engine.sync_account_fee_to_slot_not_atomic(idx, 200, 200, rate);
     assert!(r.is_ok(), "capping path MUST succeed (no revert on rate * dt > cap)");
     assert_eq!(engine.accounts[idx as usize].last_fee_slot, 200);
-    // Capital fully drained into insurance, plus fee_credits absorbs headroom.
+    // All 1M capital drained into insurance.
     assert_eq!(engine.accounts[idx as usize].capital.get(), 0);
+    assert_eq!(engine.insurance_fund.balance.get(), i_before + 1_000_000);
+    assert_eq!(engine.c_tot.get(), c_tot_before - 1_000_000);
+    // Fee debt absorbs some of the rest (up to i128::MAX).
     assert!(engine.accounts[idx as usize].fee_credits.get() < 0);
+    // Vault and conservation invariants preserved.
+    assert_eq!(engine.vault.get(), v_before);
+    assert!(engine.check_conservation());
+}
+
+#[test]
+fn init_in_place_zeroes_last_fee_slot_for_all_accounts() {
+    // Canonical-zero invariant: init_in_place MUST leave every account with
+    // last_fee_slot = 0 so subsequent materializations start fresh.
+    let mut engine = RiskEngine::new(default_params());
+    // Dirty a few accounts with stale last_fee_slot values.
+    for i in 0..MAX_ACCOUNTS {
+        engine.accounts[i].last_fee_slot = (i as u64) + 9999;
+    }
+
+    engine.init_in_place(default_params(), 0, 1);
+
+    for i in 0..MAX_ACCOUNTS {
+        assert_eq!(engine.accounts[i].last_fee_slot, 0,
+            "account {} last_fee_slot not zeroed by init_in_place", i);
+    }
+}
+
+#[test]
+fn sync_then_remat_uses_fresh_anchor_not_stale() {
+    // After free_slot → re-deposit (materialize), the NEW last_fee_slot must
+    // be the new materialization slot, not any leftover value from the
+    // previous tenant.
+    let mut engine = RiskEngine::new(default_params());
+    let idx = engine.free_head;
+
+    // First tenant: materialize at slot 100, accrue fees, then free.
+    engine.deposit_not_atomic(idx, 10_000, 1000, 100).unwrap();
+    engine.sync_account_fee_to_slot_not_atomic(idx, 150, 150, 1).unwrap();
+    assert_eq!(engine.accounts[idx as usize].last_fee_slot, 150);
+    // Drain and free.
+    engine.set_capital(idx as usize, 0).unwrap();
+    engine.accounts[idx as usize].fee_credits = I128::ZERO;
+    engine.free_slot(idx).unwrap();
+    assert_eq!(engine.accounts[idx as usize].last_fee_slot, 0);
+
+    // Second tenant: materialize at new slot 500. Must anchor at 500, not 0
+    // and not any stale value.
+    engine.deposit_not_atomic(idx, 10_000, 1000, 500).unwrap();
+    assert_eq!(engine.accounts[idx as usize].last_fee_slot, 500,
+        "Goal 47: remat must anchor at new slot, not inherit stale/zero");
 }
 
 #[test]
@@ -3585,7 +3682,7 @@ fn sync_account_fee_to_slot_resolved_anchored_at_resolved_slot() {
     let idx = engine.free_head;
     engine.deposit_not_atomic(idx, 1_000_000, 1000, 100).unwrap();
     engine.accrue_market_to(100, 1000, 0).unwrap();
-    engine.resolve_market_not_atomic(1000, 1000, 200, 0).unwrap();
+    engine.resolve_market_not_atomic(ResolveMode::Ordinary, 1000, 1000, 200, 0).unwrap();
     assert_eq!(engine.resolved_slot, 200);
 
     // Sync to resolved_slot is allowed.
@@ -3595,6 +3692,61 @@ fn sync_account_fee_to_slot_resolved_anchored_at_resolved_slot() {
     let r = engine.sync_account_fee_to_slot_not_atomic(idx, 201, 201, 1);
     assert_eq!(r, Err(RiskError::Overflow),
         "Goal 49: recurring fee MUST NOT accrue past resolved_slot");
+}
+
+#[test]
+fn resolve_market_ordinary_stays_ordinary_even_when_values_match_degenerate() {
+    // v12.18.5 test 85 / Goal 51: explicit resolve_mode controls branch
+    // selection. Ordinary with values that match degenerate preconditions
+    // (live == P_last, rate == 0) MUST take the ordinary path (accrue +
+    // band check), not fall into degenerate.
+    let mut engine = RiskEngine::new(default_params());
+    let _a = add_user_test(&mut engine, 0).unwrap();
+    engine.deposit_not_atomic(_a, 100_000, 1000, 100).unwrap();
+    engine.accrue_market_to(100, 1000, 0).unwrap();
+    assert_eq!(engine.last_oracle_price, 1000);
+
+    // With live == P_last && rate == 0 but resolve_mode=Ordinary, the band
+    // check still runs. Resolved 1400 (40% off) MUST reject.
+    let r = engine.resolve_market_not_atomic(
+        ResolveMode::Ordinary,
+        /* resolved */ 1400,
+        /* live */ 1000,
+        /* now_slot */ 200,
+        /* rate */ 0);
+    assert!(r.is_err(), "Ordinary mode MUST enforce band even when live==P_last && rate==0");
+    assert_eq!(engine.market_mode, MarketMode::Live,
+        "rejected resolve MUST NOT transition market to Resolved");
+}
+
+#[test]
+fn resolve_market_degenerate_rejects_mismatched_live_oracle() {
+    // v12.18.5 §9.8 step 5: Degenerate requires live_oracle_price == P_last.
+    let mut engine = RiskEngine::new(default_params());
+    let _a = add_user_test(&mut engine, 0).unwrap();
+    engine.deposit_not_atomic(_a, 100_000, 1000, 100).unwrap();
+    engine.accrue_market_to(100, 1000, 0).unwrap();
+    assert_eq!(engine.last_oracle_price, 1000);
+
+    // live = 1100 != P_last = 1000
+    let r = engine.resolve_market_not_atomic(
+        ResolveMode::Degenerate, 1000, 1100, 200, 0);
+    assert_eq!(r, Err(RiskError::Overflow));
+    assert_eq!(engine.market_mode, MarketMode::Live);
+}
+
+#[test]
+fn resolve_market_degenerate_rejects_nonzero_funding_rate() {
+    // v12.18.5 §9.8 step 5: Degenerate requires funding_rate_e9 == 0.
+    let mut engine = RiskEngine::new(default_params());
+    let _a = add_user_test(&mut engine, 0).unwrap();
+    engine.deposit_not_atomic(_a, 100_000, 1000, 100).unwrap();
+    engine.accrue_market_to(100, 1000, 0).unwrap();
+
+    let r = engine.resolve_market_not_atomic(
+        ResolveMode::Degenerate, 1000, 1000, 200, /* rate */ 1);
+    assert_eq!(r, Err(RiskError::Overflow));
+    assert_eq!(engine.market_mode, MarketMode::Live);
 }
 
 #[test]
@@ -3615,7 +3767,7 @@ fn resolve_market_fresh_same_price_zero_funding_still_enforces_deviation_band() 
     // Fresh live oracle = 1000 (same), rate = 0 → "degenerate" branch taken
     // for the skip-accrue optimization. Resolved = 1400 is 40% off, must
     // reject via the band check.
-    let r = engine.resolve_market_not_atomic(
+    let r = engine.resolve_market_not_atomic(ResolveMode::Ordinary, 
         /* resolved */ 1400,
         /* live */ 1000,
         /* now_slot */ 200,
@@ -3637,7 +3789,7 @@ fn audit_8_resolve_must_enforce_band_before_first_accrue() {
     // resolve_price_deviation_bps = 1000 (10%)
     // v12.16.6: self-synchronizing — resolve accrues with live oracle first
     // Price 2000 is 100% deviation from live oracle 1000, well outside 10% band
-    let result = engine.resolve_market_not_atomic(2000, 1000, 200, 0);
+    let result = engine.resolve_market_not_atomic(ResolveMode::Ordinary, 2000, 1000, 200, 0);
     assert!(result.is_err(),
         "resolve must enforce price band from init P_last even before first accrue");
 }
@@ -3681,7 +3833,7 @@ fn audit_10_accrue_market_to_must_reject_on_resolved() {
     let _a = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(_a, 100_000, 1000, 100).unwrap();
     engine.accrue_market_to(100, 1000, 0).unwrap();
-    engine.resolve_market_not_atomic(1000, 1000, 100, 0).unwrap();
+    engine.resolve_market_not_atomic(ResolveMode::Ordinary, 1000, 1000, 100, 0).unwrap();
 
     let result = engine.accrue_market_to(200, 1100, 0);
     assert!(result.is_err(), "accrue_market_to must reject on resolved markets");
@@ -4160,7 +4312,7 @@ fn test_charge_account_fee_live_only() {
     let a = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(a, 100_000, 1000, 100).unwrap();
     engine.accrue_market_to(100, 1000, 0).unwrap();
-    engine.resolve_market_not_atomic(1000, 1000, 100, 0).unwrap();
+    engine.resolve_market_not_atomic(ResolveMode::Ordinary, 1000, 1000, 100, 0).unwrap();
 
     let result = engine.charge_account_fee_not_atomic(a, 1000, 200);
     assert!(result.is_err(), "account fee must be rejected on resolved markets");
@@ -4186,7 +4338,7 @@ fn test_force_close_returns_enum_deferred() {
 
     // Price up — a (long) has positive PnL
     engine.accrue_market_to(slot + 1, 1050, 0).unwrap();
-    engine.resolve_market_not_atomic(1050, 1050, slot + 1, 0).unwrap();
+    engine.resolve_market_not_atomic(ResolveMode::Ordinary, 1050, 1050, slot + 1, 0).unwrap();
 
     // force_close on positive-PnL account when b still has position → Deferred
     let result = engine.force_close_resolved_not_atomic(a, slot + 1).unwrap();
@@ -4266,7 +4418,7 @@ fn test_is_resolved_getter() {
     assert!(!engine.is_resolved(), "must be Live initially");
 
     engine.accrue_market_to(100, 1000, 0).unwrap();
-    engine.resolve_market_not_atomic(1000, 1000, 100, 0).unwrap();
+    engine.resolve_market_not_atomic(ResolveMode::Ordinary, 1000, 1000, 100, 0).unwrap();
 
     assert!(engine.is_resolved(), "must be Resolved after resolve_market");
 }
@@ -4279,7 +4431,7 @@ fn test_resolved_context_getter() {
     let _a = add_user_test(&mut engine, 1000).unwrap();
     engine.deposit_not_atomic(_a, 100_000, oracle, slot).unwrap();
     engine.accrue_market_to(slot, oracle, 0).unwrap();
-    engine.resolve_market_not_atomic(oracle, oracle, slot, 0).unwrap();
+    engine.resolve_market_not_atomic(ResolveMode::Ordinary, oracle, oracle, slot, 0).unwrap();
 
     let (price, rslot) = engine.resolved_context();
     assert_eq!(price, oracle);

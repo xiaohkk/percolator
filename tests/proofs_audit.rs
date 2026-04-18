@@ -911,7 +911,7 @@ fn proof_force_close_resolved_with_position_conserves() {
     engine.execute_trade_not_atomic(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size, DEFAULT_ORACLE, 0i128, 0, 100).unwrap();
 
     // Resolve properly (epoch increment for stale reconciliation)
-    engine.resolve_market_not_atomic(DEFAULT_ORACLE, DEFAULT_ORACLE, DEFAULT_SLOT + 1, 0).unwrap();
+    engine.resolve_market_not_atomic(ResolveMode::Ordinary, DEFAULT_ORACLE, DEFAULT_ORACLE, DEFAULT_SLOT + 1, 0).unwrap();
     let result = engine.force_close_resolved_not_atomic(a, DEFAULT_SLOT + 2);
     assert!(result.is_ok(), "force_close must succeed after proper resolve");
     assert!(engine.check_conservation());
@@ -932,7 +932,7 @@ fn proof_force_close_resolved_with_profit_conserves() {
     let cap_before = engine.accounts[idx as usize].capital.get();
 
     // Go to Resolved first, then set PnL via ImmediateReleaseResolvedOnly
-    engine.resolve_market_not_atomic(DEFAULT_ORACLE, DEFAULT_ORACLE, DEFAULT_SLOT + 1, 0).unwrap();
+    engine.resolve_market_not_atomic(ResolveMode::Ordinary, DEFAULT_ORACLE, DEFAULT_ORACLE, DEFAULT_SLOT + 1, 0).unwrap();
 
     let profit: u16 = kani::any();
     kani::assume(profit >= 1 && profit <= 10000);
@@ -959,7 +959,7 @@ fn proof_force_close_resolved_flat_returns_capital() {
     kani::assume(dep >= 1 && dep <= 1_000_000);
     engine.deposit_not_atomic(idx, dep as u128, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
-    engine.resolve_market_not_atomic(DEFAULT_ORACLE, DEFAULT_ORACLE, DEFAULT_SLOT + 1, 0).unwrap();
+    engine.resolve_market_not_atomic(ResolveMode::Ordinary, DEFAULT_ORACLE, DEFAULT_ORACLE, DEFAULT_SLOT + 1, 0).unwrap();
     let result = engine.force_close_resolved_not_atomic(idx, DEFAULT_SLOT + 2);
     assert!(result.is_ok());
     let payout = result.unwrap().expect_closed("must be Closed");
@@ -986,7 +986,7 @@ fn proof_force_close_resolved_position_conservation() {
 
     // Advance K via price movement, then resolve
     engine.keeper_crank_not_atomic(DEFAULT_SLOT + 1, DEFAULT_ORACLE, &[], 64, 0i128, 0, 100).unwrap();
-    engine.resolve_market_not_atomic(DEFAULT_ORACLE, DEFAULT_ORACLE, DEFAULT_SLOT + 1, 0).unwrap();
+    engine.resolve_market_not_atomic(ResolveMode::Ordinary, DEFAULT_ORACLE, DEFAULT_ORACLE, DEFAULT_SLOT + 1, 0).unwrap();
 
     // Reconcile both, then terminal close a
     engine.reconcile_resolved_not_atomic(a, DEFAULT_SLOT + 1).unwrap();
@@ -1017,7 +1017,7 @@ fn proof_force_close_resolved_pos_count_decrements() {
     let long_before = engine.stored_pos_count_long;
     let short_before = engine.stored_pos_count_short;
 
-    engine.resolve_market_not_atomic(DEFAULT_ORACLE, DEFAULT_ORACLE, DEFAULT_SLOT + 1, 0).unwrap();
+    engine.resolve_market_not_atomic(ResolveMode::Ordinary, DEFAULT_ORACLE, DEFAULT_ORACLE, DEFAULT_SLOT + 1, 0).unwrap();
     engine.force_close_resolved_not_atomic(a, DEFAULT_SLOT + 2).unwrap();
     assert_eq!(engine.stored_pos_count_long, long_before - 1);
 
@@ -1040,7 +1040,7 @@ fn proof_force_close_resolved_fee_sweep_conservation() {
     kani::assume(debt >= 1 && debt <= 40000);
     engine.accounts[idx as usize].fee_credits = I128::new(-(debt as i128));
 
-    engine.resolve_market_not_atomic(DEFAULT_ORACLE, DEFAULT_ORACLE, DEFAULT_SLOT + 1, 0).unwrap();
+    engine.resolve_market_not_atomic(ResolveMode::Ordinary, DEFAULT_ORACLE, DEFAULT_ORACLE, DEFAULT_SLOT + 1, 0).unwrap();
     let ins_before = engine.insurance_fund.balance.get();
     let result = engine.force_close_resolved_not_atomic(idx, DEFAULT_SLOT + 2);
     assert!(result.is_ok());

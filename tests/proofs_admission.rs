@@ -572,7 +572,8 @@ fn k2_resolve_degenerate_bypasses_dt_cap() {
     let resolved_price = live_price;
     let rate = 0i128;
 
-    let r = engine.resolve_market_not_atomic(resolved_price, live_price, now_slot, rate);
+    // v12.18.5: degenerate branch is explicitly selected, not value-detected.
+    let r = engine.resolve_market_not_atomic(ResolveMode::Degenerate, resolved_price, live_price, now_slot, rate);
     assert!(r.is_ok());
     assert!(engine.market_mode == MarketMode::Resolved);
 }

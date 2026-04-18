@@ -1,4 +1,4 @@
-# Risk Engine Spec (Source of Truth) — v12.18.4
+# Risk Engine Spec (Source of Truth) — v12.18.5
 
 **Combined Single-Document Native 128-bit Revision  
 (Wrapper-Owned Two-Point Warmup Admission / Touch-Time Reserve Re-Admission / Wrapper-Owned Account-Fee Policy / Per-Account Recurring-Fee Checkpoint / Wrapper-Supplied High-Precision Funding Side-Index Input / Simplified Scheduled-Plus-Pending Warmup / Exact Candidate-Trade Neutralization / Self-Synchronizing Terminal-K-Delta Resolved Settlement / Whole-Only Automatic Flat Conversion / Full-Local-PnL Maintenance / Immutable Configuration / Unencumbered-Flat Deposit Sweep / Mandatory Post-Partial Local Health Check Edition)**
@@ -7,20 +7,21 @@
 **Status:** implementation source of truth (normative language: MUST / MUST NOT / SHOULD / MAY)  
 **Scope:** perpetual DEX risk engine for a single quote-token vault
 
-This revision supersedes v12.18.1. It keeps the two-bucket warmup design, keeps resolved settlement terminal-delta based, and incorporates the per-account recurring-fee checkpoint needed to support exact touched-account fee realization without global scans.
+This revision supersedes v12.18.4. It keeps the two-bucket warmup design, keeps resolved settlement terminal-delta based, and closes the remaining spec-level gaps around explicit resolution-mode selection, recurring-fee sync overflow semantics, and phantom-dust accounting.
 
-The main deltas from v12.18.1 are:
+The main deltas from v12.18.4 are:
 
 1. preserve the wrapper-supplied two-point admission pair `(admit_h_min, admit_h_max)`,
 2. preserve sticky `admit_h_max` within one instruction so fresh reserve cannot be under-admitted,
 3. preserve touch-time outstanding-reserve re-admission,
-4. preserve the funding envelope (`cfg_max_accrual_dt_slots`, `cfg_max_abs_funding_e9_per_slot`) and the privileged degenerate recovery resolution branch,
-5. add `last_fee_slot_i` as a persistent per-account checkpoint for wrapper-owned recurring fees,
-6. define a canonical fee-sync helper that charges exactly once over `[last_fee_slot_i, fee_slot_anchor]` and then advances `last_fee_slot_i`,
-7. require new accounts to anchor `last_fee_slot_i` at their materialization slot so they do not inherit pre-creation fees,
-8. require resolved-market recurring fee sync to anchor at `resolved_slot`, never after it,
-9. clarify that late resolved fee sync does not invalidate the shared resolved payout snapshot because it is a pure `C -> I` transfer (with any uncollectible tail dropped),
-10. make the scheduled-bucket warmup release rule explicit when the bucket empties, so no stale `sched_release_q` cursor survives on a non-empty bucket.
+4. restore an explicit `resolve_mode ∈ {Ordinary, Degenerate}` selector for `resolve_market`; value-detected branch selection is forbidden,
+5. preserve the funding envelope (`cfg_max_accrual_dt_slots`, `cfg_max_abs_funding_e9_per_slot`) and the privileged degenerate recovery resolution branch,
+6. preserve `last_fee_slot_i` as a persistent per-account checkpoint for wrapper-owned recurring fees,
+7. define a canonical fee-sync helper that charges exactly once over `[last_fee_slot_i, fee_slot_anchor]`, advances `last_fee_slot_i`, and uses explicit saturating-to-`MAX_PROTOCOL_FEE_ABS` overflow semantics,
+8. require new accounts to anchor `last_fee_slot_i` at their materialization slot so they do not inherit pre-creation fees,
+9. require resolved-market recurring fee sync to anchor at `resolved_slot`, never after it,
+10. make the same-epoch phantom-dust rules explicit: basis-replacement orphan remainder and same-epoch decay-to-zero each increment the relevant bound by exactly `1` q-unit,
+11. make the scheduled-bucket warmup release rule explicit when the bucket empties, so no stale `sched_release_q` cursor survives on a non-empty bucket.
 
 The engine core still keeps only:
 
@@ -100,6 +101,7 @@ The engine MUST provide the following properties.
 48. **Exact touched-account recurring-fee liveness:** if a deployment enables wrapper-owned recurring account fees, a touched account MUST be fee-syncable from `last_fee_slot_i` to the relevant slot anchor without a global scan.
 49. **No post-resolution recurring-fee accrual:** recurring account fees, if enabled by the wrapper, accrue only over live time and MUST NOT be charged past `resolved_slot`.
 50. **Resolved payout snapshot stability under late fee sync:** fee sync or fee forgiveness performed after the shared resolved payout snapshot is captured MUST NOT invalidate that snapshot’s correctness. The snapshot is over `Residual = V - (C_tot + I)` and pure `C -> I` reclassification must preserve it.
+51. **No implicit degenerate-mode selection:** the ordinary vs degenerate `resolve_market` branch MUST be chosen only from an explicit trusted wrapper mode input. Equality of economic values such as `live_oracle_price == P_last` or `funding_rate_e9_per_slot == 0` MUST NOT by itself force the degenerate branch.
 
 **Atomic execution model:** every top-level external instruction defined in §9 MUST be atomic. If any required precondition, checked-arithmetic guard, or conservative-failure condition fails, the instruction MUST roll back all state mutations performed since that instruction began.
 
@@ -277,6 +279,7 @@ The engine MUST satisfy all of the following.
 35. `last_fee_slot_i` MUST be initialized, advanced, and reset only through canonical helper paths. A new account MUST start at its materialization slot, and a freed slot MUST return to `0`.
 36. Recurring-fee sync to a resolved account MUST use `fee_slot_anchor = resolved_slot`, never `current_slot` if `current_slot > resolved_slot`.
 37. A late recurring-fee sync after the resolved payout snapshot is captured MUST preserve `Residual = V - (C_tot + I)` except for intentionally dropped uncollectible fee tails, which are conservatively ignored rather than socialized.
+38. `sync_account_fee_to_slot` MUST interpret `fee_rate_per_slot * dt` with explicit saturating-to-`MAX_PROTOCOL_FEE_ABS` semantics. It MUST either compute the product in an exact widened domain of at least 256 bits and then cap, or use an exactly equivalent branch on `fee_rate_per_slot > floor(MAX_PROTOCOL_FEE_ABS / dt)` for `dt > 0`. The helper MUST NOT fail solely because the uncapped raw fee product exceeds native `u128`.
 
 ---
 
@@ -825,18 +828,24 @@ Procedure:
 
 1. `dt = fee_slot_anchor - last_fee_slot_i`
 2. if `dt == 0`, return
-3. compute `fee_abs_raw = fee_rate_per_slot * dt` using checked wide arithmetic or an exact equivalent
-4. define `fee_abs = min(fee_abs_raw, MAX_PROTOCOL_FEE_ABS)`
-5. route `fee_abs` through `charge_fee_to_insurance(i, fee_abs)`
-6. set `last_fee_slot_i = fee_slot_anchor`
+3. define `fee_abs` by the exact capped-product law:
+   - if `fee_rate_per_slot == 0`, set `fee_abs = 0`
+   - else if the implementation computes in a widened domain, compute `fee_abs_raw = fee_rate_per_slot * dt` exactly and set `fee_abs = min(fee_abs_raw, MAX_PROTOCOL_FEE_ABS)`
+   - else it MUST use the exactly equivalent branch law:
+     - if `fee_rate_per_slot > floor(MAX_PROTOCOL_FEE_ABS / dt)`, set `fee_abs = MAX_PROTOCOL_FEE_ABS`
+     - else set `fee_abs = fee_rate_per_slot * dt`
+4. route `fee_abs` through `charge_fee_to_insurance(i, fee_abs)`
+5. set `last_fee_slot_i = fee_slot_anchor`
 
 Normative consequences:
 
 - recurring fees are charged exactly once over `[old_last_fee_slot_i, fee_slot_anchor]`
 - double-sync at the same anchor is a no-op
+- zero-fee sync still advances the checkpoint to `fee_slot_anchor`
 - a newly materialized account starts with `last_fee_slot_i = materialize_slot`, so it never inherits earlier recurring fees
 - on resolved markets this helper syncs at most through `resolved_slot`; no recurring fee accrues after resolution
 - any tail above `MAX_PROTOCOL_FEE_ABS` is intentionally dropped for liveness rather than blocking progress
+- this helper MUST NOT fail solely because the uncapped raw product would exceed native `u128`
 
 ### 4.7 `admit_fresh_reserve_h_lock(i, fresh_positive_pnl_i, ctx, admit_h_min, admit_h_max) -> admitted_h_eff`
 
@@ -936,7 +945,7 @@ If `new_pos <= old_pos`:
 15. set `PNL_pos_tot = PNL_pos_tot_after`
 16. set `PNL_i = new_PNL` and update `neg_pnl_account_count` exactly once if sign crosses zero
 17. if `new_pos == 0` and `market_mode == Live`, require `R_i == 0` and both buckets absent
-18. require `PNL_matured_pos_tot <= PNL_pos_tot`
+18. require `R_i <= max(PNL_i, 0)` and `PNL_matured_pos_tot <= PNL_pos_tot`
 
 ### 4.9 `admit_outstanding_reserve_on_touch(i)`
 
@@ -1024,7 +1033,7 @@ This formulation makes explicit the intended law: if loss consumption made `rele
 
 This helper converts a current effective quantity into a new position basis at the current side state.
 
-If discarding a same-epoch nonzero basis, it MUST first account for orphaned unresolved same-epoch quantity remainder by incrementing the appropriate phantom-dust bound when that remainder is nonzero.
+If discarding a same-epoch nonzero basis, it MUST first compute whether the old same-epoch effective quantity had a nonzero fractional orphan remainder. Concretely, let `old_basis = basis_pos_q_i`, `s = side(old_basis)`, `A_s_current = A_s`, and `a_basis_old = a_basis_i`. If `old_basis != 0`, `epoch_snap_i == epoch_s`, and `a_basis_old > 0`, compute `orphan_rem = (abs(old_basis) * A_s_current) mod a_basis_old` in exact wide arithmetic. If `orphan_rem != 0`, it MUST call `inc_phantom_dust_bound(s)`, i.e. increment the appropriate phantom-dust bound by exactly `1` q-unit, before overwriting the basis. This spec intentionally chooses the one-q-unit conservative bound for basis-replacement orphan remainder; implementations MUST NOT silently choose a different increment law.
 
 If `new_eff_pos_q == 0`, it MUST:
 
@@ -1160,7 +1169,7 @@ When touching account `i` on a live market:
    - `pnl_delta = wide_signed_mul_div_floor_from_kf_pair(abs(basis_pos_q_i), k_snap_i, K_s, f_snap_i, F_s_num, den)`
    - `set_pnl(i, PNL_i + pnl_delta, UseAdmissionPair(ctx.admit_h_min_shared, ctx.admit_h_max_shared), ctx)`
    - if `q_eff_new == 0`:
-     - increment the appropriate phantom-dust bound
+     - call `inc_phantom_dust_bound(s)`, i.e. increment the appropriate phantom-dust bound by exactly `1` q-unit (the remaining same-epoch quantity is strictly between `0` and `1` q-unit)
      - zero the basis
      - reset snapshots to canonical zero-position defaults
    - else:
@@ -1401,7 +1410,7 @@ Procedure:
 7. `settle_losses_from_principal(i)`
 8. if `effective_pos_q(i) == 0` and `PNL_i < 0`, resolve uncovered flat loss
 9. MUST NOT auto-convert
-10. MUST NOT fee-sweep
+10. MUST NOT call `fee_debt_sweep(i)`
 
 If the deployment enables wrapper-owned recurring account fees, the wrapper MUST sync the account’s recurring fee to the relevant live slot anchor **before** relying on any health-sensitive result of this touched state.
 
@@ -1424,7 +1433,7 @@ Procedure:
      - `released = ReleasedPos_i`
      - `consume_released_pnl(i, released)`
      - `set_capital(i, C_i + released)`
-   - fee-sweep the account
+   - call `fee_debt_sweep(i)`
 
 ### 6.7 Resolved positive-payout readiness
 
@@ -1476,7 +1485,7 @@ Procedure:
 
 1. if the deployment enables wrapper-owned recurring account fees and `last_fee_slot_i < resolved_slot`, sync recurring fee to `resolved_slot`
 2. if `PNL_i < 0`, resolve uncovered flat loss via §6.3
-3. fee-sweep the account
+3. call `fee_debt_sweep(i)`
 4. forgive any remaining negative `fee_credits_i`
 5. let `payout = C_i`
 6. if `payout > 0`:
@@ -1507,7 +1516,7 @@ Procedure:
 3. let `y = floor(x * resolved_payout_h_num / resolved_payout_h_den)`
 4. `set_pnl(i, 0, NoPositiveIncreaseAllowed)`
 5. `set_capital(i, C_i + y)`
-6. fee-sweep the account
+6. call `fee_debt_sweep(i)`
 7. forgive any remaining negative `fee_credits_i`
 8. let `payout = C_i`
 9. if `payout > 0`:
@@ -1697,7 +1706,7 @@ Procedure:
 7. `set_capital(i, C_i + amount)`
 8. `settle_losses_from_principal(i)`
 9. MUST NOT invoke flat-loss insurance absorption
-10. if `basis_pos_q_i == 0` and `PNL_i >= 0`, fee-sweep
+10. if `basis_pos_q_i == 0` and `PNL_i >= 0`, call `fee_debt_sweep(i)`
 11. require `V >= C_tot + I`
 
 ### 9.2.1 `deposit_fee_credits(i, amount, now_slot)`
@@ -1783,7 +1792,7 @@ Procedure:
 10. if `basis_pos_q_i == 0`, require `x_req <= max_safe_flat_conversion_released(i, x_req, h_num, h_den)`
 11. `consume_released_pnl(i, x_req)`
 12. `set_capital(i, C_i + floor(x_req * h_num / h_den))`
-13. fee-sweep
+13. call `fee_debt_sweep(i)`
 14. if `effective_pos_q(i) != 0`, require the post-conversion state is maintenance healthy
 15. `finalize_touched_accounts_post_live(ctx)`
 16. schedule resets
@@ -1895,12 +1904,14 @@ Owner-facing close path for a clean live account.
 5. set `current_slot = now_slot`
 6. iterate candidates in keeper-supplied order until budget exhausted or a pending reset is scheduled:
    - stopping at the first scheduled reset is intentional; once reset work is pending, further live-OI-dependent candidate processing belongs to a later instruction after reset finalization
+   - in this loop, “a pending reset is scheduled” means `ctx.pending_reset_long || ctx.pending_reset_short`
    - missing-account skips do not count
    - touching a materialized account counts against `max_revalidations`
    - if recurring fees are enabled, sync the candidate to `current_slot`
    - `touch_account_live_local(candidate, ctx)`
    - if the account is liquidatable after touch and a current-state-valid liquidation-policy hint is present, execute liquidation on the already-touched state
    - if the account is flat, clean, empty, or dust after that touched state, the wrapper MAY instead or additionally invoke the separate reclaim path in a later instruction
+   - after each candidate’s touch/liquidation attempt, if `ctx.pending_reset_long || ctx.pending_reset_short`, break before processing the next candidate
 7. `finalize_touched_accounts_post_live(ctx)`
 8. schedule resets
 9. finalize resets
@@ -1909,14 +1920,16 @@ Owner-facing close path for a clean live account.
 
 Candidate order in this instruction is **keeper policy**, not an engine-level fairness guarantee. Different valid candidate orders can change which accounts receive faster or slower reserve admission or touch-time acceleration in that instruction. This affects only user-side warmup timing and operational UX, never solvency, conservation, or correctness. Deployments that require deterministic UX SHOULD canonicalize candidates by ascending storage index after their own off-chain risk bucketing.
 
-### 9.8 `resolve_market(resolved_price, live_oracle_price, now_slot, funding_rate_e9_per_slot)`
+### 9.8 `resolve_market(resolve_mode, resolved_price, live_oracle_price, now_slot, funding_rate_e9_per_slot)`
 
 Privileged deployment-owned transition.
+
+`resolve_mode ∈ {Ordinary, Degenerate}` is a trusted wrapper-controlled selector. Value-detected branch selection is forbidden.
 
 This instruction has two privileged branches:
 
 - **ordinary self-synchronizing resolution**, which first accrues the live market state to `now_slot` using the trusted current live oracle price and the wrapper-owned current funding rate, then stores the final settlement mark as separate resolved terminal `K` deltas; and
-- **degenerate recovery resolution**, which is available only when the wrapper explicitly supplies degenerate live-sync inputs (`live_oracle_price = P_last` and `funding_rate_e9_per_slot = 0`), in which case the instruction resolves directly from the last synchronized live mark and intentionally applies no additional live accrual after `slot_last`.
+- **degenerate recovery resolution**, which is available only when the wrapper explicitly selects it and explicitly supplies degenerate live-sync inputs (`live_oracle_price = P_last` and `funding_rate_e9_per_slot = 0`), in which case the instruction resolves directly from the last synchronized live mark and intentionally applies no additional live accrual after `slot_last`.
 
 Procedure:
 
@@ -1924,46 +1937,52 @@ Procedure:
 2. require `now_slot >= current_slot` and `now_slot >= slot_last`
 3. require validated `0 < live_oracle_price <= MAX_ORACLE_PRICE`
 4. require validated `0 < resolved_price <= MAX_ORACLE_PRICE`
-5. if `live_oracle_price == P_last` and `funding_rate_e9_per_slot == 0`:
+5. if `resolve_mode == Degenerate`:
+   - require `live_oracle_price == P_last`
+   - require `funding_rate_e9_per_slot == 0`
    - set `current_slot = now_slot`
    - set `slot_last = now_slot`
    - set `resolved_live_price_candidate = P_last`
    - set `used_degenerate_resolution_branch = true`
-6. else:
+6. else if `resolve_mode == Ordinary`:
    - require `now_slot - slot_last <= cfg_max_accrual_dt_slots`
    - call `accrue_market_to(now_slot, live_oracle_price, funding_rate_e9_per_slot)`
    - set `current_slot = now_slot`
    - set `resolved_live_price_candidate = live_oracle_price`
    - set `used_degenerate_resolution_branch = false`
-7. if `used_degenerate_resolution_branch == false`:
+7. value-based ambiguity is forbidden: if the wrapper wants the ordinary branch, it MUST pass `resolve_mode = Ordinary`, even when `live_oracle_price == P_last` and `funding_rate_e9_per_slot == 0`
+8. if `used_degenerate_resolution_branch == false`:
    - require exact settlement-band check:
      - `abs(resolved_price - resolved_live_price_candidate) * 10_000 <= cfg_resolve_price_deviation_bps * resolved_live_price_candidate`
      - both `resolved_live_price_candidate` and `resolved_price` are privileged wrapper-trusted inputs on this path; on the ordinary branch the band is an internal consistency guard, not an independent oracle-integrity proof
-8. else:
+9. else:
    - skip the ordinary live-sync settlement band check
    - the degenerate branch relies entirely on trusted wrapper settlement inputs and must be used only when explicitly permitted by the deployment’s settlement policy
-9. compute resolved terminal mark deltas in exact checked signed arithmetic:
+10. compute resolved terminal mark deltas in exact checked signed arithmetic:
    - if `mode_long == ResetPending`, set `resolved_k_long_terminal_delta = 0`
    - else compute `resolved_k_long_terminal_delta = A_long * (resolved_price - resolved_live_price_candidate)` and require representable as persistent `i128`
    - if `mode_short == ResetPending`, set `resolved_k_short_terminal_delta = 0`
    - else compute `resolved_k_short_terminal_delta = -A_short * (resolved_price - resolved_live_price_candidate)` and require representable as persistent `i128`
    - these terminal deltas MUST NOT be added into persistent live `K_side`
-10. set `market_mode = Resolved`
-11. set `resolved_price = resolved_price`
-12. set `resolved_live_price = resolved_live_price_candidate`
-13. set `resolved_slot = now_slot`
-14. clear resolved payout snapshot state
-15. set `PNL_matured_pos_tot = PNL_pos_tot`
-16. set `OI_eff_long = 0` and `OI_eff_short = 0`
-17. for each side:
+11. set `market_mode = Resolved`
+12. set `resolved_price = resolved_price`
+13. set `resolved_live_price = resolved_live_price_candidate`
+14. set `resolved_slot = now_slot`
+15. clear resolved payout snapshot state explicitly:
+   - `resolved_payout_snapshot_ready = false`
+   - `resolved_payout_h_num = 0`
+   - `resolved_payout_h_den = 0`
+16. set `PNL_matured_pos_tot = PNL_pos_tot`
+17. set `OI_eff_long = 0` and `OI_eff_short = 0`
+18. for each side:
    - if `mode_side != ResetPending`, invoke `begin_full_drain_reset(side)`
    - if the resulting side state is `ResetPending` and `stale_account_count_side == 0` and `stored_pos_count_side == 0`, invoke `finalize_side_reset(side)`
-18. require both open-interest sides are zero
-19. require `V >= C_tot + I`
+19. require both open-interest sides are zero
+20. require `V >= C_tot + I`
 
-Under §0, steps 5 through 19 are one atomic transition. If any check fails — including ordinary live-sync accrual, degenerate-input validation, terminal-delta representability, or reset-finalization checks — the market remains live and all intermediate writes roll back with the enclosing instruction.
+Under §0, steps 5 through 20 are one atomic transition. If any check fails — including ordinary live-sync accrual, explicit degenerate-mode validation, terminal-delta representability, or reset-finalization checks — the market remains live and all intermediate writes roll back with the enclosing instruction.
 
-The ordinary branch is the normative path. The degenerate branch exists only to preserve privileged resolution liveness when applying additional live accrual would be impossible or undesirable under the deployment’s explicit settlement policy — for example because `dt > cfg_max_accrual_dt_slots` or cumulative live `K_side` or `F_side_num` headroom is tight.
+The ordinary branch is the normative path. The degenerate branch exists only to preserve privileged resolution liveness when applying additional live accrual would be impossible or undesirable under the deployment’s explicit settlement policy — for example because `dt > cfg_max_accrual_dt_slots` or cumulative live `K_side` or `F_side_num` headroom is tight. It is entered only when the wrapper explicitly passes `resolve_mode = Degenerate`.
 
 ### 9.9 `force_close_resolved(i, now_slot[, fee_rate_per_slot])`
 
@@ -2085,8 +2104,8 @@ An implementation MUST include tests covering at least the following.
 52. Live instructions reject invalid admission pairs and invalid `funding_rate_e9_per_slot`.
 53. `deposit`, `deposit_fee_credits`, `top_up_insurance_fund`, and `charge_account_fee` do not draw insurance.
 54. `settle_flat_negative_pnl` is a live-only permissionless cleanup path that does not mutate side state.
-55. On its ordinary branch, `resolve_market` self-synchronizes live accrual to `now_slot` and stores the final settlement mark as separate resolved terminal deltas.
-56. On its ordinary branch, `resolve_market` rejects settlement prices outside the immutable band around the trusted live-sync price used for that instruction; on its degenerate branch, that ordinary live-sync band check is intentionally bypassed.
+55. On its ordinary branch, `resolve_market(Ordinary, ...)` self-synchronizes live accrual to `now_slot` and stores the final settlement mark as separate resolved terminal deltas.
+56. On its ordinary branch, `resolve_market(Ordinary, ...)` rejects settlement prices outside the immutable band around the trusted live-sync price used for that instruction; on its degenerate branch, that ordinary live-sync band check is intentionally bypassed.
 57. Resolved local reconciliation applies the stored `resolved_k_*_terminal_delta` exactly on sides that were still live at resolution, and applies zero terminal delta on sides that were already `ResetPending`.
 58. Under open-interest symmetry, end-of-instruction reset scheduling preserves `OI_eff_long == OI_eff_short`.
 59. Positive resolved payouts do not begin until the market is positive-payout ready per §6.7.
@@ -2101,7 +2120,7 @@ An implementation MUST include tests covering at least the following.
 68. `admit_outstanding_reserve_on_touch` either accelerates all outstanding reserve or leaves it unchanged; it never extends or resets reserve horizons.
 69. A live live-accrual instruction with `dt > cfg_max_accrual_dt_slots` fails conservatively; privileged `resolve_market` may proceed only through its explicit degenerate branch.
 70. Market initialization rejects any `(cfg_max_abs_funding_e9_per_slot, cfg_max_accrual_dt_slots)` pair that violates the exact funding-envelope inequality.
-71. The degenerate branch of `resolve_market` requires `live_oracle_price = P_last` and `funding_rate_e9_per_slot = 0` and may be used whenever the deployment’s settlement policy explicitly allows resolving directly from the last synchronized live mark.
+71. `resolve_market(Degenerate, ...)` requires `live_oracle_price = P_last` and `funding_rate_e9_per_slot = 0`; `resolve_market(Ordinary, ...)` MUST stay on the ordinary branch even when those values happen to coincide.
 72. A voluntary trade that closes an account exactly to flat is not rejected solely because current-trade fees create or increase fee debt; the zero-position branch uses the same fee-neutral shortfall-comparison principle as strict risk reduction.
 73. `max_safe_flat_conversion_released` uses 256-bit-or-equivalent arithmetic and does not silently overflow on `E_before * h_den`.
 74. Candidate ordering in `keeper_crank` may affect warmup UX but not solvency, conservation, or correctness.
@@ -2115,6 +2134,10 @@ An implementation MUST include tests covering at least the following.
 82. Resolved recurring-fee sync uses `resolved_slot`, not later wall-clock time.
 83. Capturing the resolved payout snapshot before some accounts are fee-current does not invalidate later payouts because late fee sync is a pure `C -> I` reclassification.
 84. If `advance_profit_warmup` empties the scheduled bucket in a frame where `sched_total > sched_release_q`, the bucket is cleared immediately; no non-empty bucket can persist with an over-advanced `sched_release_q`.
+85. `resolve_market(Ordinary, ...)` does not silently fall into the degenerate branch when `live_oracle_price == P_last` and `funding_rate_e9_per_slot == 0`; explicit `resolve_mode` controls branch selection.
+86. `sync_account_fee_to_slot(i, t, r)` caps to `MAX_PROTOCOL_FEE_ABS` and advances `last_fee_slot_i` even when the uncapped raw product `r * (t - last_fee_slot_i)` exceeds native `u128`.
+87. Same-epoch basis replacement with nonzero orphan remainder increments the relevant `phantom_dust_bound_*_q` by exactly `1` q-unit.
+88. Same-epoch live settlement with `q_eff_new == 0` increments the relevant `phantom_dust_bound_*_q` by exactly `1` q-unit before basis reset.
 
 ---
 
@@ -2126,10 +2149,10 @@ The following are deployment-wrapper obligations.
    `(admit_h_min, admit_h_max)` and `funding_rate_e9_per_slot` are wrapper-owned internal inputs. Public or permissionless wrappers MUST derive them internally and MUST NOT accept arbitrary caller-chosen values.
 
 2. **Authority-gate market resolution and supply trusted inputs for both ordinary and degenerate branches.**  
-   `resolve_market` is a privileged deployment-owned transition. A compliant wrapper MUST source both `live_oracle_price` and `resolved_price` from the deployment’s trusted settlement sources or policy, and MUST source the wrapper-owned current funding rate used for the ordinary live-sync leg inside `resolve_market`. If the wrapper intentionally uses the degenerate recovery branch, it MUST pass `live_oracle_price = P_last` and `funding_rate_e9_per_slot = 0` and MUST do so only when that behavior is explicitly permitted by the deployment’s settlement policy.
+   `resolve_market` is a privileged deployment-owned transition. A compliant wrapper MUST source both `live_oracle_price` and `resolved_price` from the deployment’s trusted settlement sources or policy, MUST source the wrapper-owned current funding rate used for the ordinary live-sync leg inside `resolve_market`, and MUST pass an explicit trusted `resolve_mode ∈ {Ordinary, Degenerate}` selector. For normal resolution it MUST pass `resolve_mode = Ordinary`. If it intentionally uses the degenerate recovery branch, it MUST pass `resolve_mode = Degenerate`, `live_oracle_price = P_last`, and `funding_rate_e9_per_slot = 0`, and it MUST do so only when that behavior is explicitly permitted by the deployment’s settlement policy.
 
 3. **Do not emulate resolution with a separate prior accrual transaction as the normal path.**  
-   Because `resolve_market` is self-synchronizing in this revision, a compliant wrapper MUST invoke it directly with trusted live-sync inputs for ordinary operation. A separate pre-accrual transaction is not required and MUST NOT be treated as the normative path, though a deployment MAY use an explicit pre-accrual or headroom-management flow as an operational recovery tool if it is trying to avoid cumulative `K` or `F` saturation before resolution. If live accrual would still be unsafe or impossible, the wrapper MAY instead use the privileged degenerate branch inside `resolve_market`.
+   Because `resolve_market` is self-synchronizing in this revision, a compliant wrapper MUST invoke it directly with trusted live-sync inputs and `resolve_mode = Ordinary` for ordinary operation. A separate pre-accrual transaction is not required and MUST NOT be treated as the normative path, though a deployment MAY use an explicit pre-accrual or headroom-management flow as an operational recovery tool if it is trying to avoid cumulative `K` or `F` saturation before resolution. If live accrual would still be unsafe or impossible, the wrapper MAY instead use the privileged degenerate branch inside `resolve_market` by explicitly passing `resolve_mode = Degenerate`.
 
 4. **Respect the funding envelope operationally.**  
    A compliant deployment MUST monitor `slot_last`, `cfg_max_accrual_dt_slots`, and `cfg_max_abs_funding_e9_per_slot` so the market is actively cranked or ordinarily resolved before the engine’s live accrual envelope is exceeded. If the deployment enables permissionless stale resolution, it MUST choose `permissionless_resolve_stale_slots <= cfg_max_accrual_dt_slots`. If the envelope is exceeded anyway, only the privileged degenerate branch remains available.
@@ -2209,4 +2232,3 @@ The following are deployment-wrapper obligations.
 9. **Late resolved fee sync is harmless to payout ratios.** Once the resolved payout snapshot is captured, late fee sync only moves value from `C_i` to `I`. That preserves `Residual = V - (C_tot + I)`. Any uncollectible tail that is dropped stays as conservative unused slack; it is not socialized through payouts.
 
 10. **Monotone pending-bucket max-horizon merge is deliberate.** Coalescing into the newest pending bucket by `max(pending_horizon_i, admitted_h_eff)` is intentionally conservative. It can delay newer-bucket maturity but it never accelerates it and never contaminates the older scheduled bucket.
-
