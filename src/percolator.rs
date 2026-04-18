@@ -2021,6 +2021,38 @@ impl RiskEngine {
     }
 
     // ========================================================================
+    // Live accrual envelope
+    // ========================================================================
+
+    /// Reject `now_slot` values that would push `current_slot` beyond the
+    /// live accrual envelope (`last_market_slot + max_accrual_dt_slots`).
+    ///
+    /// Non-market-advancing public endpoints (top_up_insurance_fund,
+    /// reclaim, charge_account_fee, settle_flat_negative_pnl, deposit_fee
+    /// _credits, sync_account_fee_to_slot on Live) also set
+    /// `current_slot = now_slot` for monotonicity but do NOT advance
+    /// `last_market_slot`. Without this check a permissionless caller
+    /// could pick any `now_slot > last_market_slot + max_dt`, committing
+    /// the advance and permanently bricking live accrual — every
+    /// subsequent `accrue_market_to(n, ..)` with `n >= current_slot`
+    /// would fail because `n - last_market_slot > max_dt`, and
+    /// monotonicity forbids smaller `n`.
+    ///
+    /// Callers wanting to advance time beyond this envelope MUST go
+    /// through `accrue_market_to`, which also advances `last_market_slot`.
+    /// Safe to call on both Live and Resolved markets; on Resolved
+    /// `last_market_slot == resolved_slot` and the envelope still
+    /// applies.
+    fn check_live_accrual_envelope(&self, now_slot: u64) -> Result<()> {
+        let envelope_top = self.last_market_slot
+            .saturating_add(self.params.max_accrual_dt_slots);
+        if now_slot > envelope_top {
+            return Err(RiskError::Overflow);
+        }
+        Ok(())
+    }
+
+    // ========================================================================
     // accrue_market_to (spec §5.4)
     // ========================================================================
 
@@ -4997,6 +5029,8 @@ impl RiskEngine {
         if now_slot < self.current_slot {
             return Err(RiskError::Overflow);
         }
+        // Reject time jumps that would brick subsequent accrue_market_to.
+        self.check_live_accrual_envelope(now_slot)?;
 
         // Step 3: Pre-realization flat-clean preconditions (spec §10.7 / §2.6)
         let account = &self.accounts[idx as usize];
@@ -5151,6 +5185,8 @@ impl RiskEngine {
         if now_slot < self.current_slot {
             return Err(RiskError::Overflow);
         }
+        // Reject time jumps that would brick subsequent accrue_market_to.
+        self.check_live_accrual_envelope(now_slot)?;
         // Validate-then-mutate: all checks before any state change
         let new_vault = self.vault.get().checked_add(amount)
             .ok_or(RiskError::Overflow)?;
@@ -5206,6 +5242,8 @@ impl RiskEngine {
         if now_slot < self.current_slot {
             return Err(RiskError::Overflow);
         }
+        // Reject time jumps that would brick subsequent accrue_market_to.
+        self.check_live_accrual_envelope(now_slot)?;
         if fee_abs > MAX_PROTOCOL_FEE_ABS {
             return Err(RiskError::Overflow);
         }
@@ -5241,6 +5279,8 @@ impl RiskEngine {
         if now_slot < self.current_slot {
             return Err(RiskError::Overflow);
         }
+        // Reject time jumps that would brick subsequent accrue_market_to.
+        self.check_live_accrual_envelope(now_slot)?;
         let i = idx as usize;
         // Flat only, reserve state empty
         if self.accounts[i].position_basis_q != 0 {
@@ -5305,6 +5345,13 @@ impl RiskEngine {
             return Err(RiskError::AccountNotFound);
         }
         if now_slot < self.current_slot { return Err(RiskError::Overflow); }
+        // Reject time jumps that would brick subsequent accrue_market_to.
+        // Only meaningful on Live; on Resolved the envelope is moot because
+        // accrue_market_to is no longer reachable, but the check is safe
+        // (last_market_slot is frozen to resolved_slot).
+        if self.market_mode == MarketMode::Live {
+            self.check_live_accrual_envelope(now_slot)?;
+        }
         let anchor = match self.market_mode {
             MarketMode::Live => {
                 self.current_slot = now_slot;
@@ -5351,6 +5398,8 @@ impl RiskEngine {
         if now_slot < self.current_slot {
             return Err(RiskError::Overflow);
         }
+        // Reject time jumps that would brick subsequent accrue_market_to.
+        self.check_live_accrual_envelope(now_slot)?;
         // Spec §2.1: fee_credits <= 0. The caller externally moves `amount`
         // tokens; the engine must book exactly that. Previously the method
         // silently capped at outstanding debt, which made the real-token ↔

@@ -1721,11 +1721,25 @@ Procedure:
 10. if `basis_pos_q_i == 0` and `PNL_i >= 0`, call `fee_debt_sweep(i)`
 11. require `V >= C_tot + I`
 
+> **Live accrual envelope (applies to §9.2.1 – §9.2.4).**
+> Public Live-mode instructions that advance `current_slot` but do NOT call
+> `accrue_market_to` (i.e., do not advance `last_market_slot`) MUST also
+> require `now_slot <= last_market_slot + cfg_max_accrual_dt_slots`.
+> Without this bound, a permissionless caller could pick any `now_slot`
+> beyond the envelope, commit the `current_slot` advance, and permanently
+> brick subsequent live accrual: every later `accrue_market_to(n, ..)`
+> with `n >= current_slot` would fail because
+> `n - last_market_slot > cfg_max_accrual_dt_slots`, and monotonicity
+> forbids smaller `n`. Callers wanting to advance time beyond the
+> envelope MUST go through `accrue_market_to`, which also advances
+> `last_market_slot`.
+
 ### 9.2.1 `deposit_fee_credits(i, amount, now_slot)`
 
 1. require `market_mode == Live`
 2. require account `i` is materialized
 3. require `now_slot >= current_slot`
+3a. require `now_slot <= last_market_slot + cfg_max_accrual_dt_slots`
 4. set `current_slot = now_slot`
 5. `pay = min(amount, FeeDebt_i)`
 6. if `pay == 0`, return
@@ -1740,6 +1754,7 @@ Procedure:
 
 1. require `market_mode == Live`
 2. require `now_slot >= current_slot`
+2a. require `now_slot <= last_market_slot + cfg_max_accrual_dt_slots`
 3. set `current_slot = now_slot`
 4. require `V + amount <= MAX_VAULT_TVL`
 5. set `V = V + amount`
@@ -1751,6 +1766,7 @@ Procedure:
 1. require `market_mode == Live`
 2. require account `i` is materialized
 3. require `now_slot >= current_slot`
+3a. require `now_slot <= last_market_slot + cfg_max_accrual_dt_slots`
 4. require `fee_abs <= MAX_PROTOCOL_FEE_ABS`
 5. set `current_slot = now_slot`
 6. `charge_fee_to_insurance(i, fee_abs)`
@@ -1761,6 +1777,7 @@ Procedure:
 1. require `market_mode == Live`
 2. require account `i` is materialized
 3. require `now_slot >= current_slot`
+3a. require `now_slot <= last_market_slot + cfg_max_accrual_dt_slots`
 4. set `current_slot = now_slot`
 5. if recurring fees are enabled, `sync_account_fee_to_slot(i, current_slot, fee_rate_per_slot)`
 6. require `basis_pos_q_i == 0`

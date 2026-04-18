@@ -546,6 +546,46 @@ fn test_top_up_insurance_fund() {
     assert!(engine.check_conservation());
 }
 
+#[test]
+fn top_up_cannot_jump_current_slot_past_accrual_envelope() {
+    // Regression: a permissionless top_up_insurance_fund (amount=0) must
+    // not be able to advance current_slot so far that the next
+    // accrue_market_to is stuck with dt > max_accrual_dt_slots.
+    //
+    // Previously top_up_insurance_fund set self.current_slot = now_slot
+    // without touching last_market_slot and without enforcing the
+    // envelope. That let anyone brick live accrual by calling
+    //     top_up_insurance_fund(0, last_market_slot + max_dt + 1)
+    // after which every subsequent accrue_market_to with now_slot >=
+    // current_slot fails because now_slot - last_market_slot > max_dt,
+    // and no smaller now_slot is allowed (monotonicity).
+    let mut engine = RiskEngine::new(default_params()); // max_accrual_dt_slots = 1_000
+    assert_eq!(engine.current_slot, 0);
+    assert_eq!(engine.last_market_slot, 0);
+    let max_dt = engine.params.max_accrual_dt_slots;
+
+    // Attempt the hostile jump.
+    let hostile_slot = max_dt + 1;
+    let r = engine.top_up_insurance_fund(0, hostile_slot);
+
+    if r.is_ok() {
+        // If the engine accepts the jump, then accrue at current_slot
+        // MUST still succeed; otherwise the market is bricked.
+        let acc = engine.accrue_market_to(hostile_slot, 1_000, 0);
+        assert!(acc.is_ok(),
+            "after top_up advances current_slot to {}, \
+             accrue_market_to({}, ..) must still succeed \
+             (got {:?}) — otherwise the market is DoS-bricked",
+            engine.current_slot, hostile_slot, acc);
+    } else {
+        // Alternatively, the engine may reject the jump outright.
+        assert_eq!(r, Err(RiskError::Overflow));
+        // State must be untouched on Err.
+        assert_eq!(engine.current_slot, 0);
+        assert_eq!(engine.last_market_slot, 0);
+    }
+}
+
 
 // ============================================================================
 // 10. Fee operations
