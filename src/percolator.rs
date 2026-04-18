@@ -303,6 +303,14 @@ pub struct Account {
     /// Fee credits
     pub fee_credits: I128,
 
+    /// Per-account recurring-fee checkpoint (spec §2.1, §4.6.1 v12.18.4).
+    /// Anchors the slot at which this account's wrapper-owned recurring
+    /// maintenance fee was last realized. On materialization, set to the
+    /// materialization slot; on free_slot, reset to 0. Invariant:
+    ///   market Live     → last_fee_slot_i <= current_slot
+    ///   market Resolved → last_fee_slot_i <= resolved_slot
+    pub last_fee_slot: u64,
+
     // ---- Two-bucket warmup reserve (spec §4.3) ----
     /// Scheduled reserve bucket (older, matures linearly)
     pub sched_present: u8,
@@ -346,6 +354,7 @@ fn empty_account() -> Account {
         matcher_context: [0; 32],
         owner: [0; 32],
         fee_credits: I128::ZERO,
+        last_fee_slot: 0,
         sched_present: 0,
         sched_remaining_q: 0,
         sched_anchor_q: 0,
@@ -901,6 +910,7 @@ impl RiskEngine {
             a.matcher_context = [0; 32];
             a.owner = [0; 32];
             a.fee_credits = I128::ZERO;
+            a.last_fee_slot = 0;
             a.sched_present = 0;
             a.sched_remaining_q = 0;
             a.sched_anchor_q = 0;
@@ -1015,6 +1025,7 @@ impl RiskEngine {
         a.matcher_context = [0; 32];
         a.owner = [0; 32];
         a.fee_credits = I128::ZERO;
+        a.last_fee_slot = 0;
         a.sched_present = 0;
         a.sched_remaining_q = 0;
         a.sched_anchor_q = 0;
@@ -1045,7 +1056,7 @@ impl RiskEngine {
     /// Materializes a missing account at a specific slot index.
     /// The slot must not be currently in use.
     test_visible! {
-    fn materialize_at(&mut self, idx: u16, _slot_anchor: u64) -> Result<()> {
+    fn materialize_at(&mut self, idx: u16, slot_anchor: u64) -> Result<()> {
         if idx as usize >= MAX_ACCOUNTS {
             return Err(RiskError::AccountNotFound);
         }
@@ -1106,6 +1117,11 @@ impl RiskEngine {
             a.matcher_context = [0; 32];
             a.owner = [0; 32];
             a.fee_credits = I128::ZERO;
+            // Spec §2.7 v12.18.4: anchor recurring-fee checkpoint at the
+            // caller-supplied materialization slot. Prevents newly created
+            // accounts from being back-charged for time before materialization
+            // (Goal 47).
+            a.last_fee_slot = slot_anchor;
             a.sched_present = 0;
             a.sched_remaining_q = 0;
             a.sched_anchor_q = 0;
@@ -2123,6 +2139,74 @@ impl RiskEngine {
         let rem = self.use_insurance_buffer(loss);
         self.record_uninsured_protocol_loss(rem);
     }
+    }
+
+    // ========================================================================
+    // sync_account_fee_to_slot (spec §4.6.1, v12.18.4)
+    // ========================================================================
+
+    /// Internal helper that realizes wrapper-owned recurring maintenance fees
+    /// for account `idx` over `[last_fee_slot, fee_slot_anchor]` at the given
+    /// per-slot rate, then advances `last_fee_slot`.
+    ///
+    /// Preconditions:
+    /// - `idx` is materialized
+    /// - `fee_slot_anchor >= last_fee_slot` (monotonicity)
+    /// - on Live:     `fee_slot_anchor <= current_slot`
+    /// - on Resolved: `fee_slot_anchor <= resolved_slot`
+    ///
+    /// Behavior:
+    /// - `fee_abs_raw = fee_rate_per_slot * dt` in wide U256 to prevent overflow.
+    /// - Cap at `MAX_PROTOCOL_FEE_ABS` (spec §4.6.1 step 4 — liveness cap).
+    /// - Route the capped amount through `charge_fee_to_insurance` so the
+    ///   collectible portion moves C → I and any shortfall becomes local
+    ///   fee debt; uncollectible tail is dropped.
+    /// - Advance `last_fee_slot` to `fee_slot_anchor`.
+    fn sync_account_fee_to_slot(
+        &mut self,
+        idx: usize,
+        fee_slot_anchor: u64,
+        fee_rate_per_slot: u128,
+    ) -> Result<()> {
+        if idx >= MAX_ACCOUNTS || !self.is_used(idx) {
+            return Err(RiskError::AccountNotFound);
+        }
+        let last = self.accounts[idx].last_fee_slot;
+        if fee_slot_anchor < last { return Err(RiskError::Overflow); }
+        // Mode-specific upper bound on the anchor.
+        match self.market_mode {
+            MarketMode::Live => {
+                if fee_slot_anchor > self.current_slot {
+                    return Err(RiskError::Overflow);
+                }
+            }
+            MarketMode::Resolved => {
+                if fee_slot_anchor > self.resolved_slot {
+                    return Err(RiskError::Overflow);
+                }
+            }
+        }
+        let dt = fee_slot_anchor - last;
+        if dt == 0 {
+            // No-op at same anchor; still idempotent-advance (already at anchor).
+            return Ok(());
+        }
+        if fee_rate_per_slot == 0 {
+            self.accounts[idx].last_fee_slot = fee_slot_anchor;
+            return Ok(());
+        }
+        // Exact wide multiply; cap at MAX_PROTOCOL_FEE_ABS for liveness.
+        let raw = U256::from_u128(fee_rate_per_slot)
+            .checked_mul(U256::from_u128(dt as u128))
+            .ok_or(RiskError::Overflow)?;
+        let cap = U256::from_u128(MAX_PROTOCOL_FEE_ABS);
+        let fee_abs_u256 = if raw > cap { cap } else { raw };
+        let fee_abs: u128 = fee_abs_u256.try_into_u128().ok_or(RiskError::Overflow)?;
+        if fee_abs > 0 {
+            self.charge_fee_to_insurance(idx, fee_abs)?;
+        }
+        self.accounts[idx].last_fee_slot = fee_slot_anchor;
+        Ok(())
     }
 
     // ========================================================================
@@ -5063,6 +5147,47 @@ impl RiskEngine {
         self.settle_losses(i)?;
         self.resolve_flat_negative(i)?;
 
+        self.assert_public_postconditions()?;
+        Ok(())
+    }
+
+    // ========================================================================
+    // sync_account_fee_to_slot_not_atomic (spec §4.6.1, v12.18.4)
+    // ========================================================================
+
+    /// Public entrypoint for wrapper-owned recurring-fee realization.
+    ///
+    /// Wrappers that enable recurring maintenance fees MUST call this before
+    /// any health-sensitive engine operation on the same Solana transaction
+    /// (spec §9.0 step 5). Solana transaction atomicity guarantees the sync
+    /// and the subsequent operation commit together or roll back together.
+    ///
+    /// - On Live:     `fee_slot_anchor <= current_slot`.
+    /// - On Resolved: `fee_slot_anchor <= resolved_slot` (Goal 49 — no
+    ///   post-resolution fee accrual).
+    ///
+    /// Charges exactly once over `[last_fee_slot, fee_slot_anchor]`. A double
+    /// call at the same anchor is a no-op. Newly materialized accounts start
+    /// at their materialization slot and are never back-charged (Goal 47).
+    ///
+    /// Advances `current_slot` to `now_slot` on Live; on Resolved the value
+    /// of `now_slot` is checked but `current_slot` is not advanced past the
+    /// resolved freeze.
+    pub fn sync_account_fee_to_slot_not_atomic(
+        &mut self,
+        idx: u16,
+        now_slot: u64,
+        fee_slot_anchor: u64,
+        fee_rate_per_slot: u128,
+    ) -> Result<()> {
+        if idx as usize >= MAX_ACCOUNTS || !self.is_used(idx as usize) {
+            return Err(RiskError::AccountNotFound);
+        }
+        if now_slot < self.current_slot { return Err(RiskError::Overflow); }
+        if self.market_mode == MarketMode::Live {
+            self.current_slot = now_slot;
+        }
+        self.sync_account_fee_to_slot(idx as usize, fee_slot_anchor, fee_rate_per_slot)?;
         self.assert_public_postconditions()?;
         Ok(())
     }

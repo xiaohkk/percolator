@@ -3479,6 +3479,124 @@ fn init_in_place_fully_canonicalizes_nonzero_memory() {
     }
 }
 
+// ============================================================================
+// v12.18.4 §4.6.1: per-account recurring-fee checkpoint
+// ============================================================================
+
+#[test]
+fn materialize_anchors_last_fee_slot_at_materialize_slot() {
+    // Goal 47 (v12.18.4): new accounts MUST NOT inherit earlier recurring fees.
+    // Anchor is the actual materialization slot.
+    let mut engine = RiskEngine::new(default_params());
+    let unused_idx = engine.free_head;
+    // Deposit is the sole materialization path; it passes now_slot as anchor.
+    let anchor = 1234u64;
+    engine.deposit_not_atomic(unused_idx, 10_000, 1000, anchor).unwrap();
+    assert_eq!(engine.accounts[unused_idx as usize].last_fee_slot, anchor);
+}
+
+#[test]
+fn free_slot_resets_last_fee_slot_to_zero() {
+    let mut engine = RiskEngine::new(default_params());
+    let idx = engine.free_head;
+    engine.deposit_not_atomic(idx, 10_000, 1000, 500).unwrap();
+    assert_eq!(engine.accounts[idx as usize].last_fee_slot, 500);
+    // Drain account and free_slot manually.
+    engine.set_capital(idx as usize, 0).unwrap();
+    engine.free_slot(idx).unwrap();
+    assert_eq!(engine.accounts[idx as usize].last_fee_slot, 0);
+}
+
+#[test]
+fn sync_account_fee_to_slot_charges_rate_times_dt() {
+    let mut engine = RiskEngine::new(default_params());
+    let idx = engine.free_head;
+    engine.deposit_not_atomic(idx, 1_000_000, 1000, 100).unwrap();
+    assert_eq!(engine.accounts[idx as usize].last_fee_slot, 100);
+
+    // Sync 10 slots forward at rate 3 → collects 30 into insurance from capital.
+    let c_before = engine.accounts[idx as usize].capital.get();
+    let i_before = engine.insurance_fund.balance.get();
+    engine.sync_account_fee_to_slot_not_atomic(idx, 110, 110, 3).unwrap();
+
+    assert_eq!(engine.accounts[idx as usize].last_fee_slot, 110);
+    assert_eq!(engine.accounts[idx as usize].capital.get(), c_before - 30);
+    assert_eq!(engine.insurance_fund.balance.get(), i_before + 30);
+}
+
+#[test]
+fn sync_account_fee_to_slot_idempotent_at_same_anchor() {
+    let mut engine = RiskEngine::new(default_params());
+    let idx = engine.free_head;
+    engine.deposit_not_atomic(idx, 1_000_000, 1000, 100).unwrap();
+    engine.sync_account_fee_to_slot_not_atomic(idx, 110, 110, 5).unwrap();
+    let c_after_first = engine.accounts[idx as usize].capital.get();
+    // Second call at same anchor is a no-op.
+    engine.sync_account_fee_to_slot_not_atomic(idx, 110, 110, 5).unwrap();
+    assert_eq!(engine.accounts[idx as usize].capital.get(), c_after_first);
+}
+
+#[test]
+fn sync_account_fee_to_slot_rejects_anchor_in_past() {
+    let mut engine = RiskEngine::new(default_params());
+    let idx = engine.free_head;
+    engine.deposit_not_atomic(idx, 1_000_000, 1000, 500).unwrap();
+    // Try to sync backwards — must reject.
+    let r = engine.sync_account_fee_to_slot_not_atomic(idx, 500, 400, 5);
+    assert_eq!(r, Err(RiskError::Overflow));
+}
+
+#[test]
+fn sync_account_fee_to_slot_rate_zero_advances_anchor_without_charging() {
+    let mut engine = RiskEngine::new(default_params());
+    let idx = engine.free_head;
+    engine.deposit_not_atomic(idx, 1_000_000, 1000, 100).unwrap();
+    let c_before = engine.accounts[idx as usize].capital.get();
+
+    engine.sync_account_fee_to_slot_not_atomic(idx, 200, 200, 0).unwrap();
+    assert_eq!(engine.accounts[idx as usize].last_fee_slot, 200);
+    assert_eq!(engine.accounts[idx as usize].capital.get(), c_before);
+}
+
+#[test]
+fn sync_account_fee_to_slot_caps_at_max_protocol_fee_abs() {
+    // Rate * dt product far exceeds MAX_PROTOCOL_FEE_ABS; engine caps at
+    // MAX_PROTOCOL_FEE_ABS for liveness rather than reverting (spec §4.6.1
+    // step 4). The uncollectible tail beyond collectible headroom is dropped.
+    let mut engine = RiskEngine::new(default_params());
+    let idx = engine.free_head;
+    engine.deposit_not_atomic(idx, 1_000_000, 1000, 100).unwrap();
+
+    // Large-but-representable rate: dt=100, rate = MAX_PROTOCOL_FEE_ABS / 50
+    // → fee_abs_raw = 2 * MAX_PROTOCOL_FEE_ABS, capped at MAX_PROTOCOL_FEE_ABS.
+    let rate = MAX_PROTOCOL_FEE_ABS / 50;
+    let r = engine.sync_account_fee_to_slot_not_atomic(idx, 200, 200, rate);
+    assert!(r.is_ok(), "capping path MUST succeed (no revert on rate * dt > cap)");
+    assert_eq!(engine.accounts[idx as usize].last_fee_slot, 200);
+    // Capital fully drained into insurance, plus fee_credits absorbs headroom.
+    assert_eq!(engine.accounts[idx as usize].capital.get(), 0);
+    assert!(engine.accounts[idx as usize].fee_credits.get() < 0);
+}
+
+#[test]
+fn sync_account_fee_to_slot_resolved_anchored_at_resolved_slot() {
+    // Goal 49: no post-resolution fee accrual. Anchor MUST be <= resolved_slot.
+    let mut engine = RiskEngine::new(default_params());
+    let idx = engine.free_head;
+    engine.deposit_not_atomic(idx, 1_000_000, 1000, 100).unwrap();
+    engine.accrue_market_to(100, 1000, 0).unwrap();
+    engine.resolve_market_not_atomic(1000, 1000, 200, 0).unwrap();
+    assert_eq!(engine.resolved_slot, 200);
+
+    // Sync to resolved_slot is allowed.
+    engine.sync_account_fee_to_slot_not_atomic(idx, 200, 200, 1).unwrap();
+
+    // Sync past resolved_slot MUST reject.
+    let r = engine.sync_account_fee_to_slot_not_atomic(idx, 201, 201, 1);
+    assert_eq!(r, Err(RiskError::Overflow),
+        "Goal 49: recurring fee MUST NOT accrue past resolved_slot");
+}
+
 #[test]
 fn resolve_market_fresh_same_price_zero_funding_still_enforces_deviation_band() {
     // Reviewer regression: previously the "degenerate branch" skipped the
