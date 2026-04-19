@@ -260,11 +260,20 @@ fn proof_b5_matured_leq_pos_tot() {
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
 fn proof_g4_drain_only_blocks_oi_increase() {
+    // v12.19: DrainOnly is only reachable when the side has nonzero
+    // residual OI (spec §5.6 — A_side below MIN_A_SIDE). With OI=0
+    // execute_trade's pre-open flush transitions DrainOnly → Normal
+    // via §5.7.D. Open a real position first to exercise the real
+    // DrainOnly gate.
     let mut engine = RiskEngine::new(zero_fee_params());
     let a = add_user_test(&mut engine, 0).unwrap();
     let b = add_user_test(&mut engine, 0).unwrap();
     engine.deposit_not_atomic(a, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
     engine.deposit_not_atomic(b, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+
+    // Open a bilateral position so DrainOnly has residual OI.
+    let open = (5 * POS_SCALE) as i128;
+    engine.execute_trade_not_atomic(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, open, DEFAULT_ORACLE, 0i128, 0, 100).unwrap();
 
     engine.side_mode_long = SideMode::DrainOnly;
 

@@ -512,6 +512,11 @@ fn proof_set_position_basis_q_count_tracking() {
 #[kani::unwind(70)]
 #[kani::solver(cadical)]
 fn proof_side_mode_gating() {
+    // v12.19: the pre-open flush in execute_trade_not_atomic transitions
+    // DrainOnly+OI=0 → Normal via §5.7.D (dust cleanup). DrainOnly is
+    // only reachable in the engine's own flow when the side has nonzero
+    // residual OI, so this test opens a real position first before
+    // flipping side_mode_long to DrainOnly.
     let mut engine = RiskEngine::new(zero_fee_params());
     engine.last_crank_slot = DEFAULT_SLOT;
 
@@ -520,8 +525,13 @@ fn proof_side_mode_gating() {
     engine.deposit_not_atomic(a, 5_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
     engine.deposit_not_atomic(b, 5_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
+    // Open a real bilateral position so DrainOnly is a realistic state.
+    let open = (10 * POS_SCALE) as i128;
+    engine.execute_trade_not_atomic(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, open, DEFAULT_ORACLE, 0i128, 0, 100).unwrap();
+
     engine.side_mode_long = SideMode::DrainOnly;
 
+    // Second trade would further increase long OI — must be blocked.
     let size_q = POS_SCALE as i128;
     let result = engine.execute_trade_not_atomic(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size_q, DEFAULT_ORACLE, 0i128, 0, 100);
     assert!(result == Err(RiskError::SideBlocked));
@@ -530,6 +540,8 @@ fn proof_side_mode_gating() {
     engine.side_mode_short = SideMode::ResetPending;
     engine.stale_account_count_short = 1;
 
+    // ResetPending with stale_account_count > 0 must block OI increase
+    // (flush cannot finalize until stale accounts are touched).
     let pos_size = POS_SCALE as i128;
     let result2 = engine.execute_trade_not_atomic(b, a, DEFAULT_ORACLE, DEFAULT_SLOT, pos_size, DEFAULT_ORACLE, 0i128, 0, 100);
     assert!(result2 == Err(RiskError::SideBlocked));

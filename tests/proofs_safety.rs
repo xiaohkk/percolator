@@ -2127,7 +2127,11 @@ fn proof_audit4_deposit_fee_credits_checked_arithmetic() {
 }
 
 /// Proof: deposit_fee_credits enforces spec §2.1 fee_credits <= 0 invariant.
-/// Over-deposits beyond outstanding debt are capped.
+/// Over-deposits beyond outstanding debt are REJECTED (not capped).
+/// v12.18.1 reviewer pass: engine must not silently cap — real-token
+/// ↔ engine.vault correspondence would diverge when the caller moves
+/// `amount` tokens but the engine only books `debt`. Reject anything
+/// larger than the outstanding debt.
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
@@ -2138,20 +2142,21 @@ fn proof_audit5_deposit_fee_credits_no_positive() {
 
     // Give account 500 in fee debt
     engine.accounts[idx as usize].fee_credits = I128::new(-500);
+    let vault_before = engine.vault.get();
 
-    // Try to deposit 1000 (more than the 500 debt)
-    engine.deposit_fee_credits(idx, 1000, 0).unwrap();
-
-    // fee_credits must be exactly 0, not +500
-    assert!(engine.accounts[idx as usize].fee_credits.get() == 0,
-        "fee_credits must be capped at 0 (spec §2.1)");
-
-    // Vault and insurance should reflect only the 500 that was actually applied
-    assert!(engine.vault.get() == 500,
-        "vault must increase by capped amount only");
+    // Try to deposit 1000 (more than the 500 debt) — must be rejected.
+    let r = engine.deposit_fee_credits(idx, 1000, 0);
+    assert!(r.is_err(), "over-deposit beyond debt must be rejected");
+    // State unchanged on Err.
+    assert!(engine.accounts[idx as usize].fee_credits.get() == -500,
+        "fee_credits must be unchanged on Err");
+    assert!(engine.vault.get() == vault_before,
+        "vault must be unchanged on Err");
 }
 
-/// Proof: deposit_fee_credits on account with zero debt is a no-op.
+/// Proof: deposit_fee_credits with amount == 0 on any account is a no-op
+/// except for the current_slot advance. Any amount > 0 when debt == 0 is
+/// rejected (v12.18.1 reviewer pass: no silent cap).
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
@@ -2160,13 +2165,20 @@ fn proof_audit5_deposit_fee_credits_zero_debt_noop() {
     let mut engine = RiskEngine::new(params);
     let idx = add_user_test(&mut engine, 0).unwrap();
 
-    // fee_credits = 0 (no debt)
+    // fee_credits = 0 (no debt). Zero-amount deposit is a no-op (engine
+    // advances current_slot but makes no other mutation).
     let vault_before = engine.vault.get();
-    engine.deposit_fee_credits(idx, 9999, 0).unwrap();
+    engine.deposit_fee_credits(idx, 0, 0).unwrap();
+    assert!(engine.vault.get() == vault_before,
+        "zero-amount deposit must not change vault");
+    assert!(engine.accounts[idx as usize].fee_credits.get() == 0,
+        "credits stay 0");
 
-    // Nothing should change
-    assert!(engine.vault.get() == vault_before, "vault unchanged when no debt");
-    assert!(engine.accounts[idx as usize].fee_credits.get() == 0, "credits stay 0");
+    // Any amount > 0 when debt == 0 must be rejected.
+    let r = engine.deposit_fee_credits(idx, 9999, 0);
+    assert!(r.is_err(), "positive deposit on zero-debt account must be rejected");
+    assert!(engine.vault.get() == vault_before,
+        "vault unchanged on Err");
 }
 
 /// Proof: reclaim_empty_account_not_atomic follows spec §2.6 preconditions and effects.

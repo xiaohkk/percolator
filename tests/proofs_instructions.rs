@@ -1687,24 +1687,31 @@ fn proof_audit4_add_user_atomic_on_failure() {
         "c_tot must not change on failed add_user (no slots)");
 }
 
-/// Proof: add_user atomicity on MAX_VAULT_TVL failure path.
+/// Proof: deposit_not_atomic (the sole materialization path since
+/// v12.18.1) enforces MAX_VAULT_TVL atomically — the first deposit
+/// that would push vault over the cap is rejected without mutating
+/// vault, insurance, or the slot count. Prior spec drafts had an
+/// `add_user` opening fee that could push vault past the cap; that
+/// surface was removed (the fee path no longer exists), so this test
+/// now exercises the deposit-materialize path directly.
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
 fn proof_audit4_add_user_atomic_on_tvl_failure() {
-    let mut params = zero_fee_params();
+    let params = zero_fee_params();
     let mut engine = RiskEngine::new(params);
+    let min = engine.params.min_initial_deposit.get();
 
-    // Set vault just below MAX_VAULT_TVL so fee would push it over
-    engine.vault = U128::new(MAX_VAULT_TVL - 99);
-    engine.insurance_fund.balance = U128::new(MAX_VAULT_TVL - 99);
+    // Pin vault just below MAX_VAULT_TVL so min_initial_deposit would
+    // push it over.
+    engine.vault = U128::new(MAX_VAULT_TVL - (min - 1));
 
     let vault_before = engine.vault.get();
     let ins_before = engine.insurance_fund.balance.get();
     let used_before = engine.num_used_accounts;
 
-    // fee_payment=100 would push vault to MAX_VAULT_TVL+1 — must fail
-    let result = add_user_test(&mut engine, 100);
+    // Deposit-materialize at amount=min_initial_deposit exceeds cap → reject.
+    let result = engine.deposit_not_atomic(0, min, 1, 0);
     assert!(result.is_err());
 
     assert!(engine.vault.get() == vault_before,
@@ -1713,6 +1720,7 @@ fn proof_audit4_add_user_atomic_on_tvl_failure() {
         "insurance must not change on MAX_VAULT_TVL rejection");
     assert!(engine.num_used_accounts == used_before,
         "num_used_accounts must not change on MAX_VAULT_TVL rejection");
+    assert!(!engine.is_used(0), "slot 0 must not be materialized on Err");
 }
 
 /// Proof: deposit_fee_credits enforces MAX_VAULT_TVL.

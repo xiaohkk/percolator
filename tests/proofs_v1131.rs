@@ -692,7 +692,11 @@ fn proof_liquidation_policy_validity() {
 // ############################################################################
 
 /// deposit_fee_credits applies only min(amount, debt), never makes fee_credits
-/// positive, increases V and I by exactly the applied amount.
+/// deposit_fee_credits never leaves fee_credits positive, and when it
+/// succeeds it increases V and I by exactly the applied amount. v12.18.1
+/// reviewer pass: over-deposits (amount > outstanding debt) are now
+/// REJECTED instead of silently capped. This proof covers both branches:
+/// amount <= debt succeeds; amount > debt errors atomically.
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
@@ -707,21 +711,32 @@ fn proof_deposit_fee_credits_cap() {
 
     let v_before = engine.vault.get();
     let i_before = engine.insurance_fund.balance.get();
+    let fc_before = engine.accounts[idx as usize].fee_credits.get();
 
     let amount: u32 = kani::any();
     kani::assume(amount > 0 && amount <= 100_000);
 
     let result = engine.deposit_fee_credits(idx, amount as u128, DEFAULT_SLOT);
-    assert!(result.is_ok());
 
-    // fee_credits must be <= 0
-    assert!(engine.accounts[idx as usize].fee_credits.get() <= 0,
-        "fee_credits must never become positive");
-
-    // Applied amount = min(amount, 5000)
-    let expected_pay = core::cmp::min(amount as u128, 5000);
-    assert!(engine.vault.get() == v_before + expected_pay, "V must increase by applied amount");
-    assert!(engine.insurance_fund.balance.get() == i_before + expected_pay, "I must increase by applied amount");
+    if amount as u128 > 5000 {
+        // Over-deposit: must be rejected atomically.
+        assert!(result.is_err(), "over-deposit must be rejected");
+        assert!(engine.vault.get() == v_before,
+            "vault unchanged on Err");
+        assert!(engine.insurance_fund.balance.get() == i_before,
+            "insurance unchanged on Err");
+        assert!(engine.accounts[idx as usize].fee_credits.get() == fc_before,
+            "fee_credits unchanged on Err");
+    } else {
+        // Within debt: succeeds, books exactly `amount`.
+        assert!(result.is_ok());
+        assert!(engine.accounts[idx as usize].fee_credits.get() <= 0,
+            "fee_credits must never become positive");
+        assert!(engine.vault.get() == v_before + amount as u128,
+            "V must increase by exactly amount");
+        assert!(engine.insurance_fund.balance.get() == i_before + amount as u128,
+            "I must increase by exactly amount");
+    }
 }
 
 // ############################################################################

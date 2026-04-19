@@ -328,9 +328,21 @@ fn ac2_acceleration_fires_iff_admits() {
     let idx = add_user_test(&mut engine, 0).unwrap() as usize;
 
     let r: u8 = kani::any();
+    let matured: u8 = kani::any();
+    // Set up an account whose positive PnL is fully accounted for:
+    //   pnl_pos_tot = matured + r (reserved portion)
+    // This matches the normative admission precondition: after firing,
+    // new_matured = matured + r must not exceed pnl_pos_tot (v12.18.1
+    // added this check to admit_outstanding_reserve_on_touch).
+    let pos_tot = (matured as u128).checked_add(r as u128);
+    kani::assume(pos_tot.is_some());
+    let pos_tot = pos_tot.unwrap();
+    kani::assume(pos_tot <= i128::MAX as u128);
+
     engine.accounts[idx].reserved_pnl = r as u128;
-    engine.accounts[idx].pnl = r as i128;
-    engine.pnl_pos_tot = r as u128;
+    engine.accounts[idx].pnl = pos_tot as i128;
+    engine.pnl_pos_tot = pos_tot;
+    engine.pnl_matured_pos_tot = matured as u128;
     if r > 0 {
         engine.accounts[idx].sched_present = 1;
         engine.accounts[idx].sched_remaining_q = r as u128;
@@ -342,13 +354,15 @@ fn ac2_acceleration_fires_iff_admits() {
     let ct: u16 = kani::any();
     engine.vault = U128::new(v as u128);
     engine.c_tot = U128::new(ct as u128);
-    let matured: u8 = kani::any();
-    engine.pnl_matured_pos_tot = matured as u128;
-    kani::assume(engine.pnl_matured_pos_tot <= engine.pnl_pos_tot);
 
     let r_before = engine.accounts[idx].reserved_pnl;
+    // Engine's exact admission condition: residual uses checked_sub
+    // (senior <= vault required) AND matured + r <= pnl_pos_tot
+    // (guaranteed by our setup).
+    let senior_ok = (ct as u128) <= (v as u128);
     let residual = (v as u128).saturating_sub(ct as u128);
     let admits = r_before > 0
+        && senior_ok
         && (matured as u128).saturating_add(r_before) <= residual;
 
     let _ = engine.admit_outstanding_reserve_on_touch(idx);
@@ -532,9 +546,17 @@ fn k9_admission_pair_rejects_zero_max() {
 #[kani::unwind(4)]
 #[kani::solver(cadical)]
 fn k1_accrue_rejects_dt_over_envelope() {
+    // v12.19: the dt envelope only applies when funding is actually
+    // active (rate != 0 AND both sides have OI AND fund_px_last > 0).
+    // Idle / zero-rate / unilateral-OI markets can fast-forward past
+    // the envelope — see `idle_market_can_fast_forward_beyond_max
+    // _accrual_dt`. This proof checks the funding-active branch:
+    // when funding WOULD accrue, dt > cfg_max_accrual_dt_slots MUST
+    // be rejected.
     let mut engine = RiskEngine::new(zero_fee_params());
     engine.oi_eff_long_q = POS_SCALE;
     engine.oi_eff_short_q = POS_SCALE;
+    engine.fund_px_last = 1; // required for funding_active
     let before_slot = engine.last_market_slot;
     let before_price = engine.last_oracle_price;
 
@@ -546,7 +568,8 @@ fn k1_accrue_rejects_dt_over_envelope() {
     let oracle: u8 = kani::any();
     kani::assume(oracle > 0);
 
-    let r = engine.accrue_market_to(now_slot, oracle as u64, 0i128);
+    // Nonzero rate forces funding_active; envelope MUST apply.
+    let r = engine.accrue_market_to(now_slot, oracle as u64, 1i128);
     assert!(r.is_err());
     // State unchanged
     assert!(engine.last_market_slot == before_slot);
