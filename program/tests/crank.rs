@@ -671,3 +671,65 @@ async fn concurrent_funding_cranks_same_slot_idempotent() {
     let (cur2, _, _) = read_engine_field(&mut ctx, h.slab.pubkey()).await;
     assert_eq!(cur1, cur2, "current_slot unchanged by no-op crank");
 }
+
+#[tokio::test]
+async fn crank_bounty_clamped_by_insurance_floor() {
+    // Regression for SECURITY.md "Known limits" #2. With insurance_floor = F
+    // and balance = F + delta where 0 < delta < CRANK_BOUNTY, a successful
+    // crank must pay delta as bounty (not the full CRANK_BOUNTY), leaving
+    // insurance exactly at the floor.
+    let (h, pt) = Harness::new();
+    let mut ctx = bring_up(&h, pt, 100_000_000, 1_000_000).await;
+
+    let floor: u128 = 5_000;
+    let delta: u128 = 200;
+    {
+        let mut acct = ctx
+            .banks_client
+            .get_account(h.slab.pubkey())
+            .await
+            .unwrap()
+            .unwrap();
+        {
+            let engine_bytes = &mut acct.data[ENGINE_OFFSET..];
+            let e: &mut percolator::RiskEngine =
+                unsafe { &mut *(engine_bytes.as_mut_ptr() as *mut percolator::RiskEngine) };
+            e.params.insurance_floor = percolator::U128::new(floor);
+            let new_i = floor + delta;
+            e.insurance_fund.balance = percolator::U128::new(new_i);
+            let new_v = e.vault.get() + (floor + delta);
+            e.vault = percolator::U128::new(new_v);
+        }
+        ctx.set_account(&h.slab.pubkey(), &acct.into());
+    }
+
+    let caller_before = token_balance(&mut ctx, h.caller_ta).await;
+    ctx.warp_to_slot(40).unwrap();
+    send(&mut ctx, &h.caller, &[build_crank_ix(&h, CrankKind::Funding)])
+        .await
+        .expect("funding crank with clamped bounty");
+
+    // Bounty paid to caller: exactly `delta`, not CRANK_BOUNTY.
+    let caller_after = token_balance(&mut ctx, h.caller_ta).await;
+    assert_eq!(
+        caller_after - caller_before,
+        delta as u64,
+        "bounty must be clamped to (balance - floor)"
+    );
+
+    // Insurance balance sits at the floor post-crank.
+    let acct = ctx
+        .banks_client
+        .get_account(h.slab.pubkey())
+        .await
+        .unwrap()
+        .unwrap();
+    let engine_bytes = &acct.data[ENGINE_OFFSET..];
+    let e: &percolator::RiskEngine =
+        unsafe { &*(engine_bytes.as_ptr() as *const percolator::RiskEngine) };
+    assert_eq!(
+        e.insurance_fund.balance.get(),
+        floor,
+        "insurance must be clamped at floor"
+    );
+}

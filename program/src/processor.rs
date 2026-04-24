@@ -1434,10 +1434,13 @@ impl Processor {
                 let ins = engine.insurance_fund.balance.get();
                 // SECURITY: bounty draws from insurance, not user capital,
                 // so c_tot is NOT touched. Two-way decrement: insurance +
-                // vault, which preserves `V >= C_tot + I`. Does not
-                // enforce the configured `insurance_floor` (see
-                // SECURITY.md "Known limits" #2).
-                let pay = core::cmp::min(ins, CRANK_BOUNTY as u128) as u64;
+                // vault, which preserves `V >= C_tot + I`. The bounty is
+                // also clamped against the configured `insurance_floor`
+                // so repeated cranks cannot drain insurance below spec
+                // (fixes SECURITY.md "Known limits" #2).
+                let floor = engine.params.insurance_floor.get();
+                let available = ins.saturating_sub(floor);
+                let pay = core::cmp::min(available, CRANK_BOUNTY as u128) as u64;
                 if pay > 0 {
                     let new_ins = ins - pay as u128;
                     engine.insurance_fund.balance = percolator::U128::new(new_ins);
