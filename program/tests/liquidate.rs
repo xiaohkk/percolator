@@ -810,3 +810,30 @@ async fn wrong_oracle_rejected() {
         err
     );
 }
+
+#[tokio::test]
+async fn stale_oracle_rejected() {
+    // Matches PlaceOrder's stale-price bounds check: a zero-valued oracle
+    // (or one > MAX_ORACLE_PRICE) must be rejected with StaleOracle before
+    // any engine state mutates.
+    let (h, pt) = Harness::new();
+    let mut ctx = bring_up(&h, pt, 100_000_000, 1_000_000).await;
+    let uidx = user_idx(&mut ctx, h.slab.pubkey(), h.user.pubkey()).await;
+    send(&mut ctx, &h.user, &[build_place_order_ix(&h, 0, 500_000)])
+        .await
+        .expect("open");
+
+    set_oracle_price(&mut ctx, h.oracle, 0).await;
+    let err = send(
+        &mut ctx,
+        &h.liquidator,
+        &[build_liquidate_ix(&h, uidx)],
+    )
+    .await
+    .expect_err("stale oracle rejected");
+    assert!(
+        expected_custom_error(&err, PercolatorError::StaleOracle),
+        "{:?}",
+        err
+    );
+}

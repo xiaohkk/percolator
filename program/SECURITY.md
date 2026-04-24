@@ -1,8 +1,9 @@
 # SECURITY — percolator-program self-review
 
-Scope: the 8 public instruction handlers in `src/processor.rs` —
+Scope: the 9 public instruction handlers in `src/processor.rs` —
 CreateSlab, InitializeEngine, Deposit, Withdraw, BootstrapLp, PlaceOrder,
-Liquidate, Crank. All 68 integration tests pass as of this review.
+Liquidate, Crank, CreateMarket. 80 integration tests pass as of this
+review (2026-04-24 refresh after task #15 + #23 landed).
 
 The risk engine itself (`src/percolator.rs`) is Toly's
 formally-verified library and is out of scope — every `*_not_atomic`
@@ -66,12 +67,11 @@ BPF wrapper only.
    a stale oracle can be trivially tricked: any fresh write to the
    oracle account with a stale-but-nonzero u64 will pass the
    wrapper's checks.
-2. **Crank bounty drains insurance.** The crank bounty of `CRANK_BOUNTY`
-   is pulled from `insurance_fund.balance` and can drain insurance
-   below the configured `insurance_floor` over time (we only check
-   `balance >= bounty`, not `balance - bounty >= floor`). Low-severity
-   because `CRANK_BOUNTY` is small and the floor is a soft target.
-   Consider clamping against the floor before task #15.
+2. ~~Crank bounty drains insurance.~~ **Closed 2026-04-24.** The crank
+   bounty now clamps against `params.insurance_floor`: the pay-out is
+   `min(CRANK_BOUNTY, insurance_balance - insurance_floor)`, so the
+   floor is never breached. Regression test:
+   `tests/crank.rs::crank_bounty_clamped_by_insurance_floor`.
 3. **BootstrapLp gating.** BootstrapLp is one-shot per slab. It refuses
    if `is_used(slot 0)` OR `free_head != 0`. That means if a user
    runs Deposit before the admin runs BootstrapLp, the whole slab's
@@ -119,23 +119,25 @@ Columns are the handlers; rows are the checklist items. `P` = pass,
 `N/A` = not applicable. Relevant source-line references or `// SECURITY:`
 anchors follow in parentheses.
 
-|                                               | CreateSlab | InitializeEngine | Deposit | Withdraw | BootstrapLp | PlaceOrder | Liquidate | Crank |
-|:----------------------------------------------|:----------:|:----------------:|:-------:|:--------:|:-----------:|:----------:|:---------:|:-----:|
-| 1. Signer verification                        | P (payer)  | P (creator)      | P (user)| P (user) | P (creator) | P (user)   | P (liq)   | P (caller) |
-| 2. Owner verification (slab = this program)   | P          | P                | P       | P        | P           | P          | P         | P     |
-| 2. Owner verification (SPL token accounts)    | N/A        | N/A              | P       | P        | P           | N/A        | P         | P     |
-| 3. Mint match (token_account.mint == header.mint) | N/A    | N/A              | P       | P        | P           | N/A        | P         | P     |
-| 4. Writable flag correctness                  | P          | P                | P       | P        | P           | P (ro oracle) | P      | P     |
-| 5. PDA derivation (canonical stored bump)     | P (verify) | N/A              | P       | P        | P           | N/A        | P         | P     |
-| 6. Arithmetic (checked_* / engine wide_math)  | P          | P                | P       | P        | P           | P          | P         | P     |
-| 7. CPI ordering                               | N/A        | N/A              | see (a) | see (a)  | see (a)     | N/A        | see (a)   | see (a) |
-| 8. Rent exemption preserved                   | P          | N/A              | N/A     | N/A      | N/A         | N/A        | N/A       | N/A   |
-| 9. Re-entrancy safety                         | N/A        | N/A              | P       | P        | P           | N/A        | P         | P     |
-| 10. Bitmap race / idempotency                 | N/A        | N/A              | P       | P        | P           | P          | P         | P     |
-| 11. Stale oracle check                        | N/A        | see (b)          | N/A     | N/A      | N/A         | P          | P         | see (c) |
-| 12. Max leverage from RiskParams              | N/A        | N/A              | N/A     | P        | N/A         | P (engine) | P (engine)| N/A   |
-| 13. Conservation invariant                    | N/A        | N/A              | P       | P        | P           | P          | P         | P     |
-| 14. DrainOnly/ResetPending on new OI          | N/A        | N/A              | N/A     | N/A      | N/A         | P          | N/A       | N/A   |
+|                                               | CreateSlab | InitializeEngine | Deposit | Withdraw | BootstrapLp | PlaceOrder | Liquidate | Crank      | CreateMarket |
+|:----------------------------------------------|:----------:|:----------------:|:-------:|:--------:|:-----------:|:----------:|:---------:|:----------:|:------------:|
+| 1. Signer verification                        | P (payer)  | P (creator)      | P (user)| P (user) | P (creator) | P (user)   | P (liq)   | P (caller) | P (payer)    |
+| 2. Owner verification (slab = this program)   | P          | P                | P       | P        | P           | P          | P         | P          | P            |
+| 2. Owner verification (SPL token accounts)    | N/A        | N/A              | P       | P        | P           | N/A        | P         | P          | N/A          |
+| 3. Mint match (token_account.mint == header.mint) | N/A    | N/A              | P       | P        | P           | N/A        | P         | P          | N/A          |
+| 4. Writable flag correctness                  | P          | P                | P       | P        | P           | P (ro oracle) | P      | P          | P            |
+| 5. PDA derivation (canonical stored bump)     | P (verify) | N/A              | P       | P        | P           | N/A        | P         | P          | P (verify)   |
+| 6. Arithmetic (checked_* / engine wide_math)  | P          | P                | P       | P        | P           | P          | P         | P          | N/A          |
+| 7. CPI ordering                               | N/A        | N/A              | see (a) | see (a)  | see (a)     | N/A        | see (a)   | see (a)    | see (a)      |
+| 8. Rent exemption preserved                   | P          | N/A              | N/A     | N/A      | N/A         | N/A        | N/A       | N/A        | P            |
+| 9. Re-entrancy safety                         | N/A        | N/A              | P       | P        | P           | N/A        | P         | P          | P            |
+| 10. Bitmap race / idempotency                 | N/A        | N/A              | P       | P        | P           | P          | P         | P          | N/A          |
+| 11. Stale oracle check                        | N/A        | see (b)          | N/A     | N/A      | N/A         | P          | P         | see (c)    | N/A          |
+| 12. Max leverage from RiskParams              | N/A        | N/A              | N/A     | P        | N/A         | P (engine) | P (engine)| N/A        | N/A          |
+| 13. Conservation invariant                    | N/A        | N/A              | P       | P        | P           | P          | P         | P          | N/A          |
+| 14. DrainOnly/ResetPending on new OI          | N/A        | N/A              | N/A     | N/A      | N/A         | P          | N/A       | N/A        | N/A          |
+| Treasury pubkey must equal `TREASURY_PUBKEY`  | N/A        | N/A              | N/A     | N/A      | N/A         | N/A        | N/A       | N/A        | P            |
+| Listing fee floor enforced on-chain           | N/A        | N/A              | N/A     | N/A      | N/A         | N/A        | N/A       | N/A        | P            |
 
 Notes:
 
@@ -153,26 +155,52 @@ Notes:
   Tagged as a limit (see "Known limits" #1); Task #15 integrates the
   oracle feed and will update this.
 
-## Findings + fixes landed in this review
+## Findings + fixes landed in this review (2026-04-24)
 
-No behavioral changes were needed; existing checks satisfy the
-matrix. This review added clarifying `// SECURITY:` comments where
-the "why" isn't obvious from the code — see inline annotations on:
+### Fixes
+- **Crank insurance floor clamp.** `process_crank` now computes the
+  bounty as `min(CRANK_BOUNTY, insurance_balance - insurance_floor)`,
+  preventing the floor from being breached by repeated cranks. Closes
+  Known Limits #2. Regression test:
+  `tests/crank.rs::crank_bounty_clamped_by_insurance_floor`.
 
-- `process_liquidate` — the three-way decrement (capital, c_tot,
-  vault) preserving the conservation invariant.
-- `process_crank` — the insurance-fund bounty draw.
-- `process_place_order` — the `opens_on_user_side` predicate.
-- `process_bootstrap_lp` — the `free_head != 0` guard.
+### New negative tests
+- `tests/liquidate.rs::stale_oracle_rejected` — complements the
+  existing PlaceOrder coverage and satisfies the #18 prompt's
+  "stale_oracle_rejected (PlaceOrder + Liquidate)" requirement.
 
-## Open items for a future pass
+### Matrix refresh
+- Added **CreateMarket** as a 9th column, plus two CreateMarket-
+  specific rows (treasury pubkey check, fee floor).
 
-- Once task #15 lands the oracle adapter, extend the stale-oracle
-  check in PlaceOrder / Liquidate to assert
-  `oracle.last_update_slot >= current_slot - STALE_SLOTS`. Plumb
-  Crank's Funding kind through the same feed so the accrual
-  `funding_rate_e9` is real instead of hardcoded 0.
-- When task #23 lands the paid CreateMarket path, re-run this matrix
-  against that handler and extend the `TREASURY_PUBKEY` guard.
-- When task #17 grinds the program ID, revoke the upgrade authority
-  before mainnet (see `program/DEPLOY.md`).
+### `// SECURITY:` anchors (already in tree)
+
+Clarifying inline comments on:
+- `process_liquidate` — three-way decrement (capital, c_tot, vault)
+  preserving the conservation invariant.
+- `process_crank` — insurance-fund bounty draw (now floor-clamped).
+- `process_place_order` — `opens_on_user_side` predicate.
+- `process_bootstrap_lp` — `free_head != 0` guard.
+- `process_create_market` — `TREASURY_PUBKEY` guard and fee floor.
+
+## Open items deferred to a future pass
+
+- **Slot-delta staleness on oracle reads (high priority).** Today,
+  PlaceOrder and Liquidate bounds-check the price but do not assert
+  `current_slot - oracle.last_update_slot <= STALE_SLOTS`. The oracle
+  crate defines `Feed { last_update_slot, ... }` and `STALE_SLOTS =
+  150`, but the program still reads a bare `u64` from bytes 0..8.
+  Closing this means (a) depending on `percolator-oracle` from the
+  program crate, (b) deserializing `Feed` in both handlers, and
+  (c) rewriting every `set_oracle_price` test helper to produce a
+  full Feed layout. Estimated: one dedicated session. See Known
+  Limits #1.
+- **Crank Funding uses hardcoded `funding_rate_e9 = 0`.** Downstream
+  of the stale-oracle fix. Plumb the oracle-derived rate into the
+  Funding crank path when Feed integration lands.
+- **`RefillLp` instruction missing.** If the protocol LP goes
+  bankrupt, the slab is permanently unusable (see Known Limits #4).
+  Not in scope for pre-mainnet but worth tracking.
+- **Mainnet upgrade authority revoke.** When cutting over to mainnet,
+  run the revoke command from `program/DEPLOY.md` step 6 before
+  announcing.
