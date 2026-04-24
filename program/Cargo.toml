@@ -1,0 +1,35 @@
+[package]
+name = "percolator-program"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Solana BPF wrapper around the formally-verified Percolator risk engine"
+
+[lib]
+name = "percolator_program"
+crate-type = ["cdylib", "lib"]
+
+[features]
+# `no-entrypoint` is the standard Solana convention: downstream crates that want
+# to CPI into us (or embed our instructions) enable it so the entrypoint! macro
+# is skipped. On-chain builds leave it off.
+default = []
+no-entrypoint = []
+test-sbf = []
+
+[dependencies]
+# Enable `compact` so on-chain slabs are ~100 KiB (~0.7 SOL rent) instead of
+# the default 1.52 MiB (~11 SOL rent).
+percolator = { path = "..", features = ["compact"] }
+solana-program = "1.18"
+borsh = "0.10"
+thiserror = "1.0"
+# no-entrypoint: we only CPI into spl-token; don't pull in its entrypoint,
+# which would collide with ours.
+spl-token = { version = "4.0", features = ["no-entrypoint"] }
+
+[dev-dependencies]
+solana-program-test = "1.18"
+solana-sdk = "1.18"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+spl-associated-token-account = { version = "2.3", features = ["no-entrypoint"] }

@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "program", "oracle", "keeper"]
+resolver = "2"
+
 [package]
 name = "percolator"
 version = "0.1.0"
@@ -19,6 +23,7 @@ default = []
 test = []  # Use MAX_ACCOUNTS=64 for tests
 stress = []  # Expose test_visible methods but keep MAX_ACCOUNTS=4096
 fuzz = ["test"]  # Enable fuzzing tests (includes test feature for test_visible helpers)
+compact = []  # MAX_ACCOUNTS=256 for on-chain slab deploys (~100 KiB / ~0.7 SOL rent)
 
 [profile.release]
 lto = "fat"

@@ -1,0 +1,191 @@
+# DEPLOY — percolator-program
+
+Grind a vanity program ID ending in `...perc`, build the BPF binary, deploy
+to devnet, smoke-test, document the mainnet revoke-authority flow.
+
+All commands assume CWD = `/Users/jefferson/Desktop/quarter-two-earning-M/percolator`.
+
+## Preconditions
+
+- `solana`, `solana-keygen`, `cargo-build-sbf` on PATH (already verified
+  under `~/.local/share/solana/install/active_release/bin`).
+- `~/.config/solana/id.json` exists and has ≥ 5 SOL on devnet. Check:
+  ```
+  solana config set --url https://api.devnet.solana.com
+  solana balance
+  # If low:
+  solana airdrop 2
+  ```
+- Current BPF size: ~278 KB. Devnet deploy rent is roughly
+  `2 * size * rent_per_byte` ≈ **~2 SOL for the program + ~2 SOL for the
+  upgrade buffer**. Budget 5 SOL.
+
+## Step 1: grind the vanity program ID
+
+Grind a keypair whose base58 pubkey ends in `perc`. Expect 5-60 minutes of
+CPU depending on `--num-threads` and luck.
+
+```bash
+mkdir -p .keys
+# Run this in a separate terminal so you can keep working:
+solana-keygen grind \
+  --ends-with perc:1 \
+  --num-threads 8 \
+  --ignore-case   # optional; include for ~4x faster grind if you don't care about case
+
+# When it prints "Wrote keypair to <BASE58>perc.json", move it:
+mv ./*perc*.json .keys/percolator-program-perc.json
+```
+
+Verify:
+
+```bash
+solana-keygen pubkey .keys/percolator-program-perc.json
+# Expect a base58 string ending in ...perc
+```
+
+Confirm `.keys/` is git-ignored:
+
+```bash
+grep -q "^\.keys/" .gitignore || echo ".keys/" >> .gitignore
+```
+
+## Step 2: build the BPF binary
+
+```bash
+cargo-build-sbf --manifest-path program/Cargo.toml
+```
+
+This writes `target/deploy/percolator_program.so`. Verify:
+
+```bash
+ls -lh target/deploy/percolator_program.so
+# Expect around 270-290 KB.
+file target/deploy/percolator_program.so
+# Expect: ELF 64-bit LSB shared object, eBPF
+```
+
+## Step 3: deploy to devnet
+
+```bash
+solana program deploy \
+  target/deploy/percolator_program.so \
+  --program-id .keys/percolator-program-perc.json \
+  --url https://api.devnet.solana.com \
+  --keypair ~/.config/solana/id.json
+```
+
+On success it prints `Program Id: <YOUR_PUBKEY_ENDING_IN_perc>`.
+
+If it fails with "insufficient funds", run `solana airdrop 2` and retry
+(devnet faucet is rate-limited — sometimes you need to wait a minute).
+
+Save the program ID:
+
+```bash
+solana-keygen pubkey .keys/percolator-program-perc.json > program/PROGRAM_ID.txt
+cat program/PROGRAM_ID.txt
+```
+
+Also update the launcher's `.env.local`:
+
+```bash
+echo "NEXT_PUBLIC_PERCOLATOR_PROGRAM_ID=$(cat program/PROGRAM_ID.txt)" \
+  >> ../percpad/.env.local
+```
+
+## Step 4: smoke test
+
+A typed TypeScript smoke test lives at `../percpad/scripts/devnet-smoke.ts`
+and ships with task #19 (the frontend client). Until that lands, you can
+smoke-test with the CLI:
+
+```bash
+# The program must respond to CreateSlab; the instruction discriminator
+# is 0. We just verify the binary executes without a runtime panic.
+# (A full end-to-end CreateSlab tx needs the client SDK from task #19.)
+
+# 1. Binary exists and is owned by BPFLoaderUpgradeable:
+solana program show $(cat program/PROGRAM_ID.txt) --url devnet
+
+# 2. No upgrade pending:
+solana program show $(cat program/PROGRAM_ID.txt) --url devnet \
+  | grep "Data Length"
+```
+
+Once `percpad` ships, the full smoke-test flow is:
+
+```bash
+cd ../percpad
+pnpm tsx scripts/devnet-smoke.ts
+# Expected output:
+# ✓ CreateSlab          <tx sig>
+# ✓ InitializeEngine    <tx sig>
+# ✓ BootstrapLp         <tx sig>
+# ✓ Deposit             <tx sig>
+# ✓ Asserted: SlabHeader.initialized = 1, vault balance = bootstrap + deposit
+```
+
+## Step 5: verify on-chain
+
+```bash
+solana program show $(cat program/PROGRAM_ID.txt) --url devnet
+```
+
+Expect fields:
+- `Program Id: ...perc`
+- `Owner: BPFLoaderUpgradeab1e...`
+- `ProgramData Address: <buffer pubkey>`
+- `Authority: <your wallet>` ← important for step 6
+- `Last Deployed In Slot: <recent>`
+- `Data Length: ~278000 (~278 KiB)`
+
+## Step 6: mainnet revoke-authority flow (DO NOT RUN YET)
+
+Before mainnet deploy, you MUST decide whether the program stays upgradable
+or becomes immutable. The revoke-authority command:
+
+```bash
+# WARNING: irreversible. Once run on mainnet, no one can upgrade this
+# program again, even you.
+solana program set-upgrade-authority \
+  $(cat program/PROGRAM_ID.txt) \
+  --new-upgrade-authority $(solana address) \
+  --url mainnet-beta \
+  --keypair ~/.config/solana/mainnet-owner.json
+
+# To fully revoke (make immutable):
+solana program set-upgrade-authority \
+  $(cat program/PROGRAM_ID.txt) \
+  --final \
+  --url mainnet-beta \
+  --keypair ~/.config/solana/mainnet-owner.json
+```
+
+Recommended cadence for Percolator:
+
+1. Deploy to mainnet with your hardware-wallet pubkey as authority.
+2. Run seed (task #21) + a bake-in period of ~7 days.
+3. Announce a 48h "freeze intent" window with a last-bugfix gate.
+4. After the window, run `--final` to make the program immutable.
+
+## Troubleshooting
+
+- **"program account data did not match deployed binary"** — the deploy
+  partially succeeded; re-run the same `solana program deploy` command.
+  Solana resumes from the buffer.
+- **"error: Account data too small"** — the binary grew past the allocated
+  space. Add `--max-len <bytes>` with ~20% headroom, e.g.
+  `--max-len 350000`.
+- **devnet airdrop refused** — use `solana config get` to confirm you're on
+  devnet, then `solana airdrop 1` (smaller chunks are more reliably
+  fulfilled). If still blocked, use https://faucet.solana.com.
+
+## File inventory (added by this step)
+
+- `.keys/percolator-program-perc.json` (git-ignored)
+- `program/PROGRAM_ID.txt` (the vanity pubkey — tracked)
+- `program/DEPLOY.md` (this file)
+
+The typed smoke-test harness ships with task #19 at
+`../percpad/scripts/devnet-smoke.ts`.
