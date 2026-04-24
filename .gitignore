@@ -39,3 +39,6 @@ desktop.ini
 .env
 .env.local
 test-ledger/
+
+# Program keypairs (deploy + vanity grinds)
+.keys/
