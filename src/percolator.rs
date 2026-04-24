@@ -73,7 +73,10 @@ pub const MAX_ACCOUNTS: usize = 4;
 #[cfg(all(feature = "test", not(kani)))]
 pub const MAX_ACCOUNTS: usize = 64;
 
-#[cfg(all(not(kani), not(feature = "test")))]
+#[cfg(all(feature = "compact", not(kani), not(feature = "test")))]
+pub const MAX_ACCOUNTS: usize = 256;
+
+#[cfg(all(not(kani), not(feature = "test"), not(feature = "compact")))]
 pub const MAX_ACCOUNTS: usize = 4096;
 
 pub const BITMAP_WORDS: usize = (MAX_ACCOUNTS + 63) / 64;
