@@ -2,8 +2,9 @@
 
 Scope: the 9 public instruction handlers in `src/processor.rs` —
 CreateSlab, InitializeEngine, Deposit, Withdraw, BootstrapLp, PlaceOrder,
-Liquidate, Crank, CreateMarket. 80 integration tests pass as of this
-review (2026-04-24 refresh after task #15 + #23 landed).
+Liquidate, Crank, CreateMarket. 83 integration tests pass as of this
+review (2026-04-24 refresh covering task #15 + #23 and the typed oracle
+Feed landing in the wrapper).
 
 The risk engine itself (`src/percolator.rs`) is Toly's
 formally-verified library and is out of scope — every `*_not_atomic`
@@ -60,13 +61,14 @@ BPF wrapper only.
 
 ## Known limits
 
-1. **Oracle staleness.** Today the oracle is a bare u64 at bytes 0..8
-   with no last-update-slot gate. Task #15 replaces this with a
-   `StaleOracle`-gated feed that also adds source-kind dispatch
-   (pump.fun bonding, PumpSwap, Raydium, Meteora). Until #15 ships,
-   a stale oracle can be trivially tricked: any fresh write to the
-   oracle account with a stale-but-nonzero u64 will pass the
-   wrapper's checks.
+1. ~~Oracle staleness.~~ **Closed 2026-04-24.** PlaceOrder and
+   Liquidate now deserialize the full `percolator_oracle::state::Feed`
+   via `processor::read_oracle_price` and enforce
+   `current_slot - last_update_slot <= STALE_SLOTS` plus the
+   `initialized` flag. Regression tests:
+   - `tests/place_order.rs::stale_oracle_by_slot_rejected`
+   - `tests/place_order.rs::uninitialized_oracle_rejected`
+   - `tests/liquidate.rs::stale_oracle_by_slot_rejected`
 2. ~~Crank bounty drains insurance.~~ **Closed 2026-04-24.** The crank
    bounty now clamps against `params.insurance_floor`: the pay-out is
    `min(CRANK_BOUNTY, insurance_balance - insurance_floor)`, so the
@@ -185,19 +187,12 @@ Clarifying inline comments on:
 
 ## Open items deferred to a future pass
 
-- **Slot-delta staleness on oracle reads (high priority).** Today,
-  PlaceOrder and Liquidate bounds-check the price but do not assert
-  `current_slot - oracle.last_update_slot <= STALE_SLOTS`. The oracle
-  crate defines `Feed { last_update_slot, ... }` and `STALE_SLOTS =
-  150`, but the program still reads a bare `u64` from bytes 0..8.
-  Closing this means (a) depending on `percolator-oracle` from the
-  program crate, (b) deserializing `Feed` in both handlers, and
-  (c) rewriting every `set_oracle_price` test helper to produce a
-  full Feed layout. Estimated: one dedicated session. See Known
-  Limits #1.
-- **Crank Funding uses hardcoded `funding_rate_e9 = 0`.** Downstream
-  of the stale-oracle fix. Plumb the oracle-derived rate into the
-  Funding crank path when Feed integration lands.
+- **Crank Funding uses hardcoded `funding_rate_e9 = 0`.** Now that
+  `read_oracle_price` is the canonical oracle path, the Funding crank
+  handler can sample it (or use `engine.last_oracle_price` + the
+  oracle's ring-median delta) to compute a real rate. Low urgency
+  while Day-1 markets use placeholder funding; must land before the
+  funding mechanism is advertised as live.
 - **`RefillLp` instruction missing.** If the protocol LP goes
   bankrupt, the slab is permanently unusable (see Known Limits #4).
   Not in scope for pre-mainnet but worth tracking.
