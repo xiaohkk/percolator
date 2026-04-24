@@ -845,22 +845,13 @@ impl Processor {
             return Err(PercolatorError::StaleOracle.into());
         }
 
-        // Read u64 mark price from the first 8 bytes of the oracle account.
-        // Task #15 replaces this with a typed oracle-feed deserializer.
-        let oracle_data = oracle_account.try_borrow_data()?;
-        if oracle_data.len() < 8 {
-            return Err(PercolatorError::StaleOracle.into());
-        }
-        let oracle_price = u64::from_le_bytes(oracle_data[..8].try_into().unwrap());
-        drop(oracle_data);
-        if oracle_price == 0 || oracle_price > percolator::MAX_ORACLE_PRICE {
-            return Err(PercolatorError::StaleOracle.into());
-        }
+        // Typed oracle read: checks slot-delta staleness, initialized
+        // flag, and price bounds in one shot. See `read_oracle_price`.
+        let clock = Clock::get()?;
+        let oracle_price = read_oracle_price(oracle_account, clock.slot)?;
         if oracle_price < args.min_price || oracle_price > args.max_price {
             return Err(PercolatorError::SlippageExceeded.into());
         }
-
-        let clock = Clock::get()?;
 
         // Locate the user's existing slot. PlaceOrder requires an existing
         // account — collateral must already be deposited.
@@ -1052,19 +1043,9 @@ impl Processor {
             return Err(PercolatorError::VaultPdaMismatch.into());
         }
 
-        // Oracle price read (see process_place_order for the temporary
-        // bytes-0..8 protocol).
-        let oracle_data = oracle_account.try_borrow_data()?;
-        if oracle_data.len() < 8 {
-            return Err(PercolatorError::StaleOracle.into());
-        }
-        let oracle_price = u64::from_le_bytes(oracle_data[..8].try_into().unwrap());
-        drop(oracle_data);
-        if oracle_price == 0 || oracle_price > percolator::MAX_ORACLE_PRICE {
-            return Err(PercolatorError::StaleOracle.into());
-        }
-
+        // Typed oracle read: slot-delta staleness + price bounds.
         let clock = Clock::get()?;
+        let oracle_price = read_oracle_price(oracle_account, clock.slot)?;
 
         // Snapshot victim's pre-liquidation capital for bounty sizing.
         let orig_capital: u128 = {
@@ -1599,6 +1580,43 @@ impl Processor {
         );
         Ok(())
     }
+}
+
+/// Reads the mark price from an oracle account whose bytes are a
+/// `percolator_oracle::state::Feed`. Enforces:
+///   - feed length + `initialized` flag,
+///   - slot-delta staleness: `current_slot - last_update_slot <= STALE_SLOTS`
+///     (and `last_update_slot <= current_slot`, else the feed was written
+///     in the future — treated as corrupt),
+///   - price bounds `(0, MAX_ORACLE_PRICE]`.
+/// Returns `StaleOracle` on any failure — the wrapper maps every oracle
+/// problem to that single error code so callers don't need to branch.
+fn read_oracle_price(
+    oracle: &AccountInfo,
+    current_slot: u64,
+) -> Result<u64, PercolatorError> {
+    let data = oracle
+        .try_borrow_data()
+        .map_err(|_| PercolatorError::StaleOracle)?;
+    let feed = percolator_oracle::state::Feed::read_from(&data)
+        .map_err(|_| PercolatorError::StaleOracle)?;
+    drop(data);
+    if !feed.is_initialized() {
+        return Err(PercolatorError::StaleOracle);
+    }
+    if feed.last_update_slot > current_slot {
+        return Err(PercolatorError::StaleOracle);
+    }
+    if current_slot.saturating_sub(feed.last_update_slot)
+        > percolator_oracle::state::STALE_SLOTS
+    {
+        return Err(PercolatorError::StaleOracle);
+    }
+    let price = feed.price_lamports_per_token;
+    if price == 0 || price > percolator::MAX_ORACLE_PRICE {
+        return Err(PercolatorError::StaleOracle);
+    }
+    Ok(price)
 }
 
 /// Pre-flight validation of `RiskParamsArgs` before handing them to the parent

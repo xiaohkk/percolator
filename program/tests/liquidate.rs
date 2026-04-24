@@ -102,10 +102,26 @@ fn packed_token_account(mint: Pubkey, owner: Pubkey, amount: u64) -> Account {
 }
 
 fn packed_oracle(price: u64) -> Account {
-    let mut data = vec![0u8; 8];
-    data.copy_from_slice(&price.to_le_bytes());
+    packed_oracle_at_slot(price, 0)
+}
+
+fn packed_oracle_at_slot(price: u64, last_update_slot: u64) -> Account {
+    let feed = percolator_oracle::state::Feed {
+        price_lamports_per_token: price,
+        last_update_slot,
+        mint: Pubkey::default(),
+        source: Pubkey::default(),
+        source_kind: 0,
+        graduated: 0,
+        initialized: 1,
+        ring_idx: 0,
+        _pad: [0; 4],
+        ring_buffer: [0; percolator_oracle::state::RING_LEN],
+    };
+    let mut data = vec![0u8; percolator_oracle::state::Feed::LEN];
+    feed.write_into(&mut data).unwrap();
     Account {
-        lamports: Rent::default().minimum_balance(8),
+        lamports: Rent::default().minimum_balance(percolator_oracle::state::Feed::LEN),
         data,
         owner: system_program::ID,
         executable: false,
@@ -831,6 +847,38 @@ async fn stale_oracle_rejected() {
     )
     .await
     .expect_err("stale oracle rejected");
+    assert!(
+        expected_custom_error(&err, PercolatorError::StaleOracle),
+        "{:?}",
+        err
+    );
+}
+
+#[tokio::test]
+async fn stale_oracle_by_slot_rejected() {
+    // Slot-delta staleness on the liquidation path. Warping past STALE_SLOTS
+    // without a refreshed Feed must block liquidations to stop a griefer
+    // from front-running a price drop with a stale oracle.
+    let (h, pt) = Harness::new();
+    let mut ctx = bring_up(&h, pt, 100_000_000, 1_000_000).await;
+    let uidx = user_idx(&mut ctx, h.slab.pubkey(), h.user.pubkey()).await;
+    send(&mut ctx, &h.user, &[build_place_order_ix(&h, 0, 500_000)])
+        .await
+        .expect("open");
+
+    ctx.set_account(
+        &h.oracle,
+        &packed_oracle_at_slot(ORACLE_PRICE, 0).into(),
+    );
+    ctx.warp_to_slot(200).unwrap();
+
+    let err = send(
+        &mut ctx,
+        &h.liquidator,
+        &[build_liquidate_ix(&h, uidx)],
+    )
+    .await
+    .expect_err("stale-by-slot oracle");
     assert!(
         expected_custom_error(&err, PercolatorError::StaleOracle),
         "{:?}",

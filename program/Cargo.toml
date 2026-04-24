@@ -21,6 +21,9 @@ test-sbf = []
 # Enable `compact` so on-chain slabs are ~100 KiB (~0.7 SOL rent) instead of
 # the default 1.52 MiB (~11 SOL rent).
 percolator = { path = "..", features = ["compact"] }
+# The oracle adapter: we only pull in `state::Feed` + `state::STALE_SLOTS`.
+# `no-entrypoint` avoids duplicate entrypoint symbols at link time.
+percolator-oracle = { path = "../oracle", features = ["no-entrypoint"] }
 solana-program = "1.18"
 borsh = "0.10"
 thiserror = "1.0"

@@ -6,8 +6,10 @@
 //!   Every PlaceOrder = `execute_trade_not_atomic(user, LP, ...)` under the
 //!   hood — the wrapper trades against the LP counterparty.
 //!
-//! Oracle account = a bare data account whose first 8 bytes are a LE u64
-//! price. The wrapper reads it directly (temporary path until task #15).
+//! Oracle account = a `percolator_oracle::state::Feed` layout. The wrapper
+//! deserializes the full struct and enforces slot-delta staleness; tests
+//! populate an initialized Feed with `last_update_slot = 0` (non-stale at
+//! the warped slots used here) and flip the price via `set_oracle_price`.
 //!
 //! Several scenarios (DrainOnly / ResetPending / A-floor / profit) require
 //! directly poking engine state, because without keeper #16 / ADL #14 the
@@ -110,13 +112,31 @@ fn packed_token_account(mint: Pubkey, owner: Pubkey, amount: u64) -> Account {
     }
 }
 
-/// Bare u64-as-bytes account, owned by system_program. We don't care who
-/// owns it; the wrapper only reads bytes 0..8.
+/// A `percolator_oracle::state::Feed` account with `last_update_slot = 0`
+/// — non-stale at the small warps used here (max slot 10 across the suite,
+/// `STALE_SLOTS = 150`). Owner is system_program; wrapper doesn't ownership-
+/// check the oracle.
 fn packed_oracle(price: u64) -> Account {
-    let mut data = vec![0u8; 8];
-    data.copy_from_slice(&price.to_le_bytes());
+    packed_oracle_at_slot(price, 0)
+}
+
+fn packed_oracle_at_slot(price: u64, last_update_slot: u64) -> Account {
+    let feed = percolator_oracle::state::Feed {
+        price_lamports_per_token: price,
+        last_update_slot,
+        mint: Pubkey::default(),
+        source: Pubkey::default(),
+        source_kind: 0,
+        graduated: 0,
+        initialized: 1,
+        ring_idx: 0,
+        _pad: [0; 4],
+        ring_buffer: [0; percolator_oracle::state::RING_LEN],
+    };
+    let mut data = vec![0u8; percolator_oracle::state::Feed::LEN];
+    feed.write_into(&mut data).unwrap();
     Account {
-        lamports: Rent::default().minimum_balance(8),
+        lamports: Rent::default().minimum_balance(percolator_oracle::state::Feed::LEN),
         data,
         owner: system_program::ID,
         executable: false,
@@ -441,6 +461,9 @@ async fn user_idx(ctx: &mut ProgramTestContext, slab: Pubkey, user: Pubkey) -> u
 }
 
 async fn set_oracle_price(ctx: &mut ProgramTestContext, oracle: Pubkey, price: u64) {
+    // Writes a fresh Feed (last_update_slot = 0). Tests that warp past
+    // STALE_SLOTS without re-calling this will (correctly) see the oracle
+    // as stale.
     ctx.set_account(&oracle, &packed_oracle(price).into());
 }
 
@@ -606,6 +629,78 @@ async fn stale_oracle_rejected() {
     let err = send(&mut ctx, &h.user, &[ix])
         .await
         .expect_err("stale oracle");
+    assert!(
+        expected_custom_error(&err, PercolatorError::StaleOracle),
+        "{:?}",
+        err
+    );
+}
+
+#[tokio::test]
+async fn stale_oracle_by_slot_rejected() {
+    // Slot-delta staleness: a Feed with a valid in-range price but a
+    // last_update_slot more than STALE_SLOTS behind `clock.slot` must be
+    // rejected. Proves the wrapper goes beyond bounds-checking.
+    let (h, pt) = Harness::new();
+    let mut ctx = bring_up(&h, pt, 1_000_000, 100_000).await;
+
+    // Oracle wrote at slot 0 with a sane price, never refreshed.
+    ctx.set_account(
+        &h.oracle,
+        &packed_oracle_at_slot(ORACLE_PRICE, 0).into(),
+    );
+    // Warp past STALE_SLOTS (150).
+    ctx.warp_to_slot(200).unwrap();
+
+    let ix = build_place_order_ix(&h, h.oracle, 0, 1_000_000, u64::MAX, 0);
+    let err = send(&mut ctx, &h.user, &[ix])
+        .await
+        .expect_err("stale-by-slot oracle");
+    assert!(
+        expected_custom_error(&err, PercolatorError::StaleOracle),
+        "{:?}",
+        err
+    );
+}
+
+#[tokio::test]
+async fn uninitialized_oracle_rejected() {
+    // A Feed whose `initialized` byte is 0 must be rejected, even if its
+    // price/slot fields are otherwise valid. Catches an attacker handing
+    // the wrapper a fresh, attacker-allocated account.
+    let (h, pt) = Harness::new();
+    let mut ctx = bring_up(&h, pt, 1_000_000, 100_000).await;
+
+    let mut uninit = percolator_oracle::state::Feed {
+        price_lamports_per_token: ORACLE_PRICE,
+        last_update_slot: 0,
+        mint: Pubkey::default(),
+        source: Pubkey::default(),
+        source_kind: 0,
+        graduated: 0,
+        initialized: 0, // <-- key
+        ring_idx: 0,
+        _pad: [0; 4],
+        ring_buffer: [0; percolator_oracle::state::RING_LEN],
+    };
+    let mut data = vec![0u8; percolator_oracle::state::Feed::LEN];
+    uninit.write_into(&mut data).unwrap();
+    let acct = Account {
+        lamports: Rent::default()
+            .minimum_balance(percolator_oracle::state::Feed::LEN),
+        data,
+        owner: system_program::ID,
+        executable: false,
+        rent_epoch: 0,
+    };
+    ctx.set_account(&h.oracle, &acct.into());
+    // Silence unused_mut warnings from borsh-era compilers.
+    uninit.initialized = 0;
+
+    let ix = build_place_order_ix(&h, h.oracle, 0, 1_000_000, u64::MAX, 0);
+    let err = send(&mut ctx, &h.user, &[ix])
+        .await
+        .expect_err("uninitialized oracle");
     assert!(
         expected_custom_error(&err, PercolatorError::StaleOracle),
         "{:?}",
